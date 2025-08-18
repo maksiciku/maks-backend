@@ -1,0 +1,9 @@
+LOAD DATABASE
+  FROM sqlite:///Users/max/restaurant-app/backend/database.db
+  INTO postgresql://maksdb_rq0e_user:5UWqkeiOlKokckZmCxxjKdNQT0mXEriu@dpg-d2gf24ruibrs73ea7k60-a.frankfurt-postgres.render.com:5432/maksdb_rq0e?sslmode=require
+
+WITH include drop, create tables, create indexes, reset sequences
+
+CAST type num to timestamp using zero-dates-to-null
+;
+

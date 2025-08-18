@@ -1,0 +1,20 @@
+module.exports = {
+  milk: 7,
+  egg: 14,
+  chicken: 3,
+  beef: 5,
+  fish: 2,
+  cream: 5,
+  lettuce: 5,
+  spinach: 4,
+  cheese: 10,
+  ham: 6,
+  carrot: 10,
+  tomato: 7,
+  vanilla: 30,
+  chocolate: 30,
+  flour: 180,
+  sugar: 365,
+  rice: 365,
+  water: 365
+};
