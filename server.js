@@ -1,7 +1,7 @@
 // Import necessary modules
 const express = require('express');
 const cors = require('cors');
-const bcrypt = require('bcrypt');
+const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const Tesseract = require('tesseract.js');
@@ -33,7 +33,6 @@ const qAll = (sql, params = []) => db.allAsync(sql, params);
 
 // Initialize Express app
 const app = express();
-const PORT = 5000;
 const allowed = [
   'http://localhost:3000',
   'https://your-frontend.vercel.app',    // update after frontend deploy
@@ -3500,6 +3499,9 @@ app.get('/search', (req, res) => {
     res.json(rows);
   });
 });
+
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
 
 // Test endpoint
 app.get('/', (req, res) => {
