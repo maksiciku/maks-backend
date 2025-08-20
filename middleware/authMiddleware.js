@@ -1,5 +1,5 @@
 const jwt = require("jsonwebtoken");
-const SECRET_KEY = "your_secret_key"; // Replace with process.env.SECRET_KEY if using env variables
+const SECRET_KEY = process.env.SECRET_KEY || 'dev_secret_change_me';
 
 // ✅ Middleware to verify JWT token
 const authenticateToken = (req, res, next) => {

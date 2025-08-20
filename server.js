@@ -35,12 +35,11 @@ const qAll = (sql, params = []) => db.allAsync(sql, params);
 const app = express();
 const allowed = [
   'http://localhost:3000',
-  'https://your-frontend.vercel.app',    // update after frontend deploy
+  'https://restaurant-frontend-liart.vercel.app',    // update after frontend deploy
 ];
 
 // Middleware to parse JSON requests
 app.use(express.json());
-app.use(cors());
 
 app.use('/invoices', scanRoutes); // ✅ Now `/scan/scan-ingredient-image` works
 app.use('/pos-orders', posRoutes);
@@ -49,7 +48,7 @@ app.use('/bookings', bookingRoutes);
 app.use('/drinks', drinksRoutes);
 app.use(cors({
   origin: (origin, cb) => {
-    if (!origin) return cb(null, true); // mobile apps, curl, etc.
+    if (!origin) return cb(null, true);
     return cb(null, allowed.includes(origin));
   },
   credentials: true
@@ -655,25 +654,38 @@ app.post('/register', (req, res) => {
 
 // Login route
 app.post('/login', (req, res) => {
-    const { username, password } = req.body;
-    if (!username || !password) {
-        return res.status(400).send('Username and password are required.');
+  const { username, password } = req.body;
+
+  if (!username || !password) {
+    return res.status(400).send('Username and password are required.');
+  }
+
+  const query = `SELECT * FROM users WHERE username = ?`;
+  db.get(query, [username], (err, user) => {
+    if (err) {
+      console.error('❌ DB error on login:', err);
+      return res.status(500).send('Server error.');
     }
 
-    const query = `SELECT * FROM users WHERE username = ?`;
-    db.get(query, [username], (err, user) => {
-        if (err || !user) {
-            return res.status(401).send('Invalid username or password.');
-        }
+    if (!user) {
+      return res.status(401).send('Invalid username or password.');
+    }
 
-        const isPasswordValid = bcrypt.compareSync(password, user.password);
-        if (!isPasswordValid) {
-            return res.status(401).send('Invalid username or password.');
-        }
+    // bcryptjs check (sync version is fine here)
+    const isPasswordValid = bcrypt.compareSync(password, user.password);
+    if (!isPasswordValid) {
+      return res.status(401).send('Invalid username or password.');
+    }
 
-        const token = jwt.sign({ id: user.id, role: user.role }, SECRET_KEY, { expiresIn: '1h' });
-        res.status(200).send({ token, role: user.role });
-    });
+    // Sign JWT (expires in 1 hour)
+    const token = jwt.sign(
+      { id: user.id, role: user.role },
+      SECRET_KEY,
+      { expiresIn: '1h' }
+    );
+
+    res.status(200).json({ token, role: user.role });
+  });
 });
 
 // Add meal route
@@ -865,6 +877,14 @@ app.get('/meals', authenticateToken, (req, res) => {
 
         res.status(200).json(rows);
     });
+});
+
+// TEMP TEST: make it public briefly
+app.get('/meals', (req, res) => {
+  pool.query('SELECT * FROM meals', [], (err, rows) => {
+    if (err) return res.status(500).json({ error: 'Error fetching meals.' });
+    res.json(rows);
+  });
 });
 
 app.get('/meals/paginated', authenticateToken, (req, res) => {
@@ -1565,7 +1585,9 @@ app.post('/convert-heic', upload.single('image'), async (req, res) => {
         fs.unlinkSync(inputFilePath);
 
         // Send back the converted image URL
-        res.json({ convertedImageUrl: `http://localhost:5000/uploads/${path.basename(outputFilePath)}` });
+const proto = req.headers['x-forwarded-proto'] || req.protocol;
+const host  = req.headers['x-forwarded-host'] || req.get('host');
+res.json({ convertedImageUrl: `${proto}://${host}/uploads/${path.basename(outputFilePath)}` });
 
     } catch (error) {
         console.error('❌ Error converting HEIC:', error);
@@ -2704,6 +2726,14 @@ app.post('/prepped-items/prepare', async (req, res) => {
   }
 });
 
+app.get('/debug/echo-auth', (req, res) => {
+  res.json({ authHeader: req.headers.authorization || null });
+});
+
+app.get('/debug/whoami', authenticateToken, (req, res) => {
+  res.json({ ok: true, user: req.user });
+});
+
 app.get('/prepped-items', async (req, res) => {
   try {
     const items = await db.allAsync(`SELECT * FROM prepped_items`);
@@ -3469,6 +3499,9 @@ app.delete('/categories/:id', async (req, res) => {
   }
 });
 
+// before session or any res.cookie
+app.set('trust proxy', 1);  // important behind Vercel/Render
+
 // GET /search?q=latte
 app.get('/search', (req, res) => {
   const q = (req.query.q || '').trim();
@@ -3499,9 +3532,6 @@ app.get('/search', (req, res) => {
     res.json(rows);
   });
 });
-
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
 
 // Test endpoint
 app.get('/', (req, res) => {
