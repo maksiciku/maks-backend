@@ -1,1 +1,37 @@
-node_modules
+# Dependencies
+node_modules/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Runtime databases
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Database dumps / backups
+*.backup
+*.backup.*
+*.bak
+*.dump
+dump*.sql
+sqlite_dump.sql
+
+# Runtime uploads
+uploads/
+
+# Temporary OCR/runtime output
+tmp/
+temp/
+
+# Logs
+*.log
+npm-debug.log*
