@@ -16,6 +16,10 @@ const {
 } = require('../migrations/canonicalOperational.pg');
 
 const {
+  runCanonicalOrderLifecyclePg,
+} = require('../migrations/canonicalOrderLifecycle.pg');
+
+const {
   runBootMigrationsPg,
 } = require('../migrations/boot.pg');
 
@@ -44,6 +48,10 @@ async function main() {
     await runCanonicalOperationalPg({
       qRun,
       qGet,
+    });
+
+    await runCanonicalOrderLifecyclePg({
+      pool,
     });
 
     await runBootMigrationsPg({
