@@ -8,6 +8,14 @@ const {
 } = require('../db/pg');
 
 const {
+  runCanonicalFoundationPg,
+} = require('../migrations/canonicalFoundation.pg');
+
+const {
+  runCanonicalOperationalPg,
+} = require('../migrations/canonicalOperational.pg');
+
+const {
   runBootMigrationsPg,
 } = require('../migrations/boot.pg');
 
@@ -28,6 +36,16 @@ async function main() {
   );
 
   try {
+    await runCanonicalFoundationPg({
+      qRun,
+      qGet,
+    });
+
+    await runCanonicalOperationalPg({
+      qRun,
+      qGet,
+    });
+
     await runBootMigrationsPg({
       qAll,
       qGet,
@@ -38,7 +56,9 @@ async function main() {
       pool,
     });
 
-    console.log('✅ Schema ready.');
+    console.log(
+      '✅ Schema ready.'
+    );
   } catch (e) {
     console.error(
       '❌ Boot failed:',
