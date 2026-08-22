@@ -20,6 +20,14 @@ const {
 } = require('../migrations/canonicalOrderLifecycle.pg');
 
 const {
+  runCanonicalInventoryMenuPg,
+} = require('../migrations/canonicalInventoryMenu.pg');
+
+const {
+  runCanonicalMenuSchedulingPg,
+} = require('../migrations/canonicalMenuScheduling.pg');
+
+const {
   runBootMigrationsPg,
 } = require('../migrations/boot.pg');
 
@@ -51,6 +59,14 @@ async function main() {
     });
 
     await runCanonicalOrderLifecyclePg({
+      pool,
+    });
+
+    await runCanonicalInventoryMenuPg({
+      pool,
+    });
+
+    await runCanonicalMenuSchedulingPg({
       pool,
     });
 
