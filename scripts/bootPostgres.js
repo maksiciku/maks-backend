@@ -36,6 +36,10 @@ const {
 } = require('../migrations/canonicalCommercialPricing.pg');
 
 const {
+  runCanonicalBookingTablesPg,
+} = require('../migrations/canonicalBookingTables.pg');
+
+const {
   runBootMigrationsPg,
 } = require('../migrations/boot.pg');
 
@@ -83,6 +87,10 @@ async function main() {
     });
 
     await runCanonicalCommercialPricingPg({
+      pool,
+    });
+
+    await runCanonicalBookingTablesPg({
       pool,
     });
 
