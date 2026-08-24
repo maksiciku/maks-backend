@@ -40,6 +40,10 @@ const {
 } = require('../migrations/canonicalBookingTables.pg');
 
 const {
+  runCanonicalPlatformAuditDevicesPg,
+} = require('../migrations/canonicalPlatformAuditDevices.pg');
+
+const {
   runBootMigrationsPg,
 } = require('../migrations/boot.pg');
 
@@ -91,6 +95,10 @@ async function main() {
     });
 
     await runCanonicalBookingTablesPg({
+      pool,
+    });
+
+    await runCanonicalPlatformAuditDevicesPg({
       pool,
     });
 
