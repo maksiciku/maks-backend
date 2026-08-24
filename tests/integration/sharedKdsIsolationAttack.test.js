@@ -47,7 +47,6 @@ let kdsTokenB;
 let batchA;
 let batchB;
 
-let sharedGroupId;
 
 const PIN_A =
   "4812";
@@ -544,77 +543,6 @@ test.before(
       ]
     );
 
-    /*
-     * Create an intentional shared-KDS configuration.
-     *
-     * Runtime feeds are still tenant-bound individually.
-     */
-    const group =
-      await one(
-        `
-        INSERT INTO public.shared_kds_groups
-        (
-          name,
-          device_key,
-          active
-        )
-
-        VALUES
-        (
-          $1,
-          $2,
-          TRUE
-        )
-
-        RETURNING id
-        `,
-        [
-          "MAKS SHARED KDS ATTACK GROUP",
-
-          `attack-device-${crypto.randomUUID()}`,
-        ]
-      );
-
-    assert.ok(
-      group?.id
-    );
-
-    sharedGroupId =
-      Number(
-        group.id
-      );
-
-    await query(
-      `
-      INSERT INTO public.shared_kds_group_members
-      (
-        group_id,
-        restaurant_id,
-        label,
-        active
-      )
-
-      VALUES
-        (
-          $1,
-          $2,
-          'Restaurant A',
-          TRUE
-        ),
-        (
-          $1,
-          $3,
-          'Restaurant B',
-          TRUE
-        )
-      `,
-      [
-        sharedGroupId,
-        fixtures.restaurantA,
-        fixtures.restaurantB,
-      ]
-    );
-
     ({ app } =
       require("../../server"));
 
@@ -700,34 +628,70 @@ test.after(
  */
 
 test(
-  "SHARED KDS: group intentionally contains Restaurant A and Restaurant B",
+  "SHARED KDS: display composition uses two isolated restaurant authorities",
   async () => {
-    const members =
+    assert.notEqual(
+      fixtures.restaurantA,
+      fixtures.restaurantB
+    );
+
+    const memberships =
       await all(
         `
         SELECT
           restaurant_id,
-          active
+          user_id,
+          is_active
 
-        FROM public.shared_kds_group_members
+        FROM public.restaurant_members
 
-        WHERE group_id = $1
+        WHERE
+          (
+            restaurant_id = $1
+            AND user_id = $3
+          )
+          OR
+          (
+            restaurant_id = $2
+            AND user_id = $4
+          )
 
         ORDER BY
           restaurant_id ASC
         `,
         [
-          sharedGroupId,
+          fixtures.restaurantA,
+          fixtures.restaurantB,
+          fixtures.ownerA,
+          fixtures.ownerB,
         ]
       );
 
-    assert.deepEqual(
-      members.map(
+    assert.equal(
+      memberships.length,
+      2
+    );
+
+    assert.equal(
+      memberships.every(
         (row) =>
-          Number(
-            row.restaurant_id
-          )
+          row.is_active === true
       ),
+      true
+    );
+
+    assert.deepEqual(
+      memberships
+        .map(
+          (row) =>
+            Number(
+              row.restaurant_id
+            )
+        )
+        .sort(
+          (a, b) =>
+            a - b
+        ),
 
       [
         fixtures.restaurantA,
@@ -736,15 +700,6 @@ test(
         (a, b) =>
           a - b
       )
-    );
-
-    assert.equal(
-      members.every(
-        (row) =>
-          row.active ===
-          true
-      ),
-      true
     );
   }
 );
@@ -1711,33 +1666,33 @@ test(
  */
 
 test(
-  "FINAL: shared KDS group contains each restaurant at most once",
+  "FINAL: canonical shared KDS has no persisted cross-tenant group authority",
   async () => {
-    const bad =
-      await all(
+    const legacy =
+      await one(
         `
         SELECT
-          group_id,
-          restaurant_id,
-          COUNT(*)::int AS count
+          to_regclass(
+            'public.shared_kds_groups'
+          )::text AS groups_table,
 
-        FROM public.shared_kds_group_members
-
-        GROUP BY
-          group_id,
-          restaurant_id
-
-        HAVING COUNT(*) > 1
+          to_regclass(
+            'public.shared_kds_group_members'
+          )::text AS members_table
         `
       );
 
-    assert.deepEqual(
-      bad,
-      []
+    assert.equal(
+      legacy.groups_table,
+      null
+    );
+
+    assert.equal(
+      legacy.members_table,
+      null
     );
   }
 );
-
 /*
  * =====================================================
  * 23. FINAL TOKEN ISOLATION

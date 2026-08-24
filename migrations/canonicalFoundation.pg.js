@@ -171,6 +171,7 @@ async function runCanonicalFoundationPg({
     );
   `);
 
+
   // Existing installations may have an older restaurant table.
   // Add current fields safely without destroying data.
 
@@ -307,6 +308,31 @@ async function runCanonicalFoundationPg({
       ${column} ${definition};
     `);
   }
+
+    /*
+   * =====================================================
+   * REGISTRATION CHECKOUT REPLAY AUTHORITY
+   * =====================================================
+   *
+   * One verified Stripe checkout may create at most
+   * one MAKS restaurant.
+   *
+   * Application pre-checks improve the response, but
+   * PostgreSQL is the final authority against races.
+   * =====================================================
+   */
+
+  await qRun(`
+    CREATE UNIQUE INDEX IF NOT EXISTS
+      ux_restaurants_stripe_checkout_session_id
+
+    ON public.restaurants (
+      stripe_checkout_session_id
+    )
+
+    WHERE stripe_checkout_session_id IS NOT NULL
+      AND BTRIM(stripe_checkout_session_id) <> ''
+  `);
 
   // =====================================================
   // USERS — HUMAN / LOGIN IDENTITY
