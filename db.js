@@ -1,14 +1,6 @@
 // backend/db.js
-require('dotenv').config();
-const { Pool } = require('pg');
+// Single DB entrypoint (SOURCE OF TRUTH)
+// Everything should import from "../db" and it will work.
+// Internally we use dbCompat so you don't have to rewrite imports.
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }, // Render requires SSL
-});
-
-pool.on('error', (err) => {
-  console.error('❌ PG Pool error:', err);
-});
-
-module.exports = pool;
+module.exports = require("./dbCompat");

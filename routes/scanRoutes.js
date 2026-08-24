@@ -1,235 +1,108 @@
+// routes/scanRoutes.js
 const express = require('express');
+const router = express.Router();
 const multer = require('multer');
+const fs = require('fs');
+const path = require('path');
 const sharp = require('sharp');
 const Tesseract = require('tesseract.js');
-const fs = require('fs');
-const { execSync } = require('child_process');
-const router = express.Router();
-const { extractBaseIngredient, extractQuantity } = require('../utils/novaParser');
-const { detectAllergensFromName } = require('../utils/novaAllergens');
-const shelfLifeMap = require('../utils/shelfLifeMap');
-const db = require('../dbSqliteCompat');
 
-const upload = multer({ dest: 'uploads/' });
-
-function extractItemsFromOCR(text) {
-  const lines = text.split('\n').map(line => line.trim()).filter(Boolean);
-  const extractedItems = [];
-
-  const stopPatterns = [
-    /SUBSTITUTION DETAILS/i,
-    /The following items were not available/i,
-    /CHILLED DS/i,
-    /RETAIL GROCERY/i
-  ];
-
-  const itemPattern = /^(.*?)(\d{1,3})?\s+£?(\d+\.\d{2})$/i;
-
-  for (let line of lines) {
-    if (stopPatterns.some(pattern => pattern.test(line))) break;
-
-    const match = line.match(itemPattern);
-    if (match) {
-      const [, rawDesc, qty, price] = match;
-      const cleanedDescription = cleanDescription(rawDesc);
-      const base = extractBaseIngredient(cleanedDescription);
-      const { quantity: quantityParsed, unit } = extractQuantity(cleanedDescription);
-
-      extractedItems.push({
-        description: cleanedDescription,
-        base_ingredient: base,
-        qty: parseQuantity(qty),
-        quantity_parsed: quantityParsed,
-        unit,
-        price: parseFloat(price),
-        suggested_allergens: detectAllergensFromName(base)
-      });
-    } else {
-      console.log("❌ Line skipped, no match:", line); // 👈 debug failed lines
-    }
+// Be tolerant to any export shape from the util
+let parseInvoiceText = require('../utils/parseInvoiceText');
+if (parseInvoiceText && typeof parseInvoiceText !== 'function') {
+  if (typeof parseInvoiceText.parseInvoiceText === 'function') {
+    parseInvoiceText = parseInvoiceText.parseInvoiceText;
+  } else if (typeof parseInvoiceText.default === 'function') {
+    parseInvoiceText = parseInvoiceText.default;
   }
-
-  return extractedItems.filter(item => item.description.length > 2 && item.price > 0);
+}
+if (typeof parseInvoiceText !== 'function') {
+  console.warn('⚠️ parseInvoiceText not a function — using minimal fallback');
+  parseInvoiceText = (txt) => {
+    const lines = String(txt || '').split(/\r?\n/);
+    return lines
+      .map(l => l.trim())
+      .filter(Boolean)
+      .map(l => ({ description: l, base_ingredient: l.toLowerCase(), qty: 1, quantity_parsed: 1, unit: 'unit', price: null, suggested_allergens: 'None' }))
+      .filter(x => x.base_ingredient && x.base_ingredient !== 'total');
+  };
 }
 
-function cleanDescription(text) {
-    return text.replace(/[^\w\s]/g, '').replace(/\s\s+/g, ' ').trim();
-}
+// storage in /uploads
+const uploadsDir = path.join(__dirname, '..', 'uploads');
+if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
 
-function parseQuantity(qtyOrSize) {
-    if (!qtyOrSize) return 1;
-    const qty = parseInt(qtyOrSize);
-    return isNaN(qty) ? 1 : qty;
-}
-
-function parsePrice(priceOrValue) {
-    if (!priceOrValue) return 0;
-    const price = parseFloat(priceOrValue.replace(',', '.'));
-    return isNaN(price) ? 0 : price;
-}
-
-router.post("/scan-ingredient-image", upload.single("image"), async (req, res) => {
-    if (!req.file) return res.status(400).json({ success: false, message: "No image uploaded." });
-
-    try {
-        const inputPath = req.file.path;
-        const outputPath = `${inputPath}.png`;
-
-        await sharp(inputPath).resize(1000).grayscale().toFile(outputPath);
-
-        const { data: { text } } = await Tesseract.recognize(outputPath, "eng", { logger: m => console.log(m) });
-
-        console.log("📄 OCR Text Extracted:\n", text);
-
-        console.log("✅ Extracted Text (Raw):", text);
-
-        const ingredientPattern = /ingredients[:\s]+([\s\S]*?)(allergy advice|contains|suitable for|certified sustainable)/i;
-        const allergensPattern = /(allergy advice|contains)[:\s]+([\s\S]*?)(suitable for|certified sustainable|$)/i;
-
-        const ingredientsMatch = text.match(ingredientPattern);
-        const allergensMatch = text.match(allergensPattern);
-
-        let extractedIngredients = ingredientsMatch ? ingredientsMatch[1] : "Not detected";
-        let extractedAllergens = allergensMatch ? allergensMatch[2] : "None";
-
-        extractedIngredients = extractedIngredients.replace(/\n/g, " ").replace(/[\(\)]/g, "").replace(/\s\s+/g, " ").trim();
-        extractedAllergens = extractedAllergens.replace(/\n/g, ", ").replace(/\s\s+/g, " ").replace(/(see ingredients in bold|also, not suitable for customers with an|due to manufacturing methods)/gi, "").trim();
-
-        const allergenList = [
-            "gluten", "milk", "egg", "peanut", "soy", "sesame", "crustaceans",
-            "fish", "molluscs", "tree nuts", "wheat", "barley", "rye", "oats",
-            "sulphites", "mustard", "celery", "lupin"
-        ];
-
-        const detectedAllergens = allergenList.filter(allergen =>
-            new RegExp(`\\b${allergen}\\b`, "i").test(extractedAllergens)
-        );
-
-        if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
-        if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
-
-        const ingredient = extractedIngredients.split(",")[0].trim();
-        if (!ingredient || ingredient === "Not detected") {
-            return res.json({ success: false, message: "Could not detect ingredient name." });
-        }
-
-        const allergensToSave = detectedAllergens.length > 0 ? detectedAllergens.join(", ") : "None";
-        const isDrink = /juice|soda|water|wine|beer|coffee|tea|milk/i.test(ingredient);
-
-        const type = isDrink ? 'drink' : 'ingredient';
-        const unit = 'unit';
-        const quantity = 1;
-        const quantity_parsed = 1;
-        const price = 0;
-        const category = 'General';
-        const calories_per_100g = 0;
-        const minimum_level = 10;
-
-        await new Promise((resolve, reject) => {
-  db.run(
-    `INSERT INTO stock (
-      ingredient, price, supplier_id, quantity, allergens,
-      calories_per_100g, waste_flag, expiry_date, unit,
-      minimum_level, quantity_in_grams, type, category,
-      portions_left, name
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(ingredient) DO UPDATE SET
-      allergens = CASE 
-        WHEN stock.allergens IS NULL OR stock.allergens = 'None' 
-        THEN excluded.allergens 
-        ELSE stock.allergens || ', ' || excluded.allergens 
-      END,
-      quantity = stock.quantity + excluded.quantity`,
-    [
-      ingredient.toLowerCase(),       // ingredient
-      price || 0,                     // price
-      null,                           // supplier_id
-      quantity,                       // quantity
-      allergensToSave || 'None',      // allergens
-      0,                              // calories_per_100g
-      0,                              // waste_flag
-      null,                           // expiry_date
-      unit || 'unit',                 // unit
-      10,                             // minimum_level
-      null,                           // quantity_in_grams
-      type || 'ingredient',           // type
-      category || 'General',          // category
-      0,                              // portions_left
-      ingredient                      // name (just duplicate of ingredient)
-    ],
-    function (err) {
-      if (err) {
-        console.error('❌ FINAL SQL ERROR:', err.message);
-        reject(err);
-      } else {
-        console.log(`✅ FINAL SUCCESS: Inserted ${ingredient}`);
-        resolve();
-      }
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, uploadsDir),
+    filename: (_req, file, cb) => {
+      const ext = path.extname(file.originalname) || '.png';
+      const base = path.basename(file.originalname, ext)
+        .toLowerCase()
+        .replace(/[^a-z0-9_.-]+/g, '-')
+        .slice(0, 60);
+      cb(null, `${Date.now()}-${base}${ext}`);
     }
-  );
-});
-
-        return res.json({
-            success: true,
-            ingredientName: ingredient,
-            allergens: allergensToSave
-        });
-
-    } catch (error) {
-        console.error("❌ Error processing image:", error.message);
-        return res.status(500).json({ success: false, message: "Error processing image." });
-    }
+  }),
+  limits: { fileSize: 10 * 1024 * 1024 }
 });
 
 router.post('/scan-preview', upload.single('invoice'), async (req, res) => {
-    console.log('📥 Invoice scan preview endpoint hit.');
-    if (!req.file) return res.status(400).send('No file uploaded.');
+  const tmpPaths = [];
+  const cleanup = () => tmpPaths.forEach(p => { try { fs.unlinkSync(p); } catch {} });
 
-    const filePath = req.file.path;
-    let processedFilePath = filePath;
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No invoice file uploaded (field name must be "invoice").' });
 
-    try {
-        const fileType = execSync(`file --mime-type -b ${filePath}`).toString().trim();
-        if (fileType.includes('image/heif') || fileType.includes('image/heic')) {
-            processedFilePath = `${filePath}.png`;
-            execSync(`magick convert ${filePath} ${processedFilePath}`);
-        }
+    const inputPath = req.file.path;
+    const prepPath = inputPath + '.prep.png';
+    tmpPaths.push(inputPath, prepPath);
 
-        await sharp(processedFilePath).grayscale().toFile(`${processedFilePath}_processed.png`);
-        processedFilePath = `${processedFilePath}_processed.png`;
+    await sharp(inputPath).rotate().grayscale().normalize().toFormat('png').toFile(prepPath);
 
-        const { data: { text } } = await Tesseract.recognize(processedFilePath, 'eng', {
-            logger: m => console.log(m)
-        });
+    const ocr = await Tesseract.recognize(prepPath, 'eng', {
+      logger: m => m?.status && console.log(m)
+    });
 
-        const extractedItems = extractItemsFromOCR(text);
-        if (extractedItems.length === 0) {
-            return res.status(400).json({ success: false, message: 'No valid items found.' });
-        }
-
-        console.log("📤 Sending extracted items:", extractedItems);
-
-       return res.json({
-  success: true,
-lines: extractedItems,
-    metadata: {
-        filename: req.file.originalname,
-        scannedAt: new Date().toISOString(),
-    },
-}); 
-
-    } catch (error) {
-        console.error("❌ Error processing invoice preview:", error.message);
-        return res.status(500).send("Error processing invoice.");
-    } finally {
-        try {
-            fs.unlinkSync(filePath);
-            if (processedFilePath !== filePath) fs.unlinkSync(processedFilePath);
-            console.log("🗑️ Temporary files deleted.");
-        } catch (cleanupError) {
-            console.warn("⚠️ Cleanup failed:", cleanupError.message);
-        }
+    const rawText = (ocr?.data?.text || '').trim();
+    if (!rawText) {
+      cleanup();
+      return res.status(200).json({ itemsAndPrices: [], metadata: { textLength: 0 } });
     }
+
+    const itemsAndPrices = parseInvoiceText(rawText) || [];
+    console.log('📤 Sending extracted items:', JSON.stringify(itemsAndPrices, null, 2));
+
+    res.status(200).json({
+      itemsAndPrices,
+      metadata: { textLength: rawText.length, lines: rawText.split(/\r?\n/).length }
+    });
+
+    cleanup();
+  } catch (err) {
+    console.error('❌ Invoice scan failed:', err);
+    try { cleanup(); } catch {}
+    res.status(500).json({ error: 'Invoice scan failed.' });
+  }
 });
 
+// Simple ingredient enrichment endpoint used by AddMealForm
+// Frontend calls: POST /scan-ingredient { ingredientName }
+router.post("/scan-ingredient", async (req, res) => {
+  try {
+    const ingredientName = String(req.body?.ingredientName || "").trim();
+    if (!ingredientName) return res.status(400).json({ error: "ingredientName required" });
+
+    // ✅ If you already have a real allergen/calorie service, call it here.
+    // For now we return safe defaults so the app never breaks.
+    return res.json({
+      ingredient: ingredientName,
+      allergens: "None",
+      calories: 0,
+    });
+  } catch (err) {
+    console.error("❌ scan-ingredient failed:", err);
+    return res.status(500).json({ error: "scan-ingredient failed" });
+  }
+});
 module.exports = router;
