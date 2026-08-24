@@ -146,6 +146,8 @@ async function getRestaurantIdForeignKeys(client, table) {
       AND child_ns.nspname = 'public'
       AND child_rel.relname = $1
       AND child_col.attname = 'restaurant_id'
+      AND cardinality(c.conkey) = 1
+      AND cardinality(c.confkey) = 1
     ORDER BY c.conname
     `,
     [table]

@@ -28,6 +28,14 @@ const {
 } = require('../migrations/canonicalMenuScheduling.pg');
 
 const {
+  runCanonicalFinancialLedgerPg,
+} = require('../migrations/canonicalFinancialLedger.pg');
+
+const {
+  runCanonicalCommercialPricingPg,
+} = require('../migrations/canonicalCommercialPricing.pg');
+
+const {
   runBootMigrationsPg,
 } = require('../migrations/boot.pg');
 
@@ -67,6 +75,14 @@ async function main() {
     });
 
     await runCanonicalMenuSchedulingPg({
+      pool,
+    });
+
+    await runCanonicalFinancialLedgerPg({
+      pool,
+    });
+
+    await runCanonicalCommercialPricingPg({
       pool,
     });
 
