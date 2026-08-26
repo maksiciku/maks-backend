@@ -203,6 +203,230 @@ async function getUnusedUrl() {
   return `http://127.0.0.1:${port}`;
 }
 
+
+/*
+ * Cloud stub used specifically by the automatic sync
+ * tests.
+ *
+ * Heartbeat remains available while push availability
+ * can be turned off/on during the same running agent.
+ */
+async function createSyncCloudStub({
+  restaurantId,
+  pushAvailable = true,
+} = {}) {
+  const requests = [];
+
+  const state = {
+    pushAvailable,
+  };
+
+  const server =
+    http.createServer(
+      (req, res) => {
+        const chunks = [];
+
+        req.on(
+          "data",
+          (chunk) => {
+            chunks.push(
+              chunk
+            );
+          }
+        );
+
+        req.on(
+          "end",
+          () => {
+            let body = null;
+
+            try {
+              body =
+                JSON.parse(
+                  Buffer.concat(
+                    chunks
+                  ).toString(
+                    "utf8"
+                  ) || "{}"
+                );
+            } catch {
+              body = null;
+            }
+
+            const record = {
+              method:
+                req.method,
+
+              url:
+                req.url,
+
+              headers:
+                req.headers,
+
+              body,
+
+              receivedAt:
+                Date.now(),
+
+              responseStatus:
+                null,
+            };
+
+            requests.push(
+              record
+            );
+
+            let status = 404;
+
+            let responseBody = {
+              success:
+                false,
+
+              code:
+                "MAKS_TEST_NOT_FOUND",
+            };
+
+            if (
+              req.method ===
+                "POST" &&
+              req.url ===
+                "/edge/heartbeat"
+            ) {
+              status = 200;
+
+              responseBody = {
+                success:
+                  true,
+
+                edge: {
+                  restaurant_id:
+                    Number(
+                      restaurantId
+                    ),
+                },
+
+                heartbeat_interval_seconds:
+                  15,
+              };
+            } else if (
+              req.method ===
+                "POST" &&
+              req.url ===
+                "/edge/sync/push"
+            ) {
+              if (
+                state
+                  .pushAvailable
+              ) {
+                status = 200;
+
+                const events =
+                  Array.isArray(
+                    body?.events
+                  )
+                    ? body.events
+                    : [];
+
+                responseBody = {
+                  success:
+                    true,
+
+                  restaurant_id:
+                    Number(
+                      restaurantId
+                    ),
+
+                  acked:
+                    events.map(
+                      (event) => ({
+                        event_id:
+                          event
+                            ?.event_id,
+
+                        duplicate:
+                          false,
+                      })
+                    ),
+
+                  rejected:
+                    [],
+                };
+              } else {
+                status = 503;
+
+                responseBody = {
+                  success:
+                    false,
+
+                  code:
+                    "MAKS_TEST_CLOUD_UNAVAILABLE",
+
+                  error:
+                    "Simulated Cloud sync outage",
+                };
+              }
+            }
+
+            record.responseStatus =
+              status;
+
+            res.statusCode =
+              status;
+
+            res.setHeader(
+              "content-type",
+              "application/json"
+            );
+
+            res.end(
+              JSON.stringify(
+                responseBody
+              )
+            );
+          }
+        );
+      }
+    );
+
+  await new Promise(
+    (resolve, reject) => {
+      server.once(
+        "error",
+        reject
+      );
+
+      server.listen(
+        0,
+        "127.0.0.1",
+        resolve
+      );
+    }
+  );
+
+  const address =
+    server.address();
+
+  return {
+    server,
+    requests,
+    state,
+
+    url:
+      `http://127.0.0.1:${address.port}`,
+
+    async close() {
+      await new Promise(
+        (resolve) => {
+          server.close(
+            resolve
+          );
+        }
+      );
+    },
+  };
+}
+
+
 function spawnAgent({
   cloudUrl,
   databaseUrl,
@@ -215,6 +439,7 @@ function spawnAgent({
   version =
     "edge-agent-attack-0.1.0",
   heartbeatMs = "5000",
+  syncMs = "1000",
 } = {}) {
   const env = {
     ...process.env,
@@ -236,6 +461,9 @@ function spawnAgent({
 
     MAKS_EDGE_HEARTBEAT_MS:
       heartbeatMs,
+
+    MAKS_EDGE_SYNC_MS:
+      syncMs,
   };
 
   const child = spawn(
@@ -324,7 +552,7 @@ async function stopAgent(agent) {
 test(
   "MAKS Edge runtime attack",
   {
-    timeout: 60000,
+    timeout: 90000,
   },
   async (t) => {
     assert.ok(
@@ -775,15 +1003,9 @@ test(
           );
 
           assert.equal(
-            typeof body
-              ?.last_sync_error,
-            "string"
-          );
-
-          assert.ok(
             body
-              .last_sync_error
-              .length > 0
+              ?.last_sync_error,
+            null
           );
 
           assert.equal(
@@ -867,6 +1089,760 @@ test(
       }
     );
 
+    await t.test(
+      "automatic Edge push drains pending outbox and reports real sync telemetry",
+      async () => {
+        const localPool =
+          new Pool({
+            connectionString:
+              TEST_DATABASE_URL,
+          });
+
+        let restaurantId =
+          null;
+
+        let cloud =
+          null;
+
+        let agent =
+          null;
+
+        try {
+          const restaurant =
+            await localPool.query(
+              `
+              INSERT INTO
+                public.restaurants
+              (
+                name
+              )
+              VALUES
+              (
+                $1
+              )
+              RETURNING id
+              `,
+              [
+                `EDGE AGENT AUTO PUSH ${crypto.randomUUID()}`,
+              ]
+            );
+
+          restaurantId =
+            Number(
+              restaurant
+                .rows[0]
+                .id
+            );
+
+          const eventId =
+            crypto.randomUUID();
+
+          const entityId =
+            crypto.randomUUID();
+
+          const payload = {
+            schema_version:
+              1,
+
+            attack:
+              "automatic-push",
+
+            restaurant_id:
+              restaurantId,
+          };
+
+          await localPool.query(
+            `
+            INSERT INTO
+              public.edge_outbox
+            (
+              event_id,
+              restaurant_id,
+              event_type,
+              entity_type,
+              entity_id,
+              idempotency_key,
+              payload,
+              payload_hash
+            )
+            VALUES
+            (
+              $1::uuid,
+              $2,
+              'pos.order.submitted',
+              'order_batch',
+              $3,
+              $4,
+              $5::jsonb,
+              $6
+            )
+            `,
+            [
+              eventId,
+              restaurantId,
+              entityId,
+              `agent-auto:${eventId}`,
+              JSON.stringify(
+                payload
+              ),
+              "a".repeat(
+                64
+              ),
+            ]
+          );
+
+          cloud =
+            await createSyncCloudStub({
+              restaurantId,
+
+              pushAvailable:
+                true,
+            });
+
+          agent =
+            spawnAgent({
+              cloudUrl:
+                cloud.url,
+
+              databaseUrl:
+                TEST_DATABASE_URL,
+
+              heartbeatMs:
+                "5000",
+
+              syncMs:
+                "1000",
+            });
+
+          await waitFor(
+            async () => {
+              const result =
+                await localPool.query(
+                  `
+                  SELECT
+                    status
+                  FROM
+                    public.edge_outbox
+                  WHERE
+                    event_id =
+                      $1::uuid
+                  `,
+                  [
+                    eventId,
+                  ]
+                );
+
+              return (
+                result
+                  .rows?.[0]
+                  ?.status ===
+                "acked"
+              );
+            },
+            {
+              timeoutMs:
+                10000,
+
+              message:
+                "Automatic Edge push did not ACK pending event",
+            }
+          );
+
+          assert.equal(
+            agent.child.exitCode,
+            null
+          );
+
+          const pushRequests =
+            cloud.requests.filter(
+              (entry) =>
+                entry.url ===
+                "/edge/sync/push"
+            );
+
+          assert.ok(
+            pushRequests.length >=
+              1
+          );
+
+          assert.ok(
+            pushRequests.some(
+              (entry) =>
+                entry.body
+                  ?.events
+                  ?.some(
+                    (event) =>
+                      event
+                        ?.event_id ===
+                      eventId
+                  )
+            )
+          );
+
+          const state =
+            await localPool.query(
+              `
+              SELECT
+                sync_status,
+                pending_outbox_events,
+                last_success_at,
+                last_error
+              FROM
+                public.edge_sync_state
+              WHERE
+                restaurant_id = $1
+                AND
+                installation_id =
+                  $2::uuid
+              `,
+              [
+                restaurantId,
+                agent.installationId,
+              ]
+            );
+
+          assert.equal(
+            state
+              .rows?.[0]
+              ?.sync_status,
+            "synced"
+          );
+
+          assert.equal(
+            Number(
+              state
+                .rows?.[0]
+                ?.pending_outbox_events ||
+              0
+            ),
+            0
+          );
+
+          assert.ok(
+            state
+              .rows?.[0]
+              ?.last_success_at
+          );
+
+          assert.equal(
+            state
+              .rows?.[0]
+              ?.last_error,
+            null
+          );
+
+          /*
+           * Wait for the next heartbeat so Control
+           * Centre telemetry proves the sync result too.
+           */
+          await waitFor(
+            () =>
+              cloud.requests.some(
+                (entry) =>
+                  entry.url ===
+                    "/edge/heartbeat" &&
+                  entry.body
+                    ?.sync_status ===
+                    "synced" &&
+                  Number(
+                    entry.body
+                      ?.pending_sync_events
+                  ) === 0 &&
+                  typeof entry.body
+                    ?.last_sync_at ===
+                    "string"
+              ),
+            {
+              timeoutMs:
+                9000,
+
+              message:
+                "Heartbeat did not report real synced state",
+            }
+          );
+
+          const syncedHeartbeat =
+            [
+              ...cloud.requests,
+            ]
+              .reverse()
+              .find(
+                (entry) =>
+                  entry.url ===
+                    "/edge/heartbeat" &&
+                  entry.body
+                    ?.sync_status ===
+                    "synced"
+              );
+
+          assert.ok(
+            syncedHeartbeat
+          );
+
+          assert.ok(
+            Number(
+              syncedHeartbeat
+                .body
+                ?.uptime_seconds
+            ) >= 0
+          );
+
+          assert.ok(
+            Number(
+              syncedHeartbeat
+                .body
+                ?.uptime_seconds
+            ) < 120,
+            "Edge uptime should represent this process, not machine uptime"
+          );
+
+          assert.equal(
+            agent.output().includes(
+              agent.secret
+            ),
+            false
+          );
+
+          assert.equal(
+            agent.output().includes(
+              TEST_DATABASE_URL
+            ),
+            false
+          );
+
+          console.log(
+            "✅ 09 Automatic Edge push + real sync telemetry proven"
+          );
+        } finally {
+          if (agent) {
+            await stopAgent(
+              agent
+            );
+          }
+
+          if (cloud) {
+            await cloud.close();
+          }
+
+          if (
+            restaurantId
+          ) {
+            await localPool.query(
+              `
+              DELETE FROM
+                public.restaurants
+              WHERE
+                id = $1
+              `,
+              [
+                restaurantId,
+              ]
+            );
+          }
+
+          await localPool.end();
+        }
+      }
+    );
+
+
+    await t.test(
+      "automatic Edge sync recovers when Cloud push returns",
+      async () => {
+        const localPool =
+          new Pool({
+            connectionString:
+              TEST_DATABASE_URL,
+          });
+
+        let restaurantId =
+          null;
+
+        let cloud =
+          null;
+
+        let agent =
+          null;
+
+        try {
+          const restaurant =
+            await localPool.query(
+              `
+              INSERT INTO
+                public.restaurants
+              (
+                name
+              )
+              VALUES
+              (
+                $1
+              )
+              RETURNING id
+              `,
+              [
+                `EDGE AGENT RECOVERY ${crypto.randomUUID()}`,
+              ]
+            );
+
+          restaurantId =
+            Number(
+              restaurant
+                .rows[0]
+                .id
+            );
+
+          const eventId =
+            crypto.randomUUID();
+
+          const payload = {
+            schema_version:
+              1,
+
+            attack:
+              "cloud-recovery",
+
+            restaurant_id:
+              restaurantId,
+          };
+
+          await localPool.query(
+            `
+            INSERT INTO
+              public.edge_outbox
+            (
+              event_id,
+              restaurant_id,
+              event_type,
+              entity_type,
+              entity_id,
+              idempotency_key,
+              payload,
+              payload_hash
+            )
+            VALUES
+            (
+              $1::uuid,
+              $2,
+              'pos.order.submitted',
+              'order_batch',
+              $3,
+              $4,
+              $5::jsonb,
+              $6
+            )
+            `,
+            [
+              eventId,
+              restaurantId,
+              crypto.randomUUID(),
+              `agent-recovery:${eventId}`,
+              JSON.stringify(
+                payload
+              ),
+              "b".repeat(
+                64
+              ),
+            ]
+          );
+
+          cloud =
+            await createSyncCloudStub({
+              restaurantId,
+
+              pushAvailable:
+                false,
+            });
+
+          agent =
+            spawnAgent({
+              cloudUrl:
+                cloud.url,
+
+              databaseUrl:
+                TEST_DATABASE_URL,
+
+              heartbeatMs:
+                "5000",
+
+              syncMs:
+                "1000",
+            });
+
+          /*
+           * Cloud heartbeat works, but sync/push fails.
+           * The local event must remain durable.
+           */
+          await waitFor(
+            async () => {
+              const result =
+                await localPool.query(
+                  `
+                  SELECT
+                    status
+                  FROM
+                    public.edge_outbox
+                  WHERE
+                    event_id =
+                      $1::uuid
+                  `,
+                  [
+                    eventId,
+                  ]
+                );
+
+              return (
+                result
+                  .rows?.[0]
+                  ?.status ===
+                "failed"
+              );
+            },
+            {
+              timeoutMs:
+                10000,
+
+              message:
+                "Simulated Cloud outage did not leave event retryable",
+            }
+          );
+
+          assert.equal(
+            agent.child.exitCode,
+            null
+          );
+
+          const failedState =
+            await localPool.query(
+              `
+              SELECT
+                sync_status,
+                pending_outbox_events,
+                consecutive_failures,
+                last_error
+              FROM
+                public.edge_sync_state
+              WHERE
+                restaurant_id = $1
+                AND
+                installation_id =
+                  $2::uuid
+              `,
+              [
+                restaurantId,
+                agent.installationId,
+              ]
+            );
+
+          assert.equal(
+            failedState
+              .rows?.[0]
+              ?.sync_status,
+            "error"
+          );
+
+          assert.ok(
+            Number(
+              failedState
+                .rows?.[0]
+                ?.pending_outbox_events ||
+              0
+            ) >= 1
+          );
+
+          assert.ok(
+            Number(
+              failedState
+                .rows?.[0]
+                ?.consecutive_failures ||
+              0
+            ) >= 1
+          );
+
+          assert.equal(
+            typeof failedState
+              .rows?.[0]
+              ?.last_error,
+            "string"
+          );
+
+          /*
+           * Internet/Cloud comes back.
+           *
+           * No manual push command.
+           * No direct outbox modification.
+           */
+          cloud.state.pushAvailable =
+            true;
+
+          await waitFor(
+            async () => {
+              const result =
+                await localPool.query(
+                  `
+                  SELECT
+                    status
+                  FROM
+                    public.edge_outbox
+                  WHERE
+                    event_id =
+                      $1::uuid
+                  `,
+                  [
+                    eventId,
+                  ]
+                );
+
+              return (
+                result
+                  .rows?.[0]
+                  ?.status ===
+                "acked"
+              );
+            },
+            {
+              timeoutMs:
+                12000,
+
+              message:
+                "Edge did not automatically recover after Cloud returned",
+            }
+          );
+
+          assert.equal(
+            agent.child.exitCode,
+            null
+          );
+
+          const pushes =
+            cloud.requests.filter(
+              (entry) =>
+                entry.url ===
+                "/edge/sync/push"
+            );
+
+          assert.ok(
+            pushes.length >=
+              2,
+            "Expected failed push followed by automatic retry"
+          );
+
+          assert.ok(
+            pushes.some(
+              (entry) =>
+                entry
+                  .responseStatus ===
+                503
+            )
+          );
+
+          assert.ok(
+            pushes.some(
+              (entry) =>
+                entry
+                  .responseStatus ===
+                200
+            )
+          );
+
+          const recoveredState =
+            await localPool.query(
+              `
+              SELECT
+                sync_status,
+                pending_outbox_events,
+                consecutive_failures,
+                last_success_at,
+                last_error
+              FROM
+                public.edge_sync_state
+              WHERE
+                restaurant_id = $1
+                AND
+                installation_id =
+                  $2::uuid
+              `,
+              [
+                restaurantId,
+                agent.installationId,
+              ]
+            );
+
+          assert.equal(
+            recoveredState
+              .rows?.[0]
+              ?.sync_status,
+            "synced"
+          );
+
+          assert.equal(
+            Number(
+              recoveredState
+                .rows?.[0]
+                ?.pending_outbox_events ||
+              0
+            ),
+            0
+          );
+
+          assert.equal(
+            Number(
+              recoveredState
+                .rows?.[0]
+                ?.consecutive_failures ||
+              0
+            ),
+            0
+          );
+
+          assert.ok(
+            recoveredState
+              .rows?.[0]
+              ?.last_success_at
+          );
+
+          assert.equal(
+            recoveredState
+              .rows?.[0]
+              ?.last_error,
+            null
+          );
+
+          console.log(
+            "✅ 10 Cloud outage backlog automatically recovered"
+          );
+        } finally {
+          if (agent) {
+            await stopAgent(
+              agent
+            );
+          }
+
+          if (cloud) {
+            await cloud.close();
+          }
+
+          if (
+            restaurantId
+          ) {
+            await localPool.query(
+              `
+              DELETE FROM
+                public.restaurants
+              WHERE
+                id = $1
+              `,
+              [
+                restaurantId,
+              ]
+            );
+          }
+
+          await localPool.end();
+        }
+      }
+    );
+
+
     console.log(
       ""
     );
@@ -876,7 +1852,7 @@ test(
     );
 
     console.log(
-      "✅ MAKS EDGE AGENT ATTACK: 8/8"
+      "✅ MAKS EDGE AGENT ATTACK: 10/10"
     );
 
     console.log(
