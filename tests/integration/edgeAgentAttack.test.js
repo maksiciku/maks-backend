@@ -1674,29 +1674,79 @@ test(
           cloud.state.pushAvailable =
             true;
 
+          /*
+           * Recovery is complete only when BOTH:
+           *
+           * 1. the durable outbox event is ACKed, and
+           * 2. edge_sync_state has completed its final
+           *    syncing -> synced transition.
+           *
+           * The outbox ACK intentionally happens before
+           * the final telemetry/state update, so waiting
+           * on ACK alone creates a legitimate race.
+           */
           await waitFor(
             async () => {
               const result =
                 await localPool.query(
                   `
                   SELECT
-                    status
+                    o.status
+                      AS outbox_status,
+
+                    s.sync_status,
+                    s.pending_outbox_events,
+                    s.consecutive_failures,
+                    s.last_success_at,
+                    s.last_error
                   FROM
-                    public.edge_outbox
+                    public.edge_outbox o
+                  LEFT JOIN
+                    public.edge_sync_state s
+                    ON
+                      s.restaurant_id =
+                        o.restaurant_id
+                      AND
+                      s.installation_id =
+                        $2::uuid
                   WHERE
-                    event_id =
+                    o.event_id =
                       $1::uuid
+                  LIMIT 1
                   `,
                   [
                     eventId,
+                    agent.installationId,
                   ]
                 );
 
+              const row =
+                result.rows?.[0];
+
               return (
-                result
-                  .rows?.[0]
-                  ?.status ===
-                "acked"
+                row
+                  ?.outbox_status ===
+                  "acked" &&
+                row
+                  ?.sync_status ===
+                  "synced" &&
+                Number(
+                  row
+                    ?.pending_outbox_events ||
+                  0
+                ) === 0 &&
+                Number(
+                  row
+                    ?.consecutive_failures ||
+                  0
+                ) === 0 &&
+                Boolean(
+                  row
+                    ?.last_success_at
+                ) &&
+                row
+                  ?.last_error ===
+                  null
               );
             },
             {
@@ -1704,7 +1754,7 @@ test(
                 12000,
 
               message:
-                "Edge did not automatically recover after Cloud returned",
+                "Edge ACKed the event but did not complete synced recovery state",
             }
           );
 

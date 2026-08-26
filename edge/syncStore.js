@@ -1129,11 +1129,18 @@ async function receiveInboxEventTx(
 async function receiveInboxEvent(
   args
 ) {
-  return withTx(
+  const {
+    pool = null,
+    ...eventArgs
+  } =
+    args || {};
+
+  return runSyncTx(
+    pool,
     (tx) =>
       receiveInboxEventTx(
         tx,
-        args
+        eventArgs
       )
   );
 }

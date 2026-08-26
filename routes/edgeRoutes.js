@@ -13,6 +13,8 @@ const {
   EdgeSyncError,
   hashJson,
   receiveInboxEvent,
+  claimOutboxEvents,
+  ackOutboxEvent,
 } = require(
   "../edge/syncStore"
 );
@@ -995,6 +997,470 @@ router.post(
 
           error:
             "MAKS Edge push failed",
+        });
+    }
+  }
+);
+
+
+/*
+ * =========================================================
+ * CLOUD → EDGE PULL TRANSPORT
+ * =========================================================
+ *
+ * Cloud edge_outbox is the durable source.
+ * The authenticated installation determines restaurant
+ * ownership. The Edge may never request another tenant.
+ */
+
+function edgePullWorkerId(
+  installationId
+) {
+  return (
+    "edge-pull:" +
+    String(
+      installationId
+    )
+  );
+}
+
+
+function serializeCloudEvent(
+  row
+) {
+  return {
+    event_id:
+      row.event_id,
+
+    restaurant_id:
+      Number(
+        row.restaurant_id
+      ),
+
+    event_type:
+      row.event_type,
+
+    entity_type:
+      row.entity_type ||
+      null,
+
+    entity_id:
+      row.entity_id ||
+      null,
+
+    idempotency_key:
+      row.idempotency_key,
+
+    payload:
+      row.payload,
+
+    payload_hash:
+      row.payload_hash,
+
+    created_at:
+      row.created_at,
+  };
+}
+
+
+router.post(
+  "/sync/pull",
+  async (req, res) => {
+    try {
+      const edge =
+        await authenticateEdgeRequest(
+          req
+        );
+
+      const restaurantId =
+        Number(
+          edge.restaurant_id
+        );
+
+      const installationId =
+        String(
+          edge.installation_id
+        );
+
+      const requestedLimit =
+        req.body?.limit ===
+          undefined
+          ? 25
+          : Number(
+              req.body.limit
+            );
+
+      if (
+        !Number.isSafeInteger(
+          requestedLimit
+        ) ||
+        requestedLimit < 1 ||
+        requestedLimit > 25
+      ) {
+        return res
+          .status(400)
+          .json({
+            success:
+              false,
+
+            code:
+              "EDGE_PULL_LIMIT_INVALID",
+
+            error:
+              "Pull limit must be between 1 and 25",
+          });
+      }
+
+      const events =
+        await claimOutboxEvents({
+          restaurantId,
+
+          workerId:
+            edgePullWorkerId(
+              installationId
+            ),
+
+          limit:
+            requestedLimit,
+
+          leaseSeconds:
+            30,
+        });
+
+      return res.json({
+        success:
+          true,
+
+        restaurant_id:
+          restaurantId,
+
+        installation_id:
+          installationId,
+
+        events:
+          events.map(
+            serializeCloudEvent
+          ),
+
+        server_time:
+          new Date()
+            .toISOString(),
+      });
+    } catch (error) {
+      const status =
+        Number(
+          error?.statusCode
+        );
+
+      if (
+        status === 401 ||
+        status === 403
+      ) {
+        return res
+          .status(status)
+          .json({
+            success:
+              false,
+
+            code:
+              error.code ||
+              "EDGE_AUTH_INVALID",
+
+            error:
+              error.message ||
+              "MAKS Edge authentication failed",
+          });
+      }
+
+      if (
+        error instanceof
+          EdgeSyncError
+      ) {
+        return res
+          .status(400)
+          .json({
+            success:
+              false,
+
+            code:
+              error.code,
+
+            error:
+              error.message,
+          });
+      }
+
+      console.error(
+        "❌ MAKS Edge pull failed:",
+        error
+      );
+
+      return res
+        .status(500)
+        .json({
+          success:
+            false,
+
+          code:
+            "EDGE_PULL_FAILED",
+
+          error:
+            "MAKS Edge pull failed",
+        });
+    }
+  }
+);
+
+
+router.post(
+  "/sync/pull/ack",
+  async (req, res) => {
+    try {
+      const edge =
+        await authenticateEdgeRequest(
+          req
+        );
+
+      const restaurantId =
+        Number(
+          edge.restaurant_id
+        );
+
+      const installationId =
+        String(
+          edge.installation_id
+        );
+
+      const eventIds =
+        req.body
+          ?.event_ids;
+
+      if (
+        !Array.isArray(
+          eventIds
+        )
+      ) {
+        return res
+          .status(400)
+          .json({
+            success:
+              false,
+
+            code:
+              "EDGE_PULL_ACK_REQUIRED",
+
+            error:
+              "event_ids must be an array",
+          });
+      }
+
+      if (
+        eventIds.length >
+        25
+      ) {
+        return res
+          .status(400)
+          .json({
+            success:
+              false,
+
+            code:
+              "EDGE_PULL_ACK_TOO_LARGE",
+
+            error:
+              "A maximum of 25 events may be acknowledged at once",
+          });
+      }
+
+      const workerId =
+        edgePullWorkerId(
+          installationId
+        );
+
+      const acked = [];
+      const rejected = [];
+
+      for (
+        const rawEventId of
+          eventIds
+      ) {
+        const eventId =
+          String(
+            rawEventId ||
+            ""
+          ).trim();
+
+        if (
+          !isUuid(
+            eventId
+          )
+        ) {
+          rejected.push({
+            event_id:
+              eventId ||
+              null,
+
+            code:
+              "EDGE_EVENT_ID_INVALID",
+
+            error:
+              "event_id must be a UUID",
+          });
+
+          continue;
+        }
+
+        try {
+          await ackOutboxEvent({
+            restaurantId,
+
+            eventId,
+
+            workerId,
+          });
+
+          acked.push({
+            event_id:
+              eventId,
+
+            duplicate:
+              false,
+          });
+
+          continue;
+        } catch (error) {
+          /*
+           * ACK itself must be idempotent.
+           *
+           * If Cloud committed the first ACK but the
+           * HTTP response disappeared, the next ACK for
+           * the same restaurant/event is harmless.
+           */
+          if (
+            error instanceof
+              EdgeSyncError &&
+            error.code ===
+              "EDGE_OUTBOX_NOT_OWNED"
+          ) {
+            const existing =
+              await req.qGet(
+                `
+                SELECT
+                  status
+                FROM
+                  public.edge_outbox
+                WHERE
+                  restaurant_id = $1
+                  AND
+                  event_id =
+                    $2::uuid
+                LIMIT 1
+                `,
+                [
+                  restaurantId,
+                  eventId,
+                ]
+              );
+
+            if (
+              existing
+                ?.status ===
+              "acked"
+            ) {
+              acked.push({
+                event_id:
+                  eventId,
+
+                duplicate:
+                  true,
+              });
+
+              continue;
+            }
+          }
+
+          if (
+            error instanceof
+              EdgeSyncError
+          ) {
+            rejected.push({
+              event_id:
+                eventId,
+
+              code:
+                error.code,
+
+              error:
+                error.message,
+            });
+
+            continue;
+          }
+
+          throw error;
+        }
+      }
+
+      return res.json({
+        success:
+          true,
+
+        restaurant_id:
+          restaurantId,
+
+        installation_id:
+          installationId,
+
+        acked,
+
+        rejected,
+
+        server_time:
+          new Date()
+            .toISOString(),
+      });
+    } catch (error) {
+      const status =
+        Number(
+          error?.statusCode
+        );
+
+      if (
+        status === 401 ||
+        status === 403
+      ) {
+        return res
+          .status(status)
+          .json({
+            success:
+              false,
+
+            code:
+              error.code ||
+              "EDGE_AUTH_INVALID",
+
+            error:
+              error.message ||
+              "MAKS Edge authentication failed",
+          });
+      }
+
+      console.error(
+        "❌ MAKS Edge pull ACK failed:",
+        error
+      );
+
+      return res
+        .status(500)
+        .json({
+          success:
+            false,
+
+          code:
+            "EDGE_PULL_ACK_FAILED",
+
+          error:
+            "MAKS Edge pull acknowledgement failed",
         });
     }
   }
