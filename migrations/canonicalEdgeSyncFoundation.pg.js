@@ -229,6 +229,20 @@ async function runCanonicalEdgeSyncFoundationPg({
       );
     `);
 
+    // Inbox workers need durable ownership so an
+    // interrupted "applying" event can later be reclaimed.
+    await client.query(`
+      ALTER TABLE public.edge_inbox
+        ADD COLUMN IF NOT EXISTS
+          locked_at TIMESTAMPTZ;
+    `);
+
+    await client.query(`
+      ALTER TABLE public.edge_inbox
+        ADD COLUMN IF NOT EXISTS
+          locked_by TEXT;
+    `);
+
     // =====================================================
     // EDGE IDEMPOTENCY
     //
@@ -898,6 +912,28 @@ async function runCanonicalEdgeSyncFoundationPg({
 
     await client.query(`
       CREATE INDEX IF NOT EXISTS
+        idx_edge_outbox_stale_lock
+      ON public.edge_outbox (
+        restaurant_id,
+        locked_at,
+        id
+      )
+      WHERE status = 'in_flight';
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS
+        idx_edge_inbox_stale_lock
+      ON public.edge_inbox (
+        restaurant_id,
+        locked_at,
+        id
+      )
+      WHERE status = 'applying';
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS
         idx_edge_sync_state_status
       ON public.edge_sync_state (
         sync_status,
@@ -1207,6 +1243,24 @@ async function runCanonicalEdgeSyncFoundationPg({
         (
           status <> 'applied'
           AND applied_at IS NULL
+        )
+      )
+      `
+    );
+
+    await ensureConstraint(
+      client,
+      "edge_inbox",
+      "edge_inbox_applying_lock_check",
+      `
+      CHECK (
+        status <> 'applying'
+        OR (
+          locked_at IS NOT NULL
+          AND NULLIF(
+            TRIM(locked_by),
+            ''
+          ) IS NOT NULL
         )
       )
       `

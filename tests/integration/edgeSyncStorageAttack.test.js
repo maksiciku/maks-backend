@@ -504,6 +504,8 @@ test(
             SET
               status = 'acked',
               acked_at = NOW(),
+              locked_at = NULL,
+              locked_by = NULL,
               updated_at = NOW()
             WHERE id = $1
             `,
@@ -692,6 +694,27 @@ test(
       await t.test(
         "inbox legal apply progression works and applied state cannot reopen",
         async () => {
+          await expectReject(
+            () =>
+              client.query(
+                `
+                UPDATE public.edge_inbox
+                SET
+                  status = 'applying',
+                  apply_attempts =
+                    apply_attempts + 1,
+                  last_attempt_at = NOW(),
+                  updated_at = NOW()
+                WHERE id = $1
+                `,
+                [inboxId]
+              ),
+            {
+              message:
+                "Inbox event entered applying without a worker lease",
+            }
+          );
+
           await client.query(
             `
             UPDATE public.edge_inbox
@@ -699,6 +722,9 @@ test(
               status = 'applying',
               apply_attempts =
                 apply_attempts + 1,
+              locked_at = NOW(),
+              locked_by =
+                'edge-attack-worker',
               last_attempt_at = NOW(),
               updated_at = NOW()
             WHERE id = $1
@@ -712,6 +738,8 @@ test(
             SET
               status = 'applied',
               applied_at = NOW(),
+              locked_at = NULL,
+              locked_by = NULL,
               updated_at = NOW()
             WHERE id = $1
             `,
