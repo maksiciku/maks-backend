@@ -17,6 +17,10 @@ const LIVE_DELETE = ["owner", "admin", "manager"];
 const { audit } = require("../utils/audit");
 
 const {
+  enqueueEdgeEventTx,
+} = require("../edge/syncStore");
+
+const {
   ItemAvailabilityError,
   reserveItemsAvailability,
   consumeAvailabilityReservationsForBatch,
@@ -2752,9 +2756,11 @@ const unitVatAmount =
         ? new Date(Date.now() + 20 * 60 * 1000).toISOString()
         : null;
 
+  const createdIds = [];
+
   if (tx.kind === "pg") {
     for (let i = 0; i < qty; i++) {
-      await tx.qRun(
+      const created = await tx.qGet(
   `
   INSERT INTO pos_orders (
     restaurant_id,
@@ -2804,6 +2810,7 @@ const unitVatAmount =
     $22::jsonb,
     $23,$24,$25,$26,$27,$28
   )
+  RETURNING id
   `,
   [
     Number(restaurantId),
@@ -2890,9 +2897,21 @@ const unitVatAmount =
     safeExpiresAt,
   ]
 );
+
+      if (!created?.id) {
+        throw new Error(
+          "POS bill row INSERT did not return an id"
+        );
+      }
+
+      createdIds.push(
+        Number(created.id)
+      );
     }
 
-    return;
+    return {
+      ids: createdIds,
+    };
   }
 
   for (let i = 0; i < qty; i++) {
@@ -2951,6 +2970,10 @@ const unitVatAmount =
       ]
     );
   }
+
+  return {
+    ids: createdIds,
+  };
 }
 
 function normalizeStationKey(v) {
@@ -4129,7 +4152,17 @@ const batchId =
     : require("crypto").randomUUID();
 
 const shouldAppendToExistingBatch =
-  appendBatchIdRaw && isUuidLocal(appendBatchIdRaw);
+  Boolean(
+    appendBatchIdRaw &&
+    isUuidLocal(appendBatchIdRaw)
+  );
+
+/*
+ * batch_id identifies the whole ticket.
+ * submissionId identifies this individual Send / append.
+ */
+const submissionId =
+  require("crypto").randomUUID();
 
   console.log(
     "SENDING ITEMS:",
@@ -4450,6 +4483,8 @@ const availabilityReservations =
 
     batchId,
 
+    submissionId,
+
     // IMPORTANT:
     // availability uses the server-authoritative identities,
     // not browser-supplied identities.
@@ -4518,6 +4553,19 @@ items: trustedItems,
         throw new Error(`insertPosItems returned non-uuid batchId: ${realBatchId}`);
       }
 
+      /*
+       * =====================================================
+       * MAKS EDGE — AUTHORITATIVE POS ROW OWNERSHIP
+       * =====================================================
+       *
+       * Each quantity unit creates its own public.pos_orders
+       * row. Capture those exact PostgreSQL IDs while still
+       * inside the authoritative order transaction.
+       *
+       * Never discover these later using "latest order".
+       */
+      const createdPosOrderIds = [];
+
       for (const item of trustedItems) {
         const name = String(item.meal_name || item.item_name || "").trim();
         if (!name) continue;
@@ -4551,7 +4599,8 @@ items: trustedItems,
           tableAllergyCodes.includes(code)
         );
 
-        await insertPosBillRow(tx, {
+        const createdBillRows =
+          await insertPosBillRow(tx, {
           restaurantId,
           tableName,
           item: {
@@ -4573,6 +4622,40 @@ items: trustedItems,
           table_covers: tableCovers,
           source: orderSource,
         });
+
+        if (tx.kind === "pg") {
+          const newIds =
+            Array.isArray(
+              createdBillRows?.ids
+            )
+              ? createdBillRows.ids
+                  .map(
+                    (id) =>
+                      Number(id)
+                  )
+                  .filter(
+                    (id) =>
+                      Number.isSafeInteger(id) &&
+                      id > 0
+                  )
+              : [];
+
+          /*
+           * One public.pos_orders row is created per quantity
+           * unit. If that invariant changes unexpectedly,
+           * fail the whole order transaction rather than
+           * produce an incomplete Edge event.
+           */
+          if (newIds.length !== qty) {
+            throw new Error(
+              "POS bill row ID capture mismatch"
+            );
+          }
+
+          createdPosOrderIds.push(
+            ...newIds
+          );
+        }
       }
 
      const pricingDiscount = Number(
@@ -4701,7 +4784,131 @@ if (pricingDiscount > 0 && realBatchId) {
 }
 
       if (isDineIn) {
-        await setTableStatus(tx.qRun, restaurantId, tableName, "occupied");
+        await setTableStatus(
+          tx.qRun,
+          restaurantId,
+          tableName,
+          "occupied"
+        );
+      }
+
+      /*
+       * =====================================================
+       * MAKS EDGE — POS ORDER SUBMITTED
+       * =====================================================
+       *
+       * This outbox INSERT shares the SAME PostgreSQL
+       * transaction as:
+       *
+       * - authoritative pricing
+       * - availability reservation
+       * - order batch
+       * - KDS/order persistence
+       * - POS bill rows
+       * - pricing adjustments
+       * - table status
+       *
+       * Therefore:
+       *
+       *     restaurant operation + Edge event
+       *                   COMMIT
+       *
+       * or neither survives.
+       */
+      if (tx.kind === "pg") {
+        if (!createdPosOrderIds.length) {
+          throw new Error(
+            "Grouped POS order produced no authoritative POS bill row IDs"
+          );
+        }
+
+        await enqueueEdgeEventTx(
+          tx,
+          {
+            restaurantId,
+
+            eventType:
+              "pos.order.submitted",
+
+            entityType:
+              "order_batch",
+
+            entityId:
+              String(
+                realBatchId
+              ),
+
+            /*
+             * Appending to an existing batch is a new
+             * submission inside the same restaurant ticket.
+             */
+            idempotencyKey:
+              `pos.order.submitted:${submissionId}`,
+
+            payload: {
+              schema_version: 1,
+
+              restaurant_id:
+                Number(
+                  restaurantId
+                ),
+
+              batch_id:
+                String(
+                  realBatchId
+                ),
+
+              submission_id:
+                submissionId,
+
+              pos_order_ids:
+                createdPosOrderIds,
+
+              order_type:
+                safeOrderType,
+
+              source:
+                orderSource,
+
+              table_number:
+                tableName,
+
+              pickup_number:
+                pickupNumber,
+
+              append_to_existing_batch:
+                shouldAppendToExistingBatch,
+
+              hold_until_paid:
+                holdQrKioskUntilPaid,
+
+              pricing: {
+                subtotal:
+                  Number(
+                    authoritativeQuote
+                      ?.subtotal || 0
+                  ),
+
+                pricing_discount:
+                  Number(
+                    authoritativeQuote
+                      ?.pricing_discount || 0
+                  ),
+
+                total:
+                  Number(
+                    authoritativeQuote
+                      ?.total || 0
+                  ),
+
+                applied_rules:
+                  authoritativeQuote
+                    ?.applied_rules ||
+                  [],
+              },
+            },
+          }
+        );
       }
 
       return {

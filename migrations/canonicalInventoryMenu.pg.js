@@ -582,6 +582,7 @@ async function runCanonicalInventoryMenuPg({ pool }) {
         id BIGSERIAL PRIMARY KEY,
         restaurant_id BIGINT NOT NULL,
         batch_id UUID NOT NULL,
+        submission_id UUID NOT NULL,
         item_type TEXT NOT NULL,
         item_id BIGINT NOT NULL,
         item_name TEXT,
@@ -603,8 +604,69 @@ async function runCanonicalInventoryMenuPg({ pool }) {
           CHECK (quantity > 0),
         CONSTRAINT item_availability_reservations_status_check
           CHECK (status IN ('reserved', 'consumed', 'released')),
-        CONSTRAINT item_availability_reservation_restaurant_id_batch_id_item_t_key
-          UNIQUE (restaurant_id, batch_id, item_type, item_id)
+        CONSTRAINT item_availability_reservation_submission_key
+          UNIQUE (
+            restaurant_id,
+            batch_id,
+            submission_id,
+            item_type,
+            item_id
+          )
+      );
+    `);
+
+    /*
+     * Existing databases may pre-date submission-aware
+     * availability reservations.
+     *
+     * Historical rows used batch_id itself as their
+     * idempotency identity, so that is the correct backfill.
+     */
+    await ensureColumns(
+      client,
+      "item_availability_reservations",
+      [
+        ["submission_id", "UUID"],
+      ]
+    );
+
+    await client.query(`
+      UPDATE public.item_availability_reservations
+      SET submission_id = batch_id
+      WHERE submission_id IS NULL;
+    `);
+
+    await client.query(`
+      ALTER TABLE public.item_availability_reservations
+      ALTER COLUMN submission_id SET NOT NULL;
+    `);
+
+    await client.query(`
+      ALTER TABLE public.item_availability_reservations
+      DROP CONSTRAINT IF EXISTS
+        item_availability_reservation_restaurant_id_batch_id_item_t_key;
+    `);
+
+    await ensureConstraint(
+      client,
+      "item_availability_reservations",
+      "item_availability_reservation_submission_key",
+      `UNIQUE (
+         restaurant_id,
+         batch_id,
+         submission_id,
+         item_type,
+         item_id
+       )`
+    );
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS
+        idx_item_availability_res_submission
+      ON public.item_availability_reservations (
+        restaurant_id,
+        batch_id,
+        submission_id
       );
     `);
 

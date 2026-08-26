@@ -1486,6 +1486,7 @@ async function findExistingAvailabilityReservation({
   db,
   restaurantId,
   batchId,
+  submissionId,
   itemType,
   itemId,
 }) {
@@ -1501,14 +1502,16 @@ async function findExistingAvailabilityReservation({
 
     WHERE restaurant_id = $1
       AND batch_id = $2::uuid
-      AND item_type = $3
-      AND item_id = $4
+      AND submission_id = $3::uuid
+      AND item_type = $4
+      AND item_id = $5
 
     FOR UPDATE
     `,
     [
       restaurantId,
       batchId,
+      submissionId,
       itemType,
       itemId,
     ]
@@ -1519,6 +1522,7 @@ async function insertAvailabilityReservation({
   db,
   restaurantId,
   batchId,
+  submissionId,
 
   itemType,
   itemId,
@@ -1539,6 +1543,7 @@ async function insertAvailabilityReservation({
     INSERT INTO public.item_availability_reservations (
       restaurant_id,
       batch_id,
+      submission_id,
 
       item_type,
       item_id,
@@ -1559,23 +1564,24 @@ async function insertAvailabilityReservation({
     VALUES (
       $1,
       $2::uuid,
+      $3::uuid,
 
-      $3,
       $4,
       $5,
-
       $6,
+
       $7,
-
       $8,
-      $9,
 
+      $9,
       $10,
+
       $11,
       $12,
+      $13,
 
       CASE
-        WHEN $8 = 'consumed'
+        WHEN $9 = 'consumed'
           THEN NOW()
         ELSE NULL
       END
@@ -1586,6 +1592,7 @@ async function insertAvailabilityReservation({
     [
       restaurantId,
       batchId,
+      submissionId,
 
       itemType,
       itemId,
@@ -1615,6 +1622,7 @@ async function reserveSingleItemAvailability({
   db,
   restaurantId,
   batchId,
+  submissionId,
 
   itemType,
   itemId,
@@ -1635,6 +1643,7 @@ async function reserveSingleItemAvailability({
       db,
       restaurantId,
       batchId,
+      submissionId,
       itemType,
       itemId,
     });
@@ -1804,6 +1813,7 @@ async function reserveSingleItemAvailability({
         db,
         restaurantId,
         batchId,
+        submissionId,
 
         itemType,
         itemId,
@@ -2044,6 +2054,7 @@ async function reserveSingleItemAvailability({
         db,
         restaurantId,
         batchId,
+        submissionId,
 
         itemType,
         itemId,
@@ -2168,6 +2179,7 @@ async function reserveSingleItemAvailability({
       db,
       restaurantId,
       batchId,
+      submissionId,
 
       itemType,
       itemId,
@@ -2237,6 +2249,7 @@ async function reserveItemsAvailability({
   db,
   restaurantId,
   batchId,
+  submissionId = null,
 
   items = [],
 
@@ -2268,6 +2281,30 @@ async function reserveItemsAvailability({
   if (!batchId) {
     throw new Error(
       "batchId is required."
+    );
+  }
+
+
+  /*
+   * Existing callers that do not yet provide a
+   * submission ID retain the historical
+   * one-submission-per-batch identity.
+   */
+  const effectiveSubmissionId =
+    String(
+      submissionId ||
+      batchId ||
+      ""
+    ).trim();
+
+
+  if (
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      effectiveSubmissionId
+    )
+  ) {
+    throw new Error(
+      "submissionId must be a UUID."
     );
   }
 
@@ -2311,6 +2348,8 @@ async function reserveItemsAvailability({
 
         restaurantId,
         batchId,
+        submissionId:
+          effectiveSubmissionId,
 
         itemType:
           item.itemType,

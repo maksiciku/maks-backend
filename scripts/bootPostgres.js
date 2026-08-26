@@ -20,6 +20,10 @@ const {
 } = require('../migrations/canonicalOrderLifecycle.pg');
 
 const {
+  runCanonicalAvailabilitySubmissionPg,
+} = require('../migrations/canonicalAvailabilitySubmission.pg');
+
+const {
   runCanonicalInventoryMenuPg,
 } = require('../migrations/canonicalInventoryMenu.pg');
 
@@ -83,6 +87,19 @@ async function main() {
     });
 
     await runCanonicalOrderLifecyclePg({
+      pool,
+    });
+
+    /*
+     * Existing installations must receive the
+     * submission-aware availability upgrade BEFORE
+     * canonicalInventoryMenu runs.
+     *
+     * This is intentionally independent because an
+     * unrelated later inventory migration failure must
+     * not prevent this required compatibility upgrade.
+     */
+    await runCanonicalAvailabilitySubmissionPg({
       pool,
     });
 
