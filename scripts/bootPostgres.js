@@ -48,6 +48,10 @@ const {
 } = require('../migrations/canonicalEdgeControlPlane.pg');
 
 const {
+  runCanonicalEdgeSyncFoundationPg,
+} = require('../migrations/canonicalEdgeSyncFoundation.pg');
+
+const {
   runBootMigrationsPg,
 } = require('../migrations/boot.pg');
 
@@ -107,6 +111,10 @@ async function main() {
     });
 
     await runCanonicalEdgeControlPlanePg({
+      pool,
+    });
+
+    await runCanonicalEdgeSyncFoundationPg({
       pool,
     });
 
