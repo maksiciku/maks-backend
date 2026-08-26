@@ -9,6 +9,14 @@ const {
   "../utils/edgeAuth"
 );
 
+const {
+  EdgeSyncError,
+  hashJson,
+  receiveInboxEvent,
+} = require(
+  "../edge/syncStore"
+);
+
 const router =
   express.Router();
 
@@ -34,6 +42,135 @@ const SYNC_STATUSES =
     "syncing",
     "error",
   ]);
+
+function edgeAuthError(
+  status,
+  code,
+  message
+) {
+  const error =
+    new Error(message);
+
+  error.statusCode =
+    status;
+
+  error.code =
+    code;
+
+  return error;
+}
+
+
+async function authenticateEdgeRequest(
+  req
+) {
+  const installationId =
+    String(
+      req.headers[
+        "x-edge-installation-id"
+      ] || ""
+    ).trim();
+
+  const suppliedSecret =
+    String(
+      req.headers[
+        "x-edge-secret"
+      ] || ""
+    ).trim();
+
+  if (
+    !installationId ||
+    !suppliedSecret
+  ) {
+    throw edgeAuthError(
+      401,
+      "EDGE_AUTH_REQUIRED",
+      "Missing MAKS Edge credentials"
+    );
+  }
+
+  if (
+    !isUuid(
+      installationId
+    )
+  ) {
+    throw edgeAuthError(
+      401,
+      "EDGE_AUTH_INVALID",
+      "Invalid MAKS Edge credentials"
+    );
+  }
+
+  const edge =
+    await req.qGet(
+      `
+      SELECT
+        e.id,
+        e.restaurant_id,
+        e.installation_id,
+        e.edge_name,
+        e.secret_hash,
+        e.is_active,
+
+        r.name AS restaurant_name,
+        r.account_status
+
+      FROM
+        public.restaurant_edge_nodes e
+
+      JOIN
+        public.restaurants r
+        ON r.id =
+           e.restaurant_id
+
+      WHERE
+        e.installation_id =
+          $1::uuid
+
+      LIMIT 1
+      `,
+      [
+        installationId,
+      ]
+    );
+
+  if (
+    !edge?.id
+  ) {
+    throw edgeAuthError(
+      401,
+      "EDGE_AUTH_INVALID",
+      "Invalid MAKS Edge credentials"
+    );
+  }
+
+  if (
+    edge.is_active !==
+    true
+  ) {
+    throw edgeAuthError(
+      403,
+      "EDGE_DISABLED",
+      "MAKS Edge installation is disabled"
+    );
+  }
+
+  if (
+    !edgeSecretMatches(
+      edge.secret_hash,
+      suppliedSecret
+    )
+  ) {
+    throw edgeAuthError(
+      401,
+      "EDGE_AUTH_INVALID",
+      "Invalid MAKS Edge credentials"
+    );
+  }
+
+  return edge;
+}
+
 
 function badRequest(message) {
   const error =
@@ -529,5 +666,339 @@ router.post(
     }
   }
 );
+
+/*
+ * =========================================================
+ * EDGE → CLOUD PUSH TRANSPORT
+ * =========================================================
+ *
+ * restaurant_id is NEVER trusted as authority.
+ * The authenticated Edge installation owns the tenant.
+ */
+router.post(
+  "/sync/push",
+  async (req, res) => {
+    try {
+      const edge =
+        await authenticateEdgeRequest(
+          req
+        );
+
+      const restaurantId =
+        Number(
+          edge.restaurant_id
+        );
+
+      const installationId =
+        String(
+          edge.installation_id
+        );
+
+      const events =
+        req.body?.events;
+
+      if (
+        !Array.isArray(events)
+      ) {
+        return res
+          .status(400)
+          .json({
+            success: false,
+            code:
+              "EDGE_PUSH_EVENTS_REQUIRED",
+            error:
+              "events must be an array",
+          });
+      }
+
+      if (
+        events.length > 25
+      ) {
+        return res
+          .status(400)
+          .json({
+            success: false,
+            code:
+              "EDGE_PUSH_BATCH_TOO_LARGE",
+            error:
+              "A maximum of 25 Edge events may be pushed at once",
+          });
+      }
+
+      const requestBytes =
+        Buffer.byteLength(
+          JSON.stringify(
+            req.body || {}
+          ),
+          "utf8"
+        );
+
+      if (
+        requestBytes >
+        1024 * 1024
+      ) {
+        return res
+          .status(413)
+          .json({
+            success: false,
+            code:
+              "EDGE_PUSH_PAYLOAD_TOO_LARGE",
+            error:
+              "MAKS Edge push payload is too large",
+          });
+      }
+
+      const acked = [];
+      const rejected = [];
+
+      for (
+        const rawEvent of events
+      ) {
+        const eventId =
+          String(
+            rawEvent
+              ?.event_id ||
+            ""
+          ).trim();
+
+        if (
+          !isUuid(eventId)
+        ) {
+          rejected.push({
+            event_id:
+              eventId ||
+              null,
+
+            code:
+              "EDGE_EVENT_ID_INVALID",
+
+            error:
+              "event_id must be a UUID",
+          });
+
+          continue;
+        }
+
+        const suppliedRestaurantId =
+          Number(
+            rawEvent
+              ?.restaurant_id
+          );
+
+        if (
+          suppliedRestaurantId !==
+          restaurantId
+        ) {
+          rejected.push({
+            event_id:
+              eventId,
+
+            code:
+              "EDGE_TENANT_MISMATCH",
+
+            error:
+              "Edge event restaurant does not match authenticated installation",
+          });
+
+          continue;
+        }
+
+        const suppliedHash =
+          String(
+            rawEvent
+              ?.payload_hash ||
+            ""
+          )
+            .trim()
+            .toLowerCase();
+
+        if (
+          !/^[0-9a-f]{64}$/.test(
+            suppliedHash
+          )
+        ) {
+          rejected.push({
+            event_id:
+              eventId,
+
+            code:
+              "EDGE_PAYLOAD_HASH_INVALID",
+
+            error:
+              "payload_hash is invalid",
+          });
+
+          continue;
+        }
+
+        let calculatedHash;
+
+        try {
+          calculatedHash =
+            hashJson(
+              rawEvent?.payload
+            );
+        } catch (error) {
+          rejected.push({
+            event_id:
+              eventId,
+
+            code:
+              error?.code ||
+              "EDGE_PAYLOAD_INVALID",
+
+            error:
+              error?.message ||
+              "Edge payload is invalid",
+          });
+
+          continue;
+        }
+
+        if (
+          calculatedHash !==
+          suppliedHash
+        ) {
+          rejected.push({
+            event_id:
+              eventId,
+
+            code:
+              "EDGE_PAYLOAD_HASH_MISMATCH",
+
+            error:
+              "Edge payload does not match payload_hash",
+          });
+
+          continue;
+        }
+
+        try {
+          const received =
+            await receiveInboxEvent({
+              eventId,
+
+              restaurantId,
+
+              source:
+                "edge",
+
+              sourceInstallationId:
+                installationId,
+
+              eventType:
+                rawEvent
+                  ?.event_type,
+
+              entityType:
+                rawEvent
+                  ?.entity_type ??
+                null,
+
+              entityId:
+                rawEvent
+                  ?.entity_id ??
+                null,
+
+              payload:
+                rawEvent
+                  ?.payload,
+            });
+
+          acked.push({
+            event_id:
+              eventId,
+
+            duplicate:
+              received
+                ?.duplicate ===
+              true,
+          });
+        } catch (error) {
+          if (
+            error instanceof
+              EdgeSyncError
+          ) {
+            rejected.push({
+              event_id:
+                eventId,
+
+              code:
+                error.code ||
+                "EDGE_EVENT_REJECTED",
+
+              error:
+                error.message,
+            });
+
+            continue;
+          }
+
+          throw error;
+        }
+      }
+
+      return res.json({
+        success: true,
+
+        restaurant_id:
+          restaurantId,
+
+        installation_id:
+          installationId,
+
+        acked,
+
+        rejected,
+
+        server_time:
+          new Date()
+            .toISOString(),
+      });
+    } catch (error) {
+      const status =
+        Number(
+          error?.statusCode
+        );
+
+      if (
+        status === 401 ||
+        status === 403
+      ) {
+        return res
+          .status(status)
+          .json({
+            success: false,
+
+            code:
+              error.code ||
+              "EDGE_AUTH_INVALID",
+
+            error:
+              error.message ||
+              "MAKS Edge authentication failed",
+          });
+      }
+
+      console.error(
+        "❌ MAKS Edge push failed:",
+        error
+      );
+
+      return res
+        .status(500)
+        .json({
+          success: false,
+
+          code:
+            "EDGE_PUSH_FAILED",
+
+          error:
+            "MAKS Edge push failed",
+        });
+    }
+  }
+);
+
 
 module.exports = router;

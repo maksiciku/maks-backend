@@ -6,6 +6,123 @@ const {
   withTx,
 } = require("../dbCompat");
 
+/*
+ * Edge runtime may use a PostgreSQL database that is
+ * deliberately different from the backend DATABASE_URL.
+ *
+ * When an explicit pool is supplied we must transact
+ * against THAT pool rather than dbCompat's global pool.
+ */
+async function withExplicitPoolTx(
+  pool,
+  fn
+) {
+  if (
+    !pool ||
+    typeof pool.connect !== "function"
+  ) {
+    throw new EdgeSyncError(
+      "EDGE_POOL_INVALID",
+      "Explicit Edge PostgreSQL pool is invalid"
+    );
+  }
+
+  if (
+    typeof fn !== "function"
+  ) {
+    throw new EdgeSyncError(
+      "EDGE_TX_CALLBACK_INVALID",
+      "Edge transaction callback is required"
+    );
+  }
+
+  const client =
+    await pool.connect();
+
+  try {
+    await client.query(
+      "BEGIN"
+    );
+
+    const tx = {
+      kind: "pg",
+
+      qRun:
+        (
+          sql,
+          params = []
+        ) =>
+          client.query(
+            sql,
+            params
+          ),
+
+      qGet:
+        async (
+          sql,
+          params = []
+        ) =>
+          (
+            await client.query(
+              sql,
+              params
+            )
+          ).rows[0] ||
+          null,
+
+      qAll:
+        async (
+          sql,
+          params = []
+        ) =>
+          (
+            await client.query(
+              sql,
+              params
+            )
+          ).rows ||
+          [],
+    };
+
+    const result =
+      await fn(tx);
+
+    await client.query(
+      "COMMIT"
+    );
+
+    return result;
+  } catch (error) {
+    try {
+      await client.query(
+        "ROLLBACK"
+      );
+    } catch {}
+
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+
+function runSyncTx(
+  pool,
+  fn
+) {
+  if (pool) {
+    return withExplicitPoolTx(
+      pool,
+      fn
+    );
+  }
+
+  return withTx(
+    fn
+  );
+}
+
+
 class EdgeSyncError extends Error {
   constructor(
     code,
@@ -479,6 +596,8 @@ async function claimOutboxEvents({
   limit = 25,
 
   leaseSeconds = 30,
+
+  pool = null,
 }) {
   const rid =
     requireRestaurantId(
@@ -510,7 +629,8 @@ async function claimOutboxEvents({
       }
     );
 
-  return withTx(
+  return runSyncTx(
+    pool,
     async (tx) =>
       tx.qAll(
         `
@@ -602,6 +722,8 @@ async function ackOutboxEvent({
   eventId,
 
   workerId,
+
+  pool = null,
 }) {
   const rid =
     requireRestaurantId(
@@ -619,7 +741,8 @@ async function ackOutboxEvent({
       workerId
     );
 
-  return withTx(
+  return runSyncTx(
+    pool,
     async (tx) => {
       const row =
         await tx.qGet(
@@ -684,6 +807,8 @@ async function failOutboxEvent({
   lastError,
 
   retryDelaySeconds = 0,
+
+  pool = null,
 }) {
   const rid =
     requireRestaurantId(
@@ -716,7 +841,8 @@ async function failOutboxEvent({
       }
     );
 
-  return withTx(
+  return runSyncTx(
+    pool,
     async (tx) => {
       const row =
         await tx.qGet(
@@ -1760,6 +1886,8 @@ async function ensureSyncState({
   restaurantId,
 
   installationId,
+
+  pool = null,
 }) {
   const rid =
     requireRestaurantId(
@@ -1772,7 +1900,8 @@ async function ensureSyncState({
       "installationId"
     );
 
-  return withTx(
+  return runSyncTx(
+    pool,
     async (tx) => {
       await tx.qRun(
         `
@@ -1824,6 +1953,8 @@ async function updateSyncState({
   installationId,
 
   patch,
+
+  pool = null,
 }) {
   const rid =
     requireRestaurantId(
@@ -2103,7 +2234,8 @@ async function updateSyncState({
     "updated_at = NOW()"
   );
 
-  return withTx(
+  return runSyncTx(
+    pool,
     async (tx) => {
       await tx.qRun(
         `
