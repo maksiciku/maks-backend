@@ -44,6 +44,10 @@ const {
 } = require('../migrations/canonicalPlatformAuditDevices.pg');
 
 const {
+  runCanonicalEdgeControlPlanePg,
+} = require('../migrations/canonicalEdgeControlPlane.pg');
+
+const {
   runBootMigrationsPg,
 } = require('../migrations/boot.pg');
 
@@ -99,6 +103,10 @@ async function main() {
     });
 
     await runCanonicalPlatformAuditDevicesPg({
+      pool,
+    });
+
+    await runCanonicalEdgeControlPlanePg({
       pool,
     });
 

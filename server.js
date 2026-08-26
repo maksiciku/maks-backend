@@ -1,7 +1,10 @@
 // backend/server.js
 require("dotenv").config();
 console.log("ENV DB_DRIVER =", process.env.DB_DRIVER);
-console.log("ENV DATABASE_URL =", process.env.DATABASE_URL);
+console.log(
+  "ENV DATABASE_URL =",
+  process.env.DATABASE_URL ? "(set)" : "(missing)"
+);
 
 const express = require("express");
 const cors = require("cors");
@@ -46,6 +49,8 @@ const ccAuthRoutes = require("./routes/cc/ccAuthRoutes");
 const ccCustomerRoutes = require("./routes/cc/ccCustomerRoutes");
 const ccSystemRoutes = require("./routes/cc/ccSystemRoutes");
 const ccAuditRoutes = require("./routes/cc/ccAuditRoutes");
+const ccEdgeRoutes = require("./routes/cc/ccEdgeRoutes");
+const edgeRoutes = require("./routes/edgeRoutes");
 // ✅ REQUIRED: bring in routes that you use
 const { router: posRoutes, initPosOrders } = require("./routes/posRoutes");
 const voucherRoutes = require("./routes/voucherRoutes");
@@ -369,6 +374,13 @@ app.use("/cc-auth", ccAuthRoutes);
 app.use("/cc/customers", ccCustomerRoutes);
 app.use("/cc/system", ccSystemRoutes);
 app.use("/cc/audit", ccAuditRoutes);
+
+// MAKS Edge control plane.
+// These routes use Edge credentials / platform-admin
+// credentials and therefore must be mounted before the
+// normal restaurant authenticateToken middleware.
+app.use("/edge", edgeRoutes);
+app.use("/cc/edge", ccEdgeRoutes);
 
 app.use(
   "/platform-suppliers",
