@@ -17,6 +17,51 @@ const {
 } = require("../middleware/accessControl");
 
 const {
+  withTx,
+} = require("../dbCompat");
+
+const {
+  emitMenuCatalogSnapshotTx,
+} = require("../edge/contracts/menuCatalog");
+
+const {
+  MaksRuntimeRoleError,
+  assertCloudRuntime,
+} = require("../utils/runtimeRole");
+
+function sendMenuCatalogAuthorityError(res, error) {
+  if (!(error instanceof MaksRuntimeRoleError)) {
+    return false;
+  }
+
+  if (error.code === "MAKS_RUNTIME_ROLE_NOT_CLOUD") {
+    res.status(409).json({
+      error: "MENU_CATALOG_CLOUD_AUTHORITY_REQUIRED",
+    });
+    return true;
+  }
+
+  res.status(503).json({
+    error: "MENU_CATALOG_RUNTIME_ROLE_UNAVAILABLE",
+  });
+  return true;
+}
+
+function requireCloudMenuCatalogAuthority(req, res, next) {
+  try {
+    assertCloudRuntime();
+    next();
+  } catch (error) {
+    if (sendMenuCatalogAuthorityError(res, error)) {
+      return;
+    }
+
+    next(error);
+  }
+}
+
+
+const {
   getItemAvailability,
   normalizeItemType,
   normalizeAvailabilityMode,
@@ -490,6 +535,8 @@ router.put(
     PERMISSIONS.MENU_EDIT
   ),
 
+  requireCloudMenuCatalogAuthority,
+
   async (req, res) => {
     try {
       const rid =
@@ -505,7 +552,6 @@ router.put(
           req.params.type
         );
 
-
       if (!rid) {
         return res
           .status(400)
@@ -514,7 +560,6 @@ router.put(
               "No restaurant selected.",
           });
       }
-
 
       if (
         !Number.isInteger(id) ||
@@ -528,7 +573,6 @@ router.put(
           });
       }
 
-
       if (!itemType) {
         return res
           .status(400)
@@ -538,112 +582,120 @@ router.put(
           });
       }
 
-
       const settings =
         normalizeSettingsPayload(
           req.body || {}
         );
 
+      const updated =
+        await withTx(
+          async (tx) => {
+            let row =
+              null;
 
-      let updated =
-        null;
+            if (
+              itemType ===
+              "meal"
+            ) {
+              row =
+                await tx.qGet(
+                  `
+                  UPDATE public.meals
+                  SET
+                    availability_mode = $1,
+                    manual_quantity = $2,
+                    manually_stopped = $3,
+                    out_of_stock = $3
+                  WHERE restaurant_id = $4
+                    AND id = $5
+                  RETURNING
+                    id,
+                    name,
+                    availability_mode,
+                    manual_quantity,
+                    manually_stopped,
+                    out_of_stock
+                  `,
+                  [
+                    settings
+                      .availability_mode,
+                    settings
+                      .manual_quantity,
+                    settings
+                      .manually_stopped,
+                    rid,
+                    id,
+                  ]
+                );
+            }
 
+            if (
+              itemType ===
+                "drink" ||
+              itemType ===
+                "dessert"
+            ) {
+              row =
+                await tx.qGet(
+                  `
+                  UPDATE public.menu_items
+                  SET
+                    availability_mode = $1,
+                    manual_quantity = $2,
+                    manually_stopped = $3,
+                    out_of_stock = $3
+                  WHERE restaurant_id = $4
+                    AND id = $5
+                    AND LOWER(
+                      TRIM(
+                        COALESCE(
+                          type,
+                          ''
+                        )
+                      )
+                    ) IN (
+                      $6,
+                      $7
+                    )
+                  RETURNING
+                    id,
+                    name,
+                    type,
+                    availability_mode,
+                    manual_quantity,
+                    manually_stopped,
+                    out_of_stock
+                  `,
+                  [
+                    settings
+                      .availability_mode,
+                    settings
+                      .manual_quantity,
+                    settings
+                      .manually_stopped,
+                    rid,
+                    id,
+                    itemType,
+                    `${itemType}s`,
+                  ]
+                );
+            }
 
-      /* ===================================================
-         MEAL
-      =================================================== */
+            if (!row?.id) {
+              return null;
+            }
 
-      if (
-  itemType ===
-  "meal"
-) {
-  updated =
-    await req.qGet(
-      `
-      UPDATE public.meals
+            await emitMenuCatalogSnapshotTx(
+              tx,
+              {
+                restaurantId:
+                  rid,
+              }
+            );
 
-      SET
-        availability_mode = $1,
-        manual_quantity = $2,
-        manually_stopped = $3,
-        out_of_stock = $3
-
-      WHERE restaurant_id = $4
-        AND id = $5
-
-      RETURNING
-        id,
-        name,
-        availability_mode,
-        manual_quantity,
-        manually_stopped,
-        out_of_stock
-      `,
-      [
-        settings.availability_mode,
-        settings.manual_quantity,
-        settings.manually_stopped,
-        rid,
-        id,
-      ]
-    );
-}
-
-
-      /* ===================================================
-         DRINK / DESSERT
-      =================================================== */
-
-      if (
-  itemType === "drink" ||
-  itemType === "dessert"
-) {
-  updated =
-    await req.qGet(
-      `
-      UPDATE public.menu_items
-
-      SET
-        availability_mode = $1,
-        manual_quantity = $2,
-        manually_stopped = $3,
-        out_of_stock = $3
-
-      WHERE restaurant_id = $4
-        AND id = $5
-        AND LOWER(
-          TRIM(
-            COALESCE(
-              type,
-              ''
-            )
-          )
-        ) IN (
-          $6,
-          $7
-        )
-
-      RETURNING
-        id,
-        name,
-        type,
-        availability_mode,
-        manual_quantity,
-        manually_stopped,
-        out_of_stock
-      `,
-      [
-        settings.availability_mode,
-        settings.manual_quantity,
-        settings.manually_stopped,
-        rid,
-        id,
-        itemType,
-        `${itemType}s`,
-      ]
-    );
-}
-
+            return row;
+          }
+        );
 
       if (!updated?.id) {
         return res
@@ -653,7 +705,6 @@ router.put(
               "Item not found.",
           });
       }
-
 
       const availability =
         await getItemAvailability({
@@ -669,7 +720,6 @@ router.put(
 
           quantity: 1,
         });
-
 
       return res.json({
         success: true,
@@ -688,27 +738,31 @@ router.put(
 
           availability_mode:
             normalizeAvailabilityMode(
-              updated.availability_mode
+              updated
+                .availability_mode
             ),
 
           manual_quantity:
             updated.manual_quantity !=
             null
               ? Number(
-                  updated.manual_quantity
+                  updated
+                    .manual_quantity
                 )
               : null,
 
           manually_stopped:
             asBool(
-              updated.manually_stopped
+              updated
+                .manually_stopped
             ),
 
           can_sell:
             !!availability.can_sell,
 
           available_quantity:
-            availability.available_quantity,
+            availability
+              .available_quantity,
 
           availability_reason:
             availability.reason,
@@ -722,6 +776,15 @@ router.put(
         "❌ PUT /items-settings failed:",
         err
       );
+
+      if (
+        sendMenuCatalogAuthorityError(
+          res,
+          err
+        )
+      ) {
+        return;
+      }
 
       const status =
         Number(
@@ -740,6 +803,7 @@ router.put(
     }
   }
 );
+
 
 
 module.exports =
