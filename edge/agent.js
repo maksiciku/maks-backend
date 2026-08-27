@@ -44,6 +44,13 @@ const {
   "./contracts/promotions"
 );
 
+const {
+  MENU_CATALOG_EVENT_TYPE,
+  applyMenuCatalogReplaced,
+} = require(
+  "./contracts/menuCatalog"
+);
+
 
 function intervalFromEnv(
   name,
@@ -191,6 +198,9 @@ const APPLY_HANDLERS =
 
     [PROMOTIONS_EVENT_TYPE]:
       applyPromotionsReplaced,
+
+    [MENU_CATALOG_EVENT_TYPE]:
+      applyMenuCatalogReplaced,
   });
 
 
