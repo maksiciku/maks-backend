@@ -19,6 +19,12 @@ const {
 );
 
 const {
+  reconcilePromotionAssetsOnce,
+} = require(
+  "./promotionAssetTransport"
+);
+
+const {
   applyInboxOnce,
 } = require(
   "./applyEngine"
@@ -143,6 +149,23 @@ const APPLY_MS =
   );
 
 
+const PROMOTION_ASSET_MS =
+  intervalFromEnv(
+    "MAKS_EDGE_PROMOTION_ASSET_MS",
+    15000,
+    1000
+  );
+
+
+const PROMOTION_UPLOADS_ROOT =
+  String(
+    process.env
+      .MAKS_EDGE_PROMOTION_UPLOADS_ROOT ||
+    ""
+  ).trim() ||
+  undefined;
+
+
 const SYNC_BATCH_LIMIT =
   25;
 
@@ -247,6 +270,9 @@ let pullSending =
 let applySending =
   false;
 
+let promotionAssetSending =
+  false;
+
 let heartbeatTimer =
   null;
 
@@ -257,6 +283,9 @@ let pullTimer =
   null;
 
 let applyTimer =
+  null;
+
+let promotionAssetTimer =
   null;
 
 let previousCloudLatencyMs =
@@ -1257,6 +1286,135 @@ async function sendApplyCycle() {
 }
 
 
+async function sendPromotionAssetCycle() {
+  if (
+    shuttingDown ||
+    promotionAssetSending ||
+    !authenticatedRestaurantId
+  ) {
+    return;
+  }
+
+  promotionAssetSending =
+    true;
+
+  try {
+    const options = {
+      pool,
+
+      cloudUrl:
+        CLOUD_URL,
+
+      installationId:
+        INSTALLATION_ID,
+
+      edgeSecret:
+        EDGE_SECRET,
+
+      restaurantId:
+        authenticatedRestaurantId,
+
+      timeoutMs:
+        10000,
+    };
+
+    if (
+      PROMOTION_UPLOADS_ROOT
+    ) {
+      options.uploadsRoot =
+        PROMOTION_UPLOADS_ROOT;
+    }
+
+    const result =
+      await reconcilePromotionAssetsOnce(
+        options
+      );
+
+    const activity =
+      Number(
+        result?.downloaded ||
+        0
+      ) +
+      Number(
+        result?.rejected ||
+        0
+      ) +
+      Number(
+        result?.failed ||
+        0
+      );
+
+    if (
+      activity > 0
+    ) {
+      const logger =
+        result?.success ===
+          true
+          ? console.log
+          : console.error;
+
+      logger(
+        `[${nowIso()}] ${result?.success === true ? "✅" : "❌"} MAKS Edge promotion assets`,
+        {
+          scanned:
+            Number(
+              result?.scanned ||
+              0
+            ),
+
+          downloaded:
+            Number(
+              result?.downloaded ||
+              0
+            ),
+
+          unchanged:
+            Number(
+              result?.unchanged ||
+              0
+            ),
+
+          skipped:
+            Number(
+              result?.skipped ||
+              0
+            ),
+
+          rejected:
+            Number(
+              result?.rejected ||
+              0
+            ),
+
+          failed:
+            Number(
+              result?.failed ||
+              0
+            ),
+        }
+      );
+    }
+  } catch (error) {
+    console.error(
+      `[${nowIso()}] ❌ MAKS Edge promotion asset cycle failed`,
+      {
+        error:
+          String(
+            error?.message ||
+            error
+          ).slice(
+            0,
+            500
+          ),
+      }
+    );
+  } finally {
+    promotionAssetSending =
+      false;
+  }
+}
+
+
 async function sendHeartbeat() {
   if (
     shuttingDown ||
@@ -1444,6 +1602,7 @@ async function sendHeartbeat() {
             sendSyncCycle();
             sendPullCycle();
             sendApplyCycle();
+            sendPromotionAssetCycle();
           }
         );
       }
@@ -1570,6 +1729,17 @@ async function shutdown(
       null;
   }
 
+  if (
+    promotionAssetTimer
+  ) {
+    clearInterval(
+      promotionAssetTimer
+    );
+
+    promotionAssetTimer =
+      null;
+  }
+
   try {
     await pool.end();
   } finally {
@@ -1664,6 +1834,13 @@ console.log(
 );
 
 console.log(
+  `Promotion assets: ${Math.round(
+    PROMOTION_ASSET_MS /
+    1000
+  )} seconds`
+);
+
+console.log(
   "Secret: configured (hidden)"
 );
 
@@ -1687,6 +1864,8 @@ sendSyncCycle();
 sendPullCycle();
 
 sendApplyCycle();
+
+sendPromotionAssetCycle();
 
 
 heartbeatTimer =
@@ -1714,4 +1893,11 @@ applyTimer =
   setInterval(
     sendApplyCycle,
     APPLY_MS
+  );
+
+
+promotionAssetTimer =
+  setInterval(
+    sendPromotionAssetCycle,
+    PROMOTION_ASSET_MS
   );

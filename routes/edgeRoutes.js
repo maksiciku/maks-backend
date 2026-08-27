@@ -3,6 +3,15 @@
 const express =
   require("express");
 
+const crypto =
+  require("node:crypto");
+
+const fs =
+  require("node:fs");
+
+const path =
+  require("node:path");
+
 const {
   edgeSecretMatches,
 } = require(
@@ -1461,6 +1470,607 @@ router.post(
 
           error:
             "MAKS Edge pull acknowledgement failed",
+        });
+    }
+  }
+);
+
+
+
+/*
+ * =========================================================
+ * CLOUD → EDGE PROMOTION ASSET FETCH
+ * =========================================================
+ *
+ * Authority:
+ * - credentials identify one Edge installation
+ * - installation owns one restaurant
+ * - promotion lookup is restricted to that restaurant
+ * - caller never supplies a filesystem path
+ */
+
+const PROMOTION_ASSET_MAX_BYTES =
+  20 * 1024 * 1024;
+
+
+function promotionAssetUploadsRoot() {
+  const configured =
+    String(
+      process.env
+        .MAKS_EDGE_ASSET_UPLOADS_ROOT ||
+      ""
+    ).trim();
+
+  return path.resolve(
+    configured ||
+      path.join(
+        process.cwd(),
+        "uploads"
+      )
+  );
+}
+
+
+function promotionAssetPathInside(
+  base,
+  target
+) {
+  const relative =
+    path.relative(
+      base,
+      target
+    );
+
+  return (
+    relative === "" ||
+    (
+      !relative.startsWith(
+        `..${path.sep}`
+      ) &&
+      relative !== ".." &&
+      !path.isAbsolute(
+        relative
+      )
+    )
+  );
+}
+
+
+function promotionAssetFilename({
+  restaurantId,
+  imageUrl,
+}) {
+  const rid =
+    Number(
+      restaurantId
+    );
+
+  const raw =
+    String(
+      imageUrl || ""
+    ).trim();
+
+  const prefix =
+    `/uploads/${rid}/promotions/`;
+
+  if (
+    !Number.isSafeInteger(
+      rid
+    ) ||
+    rid <= 0 ||
+    !raw.startsWith(
+      prefix
+    )
+  ) {
+    throw edgeAuthError(
+      409,
+      "EDGE_PROMOTION_ASSET_PATH_INVALID",
+      "Promotion image path is invalid"
+    );
+  }
+
+  const filename =
+    raw.slice(
+      prefix.length
+    );
+
+  if (
+    !filename ||
+    filename === "." ||
+    filename === ".." ||
+    filename.includes(
+      "/"
+    ) ||
+    filename.includes(
+      "\\"
+    ) ||
+    filename.includes(
+      "\0"
+    ) ||
+    path.basename(
+      filename
+    ) !==
+      filename
+  ) {
+    throw edgeAuthError(
+      409,
+      "EDGE_PROMOTION_ASSET_PATH_INVALID",
+      "Promotion image path is invalid"
+    );
+  }
+
+  let decoded =
+    filename;
+
+  try {
+    decoded =
+      decodeURIComponent(
+        filename
+      );
+  } catch {
+    decoded =
+      filename;
+  }
+
+  if (
+    decoded.includes(
+      "/"
+    ) ||
+    decoded.includes(
+      "\\"
+    ) ||
+    decoded === "." ||
+    decoded === ".."
+  ) {
+    throw edgeAuthError(
+      409,
+      "EDGE_PROMOTION_ASSET_PATH_INVALID",
+      "Promotion image path is invalid"
+    );
+  }
+
+  return filename;
+}
+
+
+async function promotionAssetSha256(
+  filePath
+) {
+  return new Promise(
+    (
+      resolve,
+      reject
+    ) => {
+      const hash =
+        crypto.createHash(
+          "sha256"
+        );
+
+      const stream =
+        fs.createReadStream(
+          filePath
+        );
+
+      stream.on(
+        "error",
+        reject
+      );
+
+      stream.on(
+        "data",
+        (chunk) =>
+          hash.update(
+            chunk
+          )
+      );
+
+      stream.on(
+        "end",
+        () =>
+          resolve(
+            hash.digest(
+              "hex"
+            )
+          )
+      );
+    }
+  );
+}
+
+
+async function resolveCloudPromotionAsset({
+  restaurantId,
+  imageUrl,
+}) {
+  const rid =
+    Number(
+      restaurantId
+    );
+
+  const filename =
+    promotionAssetFilename({
+      restaurantId:
+        rid,
+
+      imageUrl,
+    });
+
+  const uploadsRoot =
+    promotionAssetUploadsRoot();
+
+  const directory =
+    path.resolve(
+      uploadsRoot,
+      String(
+        rid
+      ),
+      "promotions"
+    );
+
+  const target =
+    path.resolve(
+      directory,
+      filename
+    );
+
+  if (
+    !promotionAssetPathInside(
+      uploadsRoot,
+      directory
+    ) ||
+    !promotionAssetPathInside(
+      directory,
+      target
+    ) ||
+    target === directory
+  ) {
+    throw edgeAuthError(
+      409,
+      "EDGE_PROMOTION_ASSET_PATH_INVALID",
+      "Promotion image path escaped the restaurant uploads directory"
+    );
+  }
+
+  let rootReal;
+  let directoryReal;
+  let targetReal;
+  let lstat;
+
+  try {
+    [
+      rootReal,
+      directoryReal,
+      targetReal,
+      lstat,
+    ] =
+      await Promise.all([
+        fs.promises
+          .realpath(
+            uploadsRoot
+          ),
+
+        fs.promises
+          .realpath(
+            directory
+          ),
+
+        fs.promises
+          .realpath(
+            target
+          ),
+
+        fs.promises
+          .lstat(
+            target
+          ),
+      ]);
+  } catch (error) {
+    if (
+      error?.code ===
+        "ENOENT"
+    ) {
+      throw edgeAuthError(
+        404,
+        "EDGE_PROMOTION_ASSET_FILE_MISSING",
+        "Promotion image file is not available"
+      );
+    }
+
+    throw error;
+  }
+
+  if (
+    !promotionAssetPathInside(
+      rootReal,
+      directoryReal
+    ) ||
+    !promotionAssetPathInside(
+      directoryReal,
+      targetReal
+    ) ||
+    lstat.isSymbolicLink() ||
+    !lstat.isFile()
+  ) {
+    throw edgeAuthError(
+      409,
+      "EDGE_PROMOTION_ASSET_PATH_INVALID",
+      "Promotion image file is invalid"
+    );
+  }
+
+  const size =
+    Number(
+      lstat.size
+    );
+
+  if (
+    !Number.isSafeInteger(
+      size
+    ) ||
+    size < 0 ||
+    size >
+      PROMOTION_ASSET_MAX_BYTES
+  ) {
+    throw edgeAuthError(
+      413,
+      "EDGE_PROMOTION_ASSET_TOO_LARGE",
+      "Promotion image file exceeds the Edge asset limit"
+    );
+  }
+
+  const sha256 =
+    await promotionAssetSha256(
+      targetReal
+    );
+
+  return {
+    filename,
+
+    filePath:
+      targetReal,
+
+    size,
+
+    sha256,
+  };
+}
+
+
+router.get(
+  "/assets/promotions/:promotionId/image",
+  async (req, res) => {
+    try {
+      const edge =
+        await authenticateEdgeRequest(
+          req
+        );
+
+      const restaurantId =
+        Number(
+          edge.restaurant_id
+        );
+
+      const promotionId =
+        Number(
+          req.params
+            .promotionId
+        );
+
+      if (
+        !Number.isSafeInteger(
+          promotionId
+        ) ||
+        promotionId <= 0
+      ) {
+        return res
+          .status(400)
+          .json({
+            success:
+              false,
+
+            code:
+              "EDGE_PROMOTION_ASSET_ID_INVALID",
+
+            error:
+              "Promotion id is invalid",
+          });
+      }
+
+      const promotion =
+        await req.qGet(
+          `
+          SELECT
+            id,
+            image_url
+          FROM
+            public.restaurant_promotions
+          WHERE
+            id = $1
+            AND restaurant_id = $2
+          LIMIT 1
+          `,
+          [
+            promotionId,
+            restaurantId,
+          ]
+        );
+
+      if (
+        !promotion?.id
+      ) {
+        return res
+          .status(404)
+          .json({
+            success:
+              false,
+
+            code:
+              "EDGE_PROMOTION_ASSET_NOT_FOUND",
+
+            error:
+              "Promotion image was not found",
+          });
+      }
+
+      if (
+        !String(
+          promotion.image_url ||
+          ""
+        ).trim()
+      ) {
+        return res
+          .status(404)
+          .json({
+            success:
+              false,
+
+            code:
+              "EDGE_PROMOTION_ASSET_NOT_FOUND",
+
+            error:
+              "Promotion image was not found",
+          });
+      }
+
+      const asset =
+        await resolveCloudPromotionAsset({
+          restaurantId,
+
+          imageUrl:
+            promotion.image_url,
+        });
+
+      res.set(
+        "x-maks-asset-sha256",
+        asset.sha256
+      );
+
+      res.set(
+        "x-maks-asset-size",
+        String(
+          asset.size
+        )
+      );
+
+      res.set(
+        "cache-control",
+        "private, no-cache"
+      );
+
+      const localSha =
+        String(
+          req.headers[
+            "x-maks-local-sha256"
+          ] ||
+          ""
+        )
+          .trim()
+          .toLowerCase();
+
+      if (
+        /^[0-9a-f]{64}$/.test(
+          localSha
+        ) &&
+        localSha ===
+          asset.sha256
+      ) {
+        return res
+          .status(304)
+          .end();
+      }
+
+      res.type(
+        asset.filename
+      );
+
+      res.set(
+        "content-length",
+        String(
+          asset.size
+        )
+      );
+
+      const stream =
+        fs.createReadStream(
+          asset.filePath
+        );
+
+      stream.on(
+        "error",
+        (error) => {
+          console.error(
+            "❌ MAKS Edge promotion asset stream failed:",
+            String(
+              error?.message ||
+              error
+            ).slice(
+              0,
+              300
+            )
+          );
+
+          if (
+            !res.headersSent
+          ) {
+            res
+              .status(500)
+              .end();
+          } else {
+            res.destroy(
+              error
+            );
+          }
+        }
+      );
+
+      return stream.pipe(
+        res
+      );
+    } catch (error) {
+      if (
+        Number.isSafeInteger(
+          error?.statusCode
+        ) &&
+        error?.code
+      ) {
+        return res
+          .status(
+            error.statusCode
+          )
+          .json({
+            success:
+              false,
+
+            code:
+              error.code,
+
+            error:
+              error.message,
+          });
+      }
+
+      console.error(
+        "❌ MAKS Edge promotion asset fetch failed:",
+        String(
+          error?.message ||
+          error
+        ).slice(
+          0,
+          500
+        )
+      );
+
+      return res
+        .status(500)
+        .json({
+          success:
+            false,
+
+          code:
+            "EDGE_PROMOTION_ASSET_FAILED",
+
+          error:
+            "Promotion image fetch failed",
         });
     }
   }
