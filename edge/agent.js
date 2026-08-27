@@ -18,6 +18,19 @@ const {
   "./pullTransport"
 );
 
+const {
+  applyInboxOnce,
+} = require(
+  "./applyEngine"
+);
+
+const {
+  PRICING_RULES_EVENT_TYPE,
+  applyPricingRulesReplaced,
+} = require(
+  "./contracts/pricingRules"
+);
+
 
 function intervalFromEnv(
   name,
@@ -115,14 +128,37 @@ const PULL_MS =
   );
 
 
+const APPLY_MS =
+  intervalFromEnv(
+    "MAKS_EDGE_APPLY_MS",
+    1000,
+    500
+  );
+
+
 const SYNC_BATCH_LIMIT =
   25;
 
 const PULL_BATCH_LIMIT =
   25;
 
+const APPLY_BATCH_LIMIT =
+  10;
+
 const SYNC_LEASE_SECONDS =
   30;
+
+const APPLY_LEASE_SECONDS =
+  30;
+
+const APPLY_MAX_ATTEMPTS =
+  5;
+
+const APPLY_HANDLERS =
+  Object.freeze({
+    [PRICING_RULES_EVENT_TYPE]:
+      applyPricingRulesReplaced,
+  });
 
 
 if (!CLOUD_URL) {
@@ -177,6 +213,14 @@ const SYNC_WORKER_ID =
   )}:` +
   `${process.pid}`;
 
+const APPLY_WORKER_ID =
+  `edge-apply:` +
+  `${INSTALLATION_ID.slice(
+    0,
+    8
+  )}:` +
+  `${process.pid}`;
+
 
 let shuttingDown =
   false;
@@ -190,6 +234,9 @@ let syncSending =
 let pullSending =
   false;
 
+let applySending =
+  false;
+
 let heartbeatTimer =
   null;
 
@@ -197,6 +244,9 @@ let syncTimer =
   null;
 
 let pullTimer =
+  null;
+
+let applyTimer =
   null;
 
 let previousCloudLatencyMs =
@@ -634,6 +684,69 @@ async function hasDueOutboxWork() {
 }
 
 
+async function hasDueInboxWork() {
+  if (
+    !authenticatedRestaurantId
+  ) {
+    return false;
+  }
+
+  const result =
+    await pool.query(
+      `
+      SELECT
+        EXISTS (
+          SELECT
+            1
+          FROM
+            public.edge_inbox
+          WHERE
+            restaurant_id = $1
+            AND
+            (
+              (
+                status IN (
+                  'received',
+                  'failed'
+                )
+                AND
+                next_attempt_at <=
+                  NOW()
+              )
+              OR
+              (
+                status =
+                  'applying'
+                AND
+                locked_at IS NOT NULL
+                AND
+                locked_at <=
+                  NOW()
+                  -
+                  (
+                    $2::int *
+                    INTERVAL '1 second'
+                  )
+              )
+            )
+          LIMIT 1
+        ) AS has_work
+      `,
+      [
+        authenticatedRestaurantId,
+        APPLY_LEASE_SECONDS,
+      ]
+    );
+
+  return (
+    result
+      .rows?.[0]
+      ?.has_work ===
+    true
+  );
+}
+
+
 async function buildTelemetry() {
   const [
     database,
@@ -879,6 +992,26 @@ async function sendPullCycle() {
           10000,
       });
 
+    const inboundActivity =
+      Number(
+        result?.received ||
+        0
+      ) +
+      Number(
+        result?.duplicates ||
+        0
+      );
+
+    if (
+      inboundActivity > 0 &&
+      !shuttingDown
+    ) {
+      setImmediate(
+        () =>
+          sendApplyCycle()
+      );
+    }
+
     if (
       result?.success ===
       true
@@ -1001,6 +1134,114 @@ async function sendPullCycle() {
     );
   } finally {
     pullSending =
+      false;
+  }
+}
+
+
+async function sendApplyCycle() {
+  if (
+    shuttingDown ||
+    applySending ||
+    !authenticatedRestaurantId
+  ) {
+    return;
+  }
+
+  applySending =
+    true;
+
+  try {
+    const hasWork =
+      await hasDueInboxWork();
+
+    if (!hasWork) {
+      return;
+    }
+
+    const result =
+      await applyInboxOnce({
+        pool,
+
+        restaurantId:
+          authenticatedRestaurantId,
+
+        workerId:
+          APPLY_WORKER_ID,
+
+        handlers:
+          APPLY_HANDLERS,
+
+        limit:
+          APPLY_BATCH_LIMIT,
+
+        leaseSeconds:
+          APPLY_LEASE_SECONDS,
+
+        maxAttempts:
+          APPLY_MAX_ATTEMPTS,
+      });
+
+    const activity =
+      Number(
+        result?.applied ||
+        0
+      ) +
+      Number(
+        result?.failed ||
+        0
+      ) +
+      Number(
+        result?.dead_lettered ||
+        0
+      );
+
+    if (activity > 0) {
+      console.log(
+        `[${nowIso()}] ✅ MAKS Edge inbox apply`,
+        {
+          claimed:
+            Number(
+              result?.claimed ||
+              0
+            ),
+
+          applied:
+            Number(
+              result?.applied ||
+              0
+            ),
+
+          failed:
+            Number(
+              result?.failed ||
+              0
+            ),
+
+          dead_lettered:
+            Number(
+              result?.dead_lettered ||
+              0
+            ),
+        }
+      );
+    }
+  } catch (error) {
+    console.error(
+      `[${nowIso()}] ❌ MAKS Edge inbox apply cycle failed`,
+      {
+        error:
+          String(
+            error?.message ||
+            error
+          ).slice(
+            0,
+            500
+          ),
+      }
+    );
+  } finally {
+    applySending =
       false;
   }
 }
@@ -1192,6 +1433,7 @@ async function sendHeartbeat() {
           () => {
             sendSyncCycle();
             sendPullCycle();
+            sendApplyCycle();
           }
         );
       }
@@ -1307,6 +1549,17 @@ async function shutdown(
       null;
   }
 
+  if (
+    applyTimer
+  ) {
+    clearInterval(
+      applyTimer
+    );
+
+    applyTimer =
+      null;
+  }
+
   try {
     await pool.end();
   } finally {
@@ -1394,6 +1647,13 @@ console.log(
 );
 
 console.log(
+  `Apply: ${Math.round(
+    APPLY_MS /
+    1000
+  )} seconds`
+);
+
+console.log(
   "Secret: configured (hidden)"
 );
 
@@ -1408,13 +1668,15 @@ console.log(
 
 /*
  * First heartbeat learns the authoritative restaurant.
- * First push/pull attempts before that safely do nothing.
+ * First push/pull/apply attempts before that safely do nothing.
  */
 sendHeartbeat();
 
 sendSyncCycle();
 
 sendPullCycle();
+
+sendApplyCycle();
 
 
 heartbeatTimer =
@@ -1435,4 +1697,11 @@ pullTimer =
   setInterval(
     sendPullCycle,
     PULL_MS
+  );
+
+
+applyTimer =
+  setInterval(
+    sendApplyCycle,
+    APPLY_MS
   );

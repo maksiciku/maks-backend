@@ -2361,7 +2361,6 @@ test(
             await localPool.query(
               `
               SELECT
-                status,
                 payload_hash
               FROM
                 public.edge_inbox
@@ -2380,13 +2379,6 @@ test(
           assert.equal(
             inbox.rows.length,
             1
-          );
-
-          assert.equal(
-            inbox
-              .rows[0]
-              .status,
-            "received"
           );
 
           assert.equal(
