@@ -31,6 +31,13 @@ const {
   "./contracts/pricingRules"
 );
 
+const {
+  PROMOTIONS_EVENT_TYPE,
+  applyPromotionsReplaced,
+} = require(
+  "./contracts/promotions"
+);
+
 
 function intervalFromEnv(
   name,
@@ -158,6 +165,9 @@ const APPLY_HANDLERS =
   Object.freeze({
     [PRICING_RULES_EVENT_TYPE]:
       applyPricingRulesReplaced,
+
+    [PROMOTIONS_EVENT_TYPE]:
+      applyPromotionsReplaced,
   });
 
 

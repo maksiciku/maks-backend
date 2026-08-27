@@ -12,6 +12,19 @@ const {
   normalizePermissions: normalizeAccessPermissions,
 } = require("../middleware/accessControl");
 
+const {
+  withTx,
+} = require("../dbCompat");
+
+const {
+  MaksRuntimeRoleError,
+  assertCloudRuntime,
+} = require("../utils/runtimeRole");
+
+const {
+  emitPromotionsSnapshotTx,
+} = require("../edge/contracts/promotions");
+
 const router = express.Router();
 
 /*
@@ -2445,254 +2458,1104 @@ router.get("/promotions", requirePermission(PERMISSIONS.PROMOTIONS_MANAGE), asyn
   }
 });
 
-router.post("/promotions", requirePermission(PERMISSIONS.PROMOTIONS_MANAGE), promoUpload.single("image"), async (req, res) => {
+function sendPromotionAuthorityError(
+  res,
+  error
+) {
+  if (
+    !(error instanceof
+      MaksRuntimeRoleError)
+  ) {
+    return false;
+  }
+
+  return res.status(409).json({
+    error:
+      "Promotions can only be managed by the Cloud runtime.",
+
+    code:
+      error.code ||
+      "MAKS_RUNTIME_ROLE_FORBIDDEN",
+  });
+}
+
+
+function requireCloudPromotionAuthority(
+  req,
+  res,
+  next
+) {
   try {
-    await ensurePromotionsTable(req);
+    assertCloudRuntime();
+    return next();
+  } catch (error) {
+    if (
+      sendPromotionAuthorityError(
+        res,
+        error
+      )
+    ) {
+      return;
+    }
 
-    const body = req.body || {};
+    return next(error);
+  }
+}
 
-    const imageUrl = req.file
-      ? `/uploads/${req.tenantRid}/promotions/${req.file.filename}`
-      : String(body.image_url || "").trim() || null;
 
-    const bool = (v, def = true) => {
-      if (v === undefined || v === null || v === "") return def;
-      return v === true || v === "true" || v === "1";
-    };
+function promotionBool(
+  value,
+  fallback
+) {
+  if (
+    value === undefined ||
+    value === null ||
+    value === ""
+  ) {
+    return Boolean(fallback);
+  }
 
-    const days = (() => {
-      try {
-        const parsed = JSON.parse(body.days_of_week || "[]");
-        return Array.isArray(parsed) ? parsed : [];
-      } catch {
-        return [];
-      }
-    })();
+  if (
+    typeof value ===
+      "boolean"
+  ) {
+    return value;
+  }
 
-    const displayContext =
-      body.show_on_qr === "true" && body.show_on_kiosk === "false"
-        ? "qr"
-        : body.show_on_qr === "false" && body.show_on_kiosk === "true"
-        ? "kiosk"
-        : "both";
+  const normalized =
+    String(value)
+      .trim()
+      .toLowerCase();
 
-    const orderType =
-      body.show_for_dine_in === "true" && body.show_for_takeaway === "false"
-        ? "dine-in"
-        : body.show_for_dine_in === "false" && body.show_for_takeaway === "true"
-        ? "takeaway"
-        : "both";
+  return [
+    "1",
+    "true",
+    "yes",
+    "on",
+  ].includes(normalized);
+}
 
-    const actionType = ["none", "booking", "category", "item", "url", "menu"].includes(
-      String(body.button_action || "none")
+
+function promotionDays(
+  value,
+  fallback = []
+) {
+  if (
+    value === undefined ||
+    value === null ||
+    value === ""
+  ) {
+    if (
+      Array.isArray(fallback)
+    ) {
+      return fallback;
+    }
+
+    try {
+      const parsed =
+        JSON.parse(
+          fallback || "[]"
+        );
+
+      return Array.isArray(parsed)
+        ? parsed
+        : [];
+    } catch {
+      return [];
+    }
+  }
+
+  if (
+    Array.isArray(value)
+  ) {
+    return value;
+  }
+
+  try {
+    const parsed =
+      JSON.parse(value);
+
+    return Array.isArray(parsed)
+      ? parsed
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+
+function promotionOptionalId(
+  value,
+  fallback = null
+) {
+  if (
+    value === undefined
+  ) {
+    return fallback === null ||
+      fallback === undefined
+      ? null
+      : Number(fallback);
+  }
+
+  if (
+    value === null ||
+    value === ""
+  ) {
+    return null;
+  }
+
+  const number =
+    Number(value);
+
+  return Number.isSafeInteger(number) &&
+    number > 0
+    ? number
+    : null;
+}
+
+
+function promotionOptionalText(
+  value,
+  fallback = null
+) {
+  if (
+    value === undefined
+  ) {
+    return fallback === null ||
+      fallback === undefined
+      ? null
+      : String(fallback);
+  }
+
+  const text =
+    String(
+      value ?? ""
+    ).trim();
+
+  return text || null;
+}
+
+
+function promotionScalar(
+  value,
+  fallback = null
+) {
+  return value === undefined
+    ? fallback
+    : (
+        value === ""
+          ? null
+          : value
+      );
+}
+
+
+function promotionEnum(
+  value,
+  allowed,
+  fallback
+) {
+  const candidate =
+    String(
+      value === undefined
+        ? fallback
+        : value
     )
-      ? String(body.button_action || "none")
-      : "none";
+      .trim()
+      .toLowerCase();
 
-    const actionTarget =
-      actionType === "category"
-        ? String(body.linked_category_id || "").trim() || null
-        : actionType === "item"
-        ? String(body.linked_item_id || "").trim() || null
-        : String(body.action_target || "").trim() || null;
+  return allowed.includes(
+    candidate
+  )
+    ? candidate
+    : fallback;
+}
 
-    const saved = await req.qGet(
-      `
-      INSERT INTO public.restaurant_promotions
-        (
-          restaurant_id,
-          title,
-          description,
-          image_url,
-          display_context,
-          order_type,
-          linked_item_id,
-          linked_item_type,
-          linked_category_id,
-          button_text,
-          action_type,
-          action_target,
-          start_at,
-          end_at,
-          event_date,
-          event_time,
-          event_end_time,
-          active,
-          sort_order,
-          show_on_qr,
-          show_on_kiosk,
-          show_on_eat_in,
-          show_on_takeaway,
-          show_for_dine_in,
-          show_for_takeaway,
-          promotion_type,
-          button_action,
-          start_date,
-          end_date,
-          start_time,
-          end_time,
-          meal_period,
-          days_of_week,
-          priority,
-          created_at,
-          updated_at
+
+function normalizePromotionMutation(
+  body,
+  existing = null,
+  imageUrl
+) {
+  const current =
+    existing || {};
+
+  const showOnQr =
+    promotionBool(
+      body.show_on_qr,
+      current.show_on_qr ??
+        true
+    );
+
+  const showOnKiosk =
+    promotionBool(
+      body.show_on_kiosk,
+      current.show_on_kiosk ??
+        true
+    );
+
+  const showForDineIn =
+    promotionBool(
+      body.show_for_dine_in,
+      current.show_for_dine_in ??
+        true
+    );
+
+  const showForTakeaway =
+    promotionBool(
+      body.show_for_takeaway,
+      current.show_for_takeaway ??
+        true
+    );
+
+  const displayContext =
+    body.display_context !==
+      undefined
+      ? promotionEnum(
+          body.display_context,
+          [
+            "qr",
+            "kiosk",
+            "both",
+          ],
+          current.display_context ||
+            "both"
         )
-      VALUES
-        (
-          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-          ?, ?, ?::jsonb, ?, NOW(), NOW()
+      : (
+          showOnQr &&
+          !showOnKiosk
+            ? "qr"
+            : (
+                !showOnQr &&
+                showOnKiosk
+                  ? "kiosk"
+                  : "both"
+              )
+        );
+
+  const orderType =
+    body.order_type !==
+      undefined
+      ? promotionEnum(
+          body.order_type,
+          [
+            "dine-in",
+            "takeaway",
+            "both",
+          ],
+          current.order_type ||
+            "both"
         )
-      RETURNING *
-      `,
+      : (
+          showForDineIn &&
+          !showForTakeaway
+            ? "dine-in"
+            : (
+                !showForDineIn &&
+                showForTakeaway
+                  ? "takeaway"
+                  : "both"
+              )
+        );
+
+  const linkedItemId =
+    promotionOptionalId(
+      body.linked_item_id,
+      current.linked_item_id
+    );
+
+  const linkedCategoryId =
+    promotionOptionalId(
+      body.linked_category_id,
+      current.linked_category_id
+    );
+
+  const buttonAction =
+    promotionEnum(
+      body.button_action,
       [
-        req.tenantRid,
-        String(body.title || "").trim(),
-        String(body.description || "").trim(),
-        imageUrl,
-
-        displayContext,
-        orderType,
-        body.linked_item_id ? Number(body.linked_item_id) : null,
-        body.linked_item_id ? "item" : null,
-        body.linked_category_id ? Number(body.linked_category_id) : null,
-
-        String(body.button_text || "View Menu").trim(),
-        actionType,
-        actionTarget,
-
-        body.start_at || null,
-        body.end_at || null,
-        body.event_date || null,
-        body.event_time || null,
-        body.event_end_time || null,
-
-        bool(body.active, true),
-        Number(body.sort_order || 0),
-
-        bool(body.show_on_qr, true),
-        bool(body.show_on_kiosk, true),
-        bool(body.show_on_eat_in, true),
-        bool(body.show_on_takeaway, true),
-        bool(body.show_for_dine_in, true),
-        bool(body.show_for_takeaway, true),
-
-        String(body.promotion_type || "advert").trim(),
-        String(body.button_action || "none").trim(),
-
-        body.start_date || null,
-        body.end_date || null,
-        body.start_time || null,
-        body.end_time || null,
-        String(body.meal_period || "all").trim(),
-        JSON.stringify(days),
-        Number(body.priority || 0),
-      ]
+        "none",
+        "booking",
+        "category",
+        "item",
+        "url",
+        "menu",
+      ],
+      promotionEnum(
+        current.button_action,
+        [
+          "none",
+          "booking",
+          "category",
+          "item",
+          "url",
+          "menu",
+        ],
+        "none"
+      )
     );
 
-    res.status(201).json(saved);
-  } catch (err) {
-    console.error("❌ POST /org/promotions failed:", err);
-    res.status(500).json({
-      error: "Failed to create promotion",
-      detail: err?.message,
-    });
-  }
-});
-
-router.put("/promotions/:id", requirePermission(PERMISSIONS.PROMOTIONS_MANAGE), promoUpload.single("image"), async (req, res) => {
-  try {
-    await ensurePromotionsTable(req);
-
-    const id = Number(req.params.id);
-    const body = req.body || {};
-
-    const existing = await req.qGet(
-      `SELECT * FROM public.restaurant_promotions WHERE id = ? AND restaurant_id = ?`,
-      [id, req.tenantRid]
-    );
-
-    if (!existing) return res.status(404).json({ error: "Promotion not found" });
-
-    const imageUrl = req.file
-      ? `/uploads/${req.tenantRid}/promotions/${req.file.filename}`
-      : body.image_url !== undefined
-        ? String(body.image_url || "").trim() || null
-        : existing.image_url;
-
-    const saved = await req.qGet(
-      `
-      UPDATE public.restaurant_promotions
-      SET
-        title = ?,
-        description = ?,
-        image_url = ?,
-        display_context = ?,
-        order_type = ?,
-        button_text = ?,
-        action_type = ?,
-        action_target = ?,
-        start_at = ?,
-        end_at = ?,
-        event_date = ?,
-event_time = ?,
-event_end_time = ?,
-        active = ?,
-        sort_order = ?,
-      
-        updated_at = NOW()
-      WHERE id = ?
-        AND restaurant_id = ?
-      RETURNING *
-      `,
+  const actionType =
+    promotionEnum(
+      body.action_type !==
+        undefined
+        ? body.action_type
+        : buttonAction,
       [
-        String(body.title ?? existing.title ?? "").trim(),
-        String(body.description ?? existing.description ?? "").trim(),
-        imageUrl,
-        ["qr", "kiosk", "both"].includes(String(body.display_context)) ? String(body.display_context) : existing.display_context || "both",
-        ["dine-in", "takeaway", "both"].includes(String(body.order_type)) ? String(body.order_type) : existing.order_type || "both",
-        String(body.button_text ?? existing.button_text ?? "View").trim(),
-        ["none", "booking", "category", "item", "url"].includes(String(body.action_type)) ? String(body.action_type) : existing.action_type || "none",
-        String(body.action_target ?? existing.action_target ?? "").trim() || null,
-        body.start_at ?? existing.start_at,
-        body.end_at ?? existing.end_at,
-        body.event_date ?? existing.event_date,
-body.event_time ?? existing.event_time,
-body.event_end_time ?? existing.event_end_time,
-        body.active === true || body.active === "true",
-        Number(body.sort_order ?? existing.sort_order ?? 0),
-        id,
-        req.tenantRid,
-      ]
+        "none",
+        "booking",
+        "category",
+        "item",
+        "url",
+        "menu",
+      ],
+      promotionEnum(
+        current.action_type,
+        [
+          "none",
+          "booking",
+          "category",
+          "item",
+          "url",
+          "menu",
+        ],
+        buttonAction
+      )
     );
 
-    res.json(saved);
-  } catch (err) {
-    console.error("❌ PUT /org/promotions/:id failed:", err);
-    res.status(500).json({ error: "Failed to update promotion" });
-  }
-});
+  let actionTarget =
+    promotionOptionalText(
+      body.action_target,
+      current.action_target
+    );
 
-router.delete("/promotions/:id", requirePermission(PERMISSIONS.PROMOTIONS_MANAGE), async (req, res) => {
+  if (
+    actionType ===
+      "category"
+  ) {
+    actionTarget =
+      linkedCategoryId
+        ? String(
+            linkedCategoryId
+          )
+        : null;
+  }
+
+  if (
+    actionType ===
+      "item"
+  ) {
+    actionTarget =
+      linkedItemId
+        ? String(
+            linkedItemId
+          )
+        : null;
+  }
+
+  const daysOfWeek =
+    promotionDays(
+      body.days_of_week,
+      current.days_of_week ||
+        []
+    );
+
+  return {
+    title:
+      String(
+        body.title ??
+        current.title ??
+        ""
+      ).trim(),
+
+    description:
+      String(
+        body.description ??
+        current.description ??
+        ""
+      ).trim(),
+
+    image_url:
+      imageUrl,
+
+    display_context:
+      displayContext,
+
+    order_type:
+      orderType,
+
+    linked_item_id:
+      linkedItemId,
+
+    linked_item_type:
+      linkedItemId
+        ? (
+            promotionOptionalText(
+              body.linked_item_type,
+              current.linked_item_type ||
+                "item"
+            ) ||
+            "item"
+          )
+        : null,
+
+    linked_category_id:
+      linkedCategoryId,
+
+    active:
+      promotionBool(
+        body.active,
+        current.active ??
+          true
+      ),
+
+    show_on_qr:
+      showOnQr,
+
+    show_on_kiosk:
+      showOnKiosk,
+
+    show_on_eat_in:
+      promotionBool(
+        body.show_on_eat_in,
+        current.show_on_eat_in ??
+          true
+      ),
+
+    show_on_takeaway:
+      promotionBool(
+        body.show_on_takeaway,
+        current.show_on_takeaway ??
+          true
+      ),
+
+    show_for_dine_in:
+      showForDineIn,
+
+    show_for_takeaway:
+      showForTakeaway,
+
+    button_text:
+      String(
+        body.button_text ??
+        current.button_text ??
+        "View"
+      ).trim(),
+
+    action_type:
+      actionType,
+
+    action_target:
+      actionTarget,
+
+    start_at:
+      promotionScalar(
+        body.start_at,
+        current.start_at
+      ),
+
+    end_at:
+      promotionScalar(
+        body.end_at,
+        current.end_at
+      ),
+
+    sort_order:
+      Number(
+        body.sort_order ??
+        current.sort_order ??
+        0
+      ),
+
+    promotion_type:
+      String(
+        body.promotion_type ??
+        current.promotion_type ??
+        "general"
+      ).trim(),
+
+    button_action:
+      buttonAction,
+
+    start_date:
+      promotionScalar(
+        body.start_date,
+        current.start_date
+      ),
+
+    end_date:
+      promotionScalar(
+        body.end_date,
+        current.end_date
+      ),
+
+    start_time:
+      promotionScalar(
+        body.start_time,
+        current.start_time
+      ),
+
+    end_time:
+      promotionScalar(
+        body.end_time,
+        current.end_time
+      ),
+
+    meal_period:
+      String(
+        body.meal_period ??
+        current.meal_period ??
+        "all"
+      ).trim(),
+
+    days_of_week:
+      daysOfWeek,
+
+    priority:
+      Number(
+        body.priority ??
+        current.priority ??
+        0
+      ),
+
+    event_date:
+      promotionScalar(
+        body.event_date,
+        current.event_date
+      ),
+
+    event_time:
+      promotionScalar(
+        body.event_time,
+        current.event_time
+      ),
+
+    event_end_time:
+      promotionScalar(
+        body.event_end_time,
+        current.event_end_time
+      ),
+  };
+}
+
+
+function cleanupFailedPromotionUpload(
+  req
+) {
+  const filePath =
+    req?.file?.path;
+
+  if (!filePath) {
+    return;
+  }
+
   try {
-    await ensurePromotionsTable(req);
-
-    const id = Number(req.params.id);
-
-    await req.qRun(
-      `
-      DELETE FROM public.restaurant_promotions
-      WHERE id = ?
-        AND restaurant_id = ?
-      `,
-      [id, req.tenantRid]
+    if (
+      fs.existsSync(filePath)
+    ) {
+      fs.unlinkSync(filePath);
+    }
+  } catch (error) {
+    console.error(
+      "❌ Failed to clean rolled-back promotion upload:",
+      error?.message ||
+        error
     );
-
-    res.json({ success: true });
-  } catch (err) {
-    console.error("❌ DELETE /org/promotions/:id failed:", err);
-    res.status(500).json({ error: "Failed to delete promotion" });
   }
-});
+}
+
+
+router.post(
+  "/promotions",
+  requirePermission(
+    PERMISSIONS.PROMOTIONS_MANAGE
+  ),
+  requireCloudPromotionAuthority,
+  promoUpload.single("image"),
+  async (req, res) => {
+    try {
+      await ensurePromotionsTable(
+        req
+      );
+
+      const body =
+        req.body || {};
+
+      const imageUrl =
+        req.file
+          ? `/uploads/${req.tenantRid}/promotions/${req.file.filename}`
+          : promotionOptionalText(
+              body.image_url,
+              null
+            );
+
+      const values =
+        normalizePromotionMutation(
+          body,
+          null,
+          imageUrl
+        );
+
+      const saved =
+        await withTx(
+          async (tx) => {
+            const row =
+              await tx.qGet(
+                `
+                INSERT INTO public.restaurant_promotions
+                (
+                  restaurant_id,
+                  title,
+                  description,
+                  image_url,
+                  display_context,
+                  order_type,
+                  linked_item_id,
+                  linked_item_type,
+                  linked_category_id,
+                  button_text,
+                  action_type,
+                  action_target,
+                  start_at,
+                  end_at,
+                  event_date,
+                  event_time,
+                  event_end_time,
+                  active,
+                  sort_order,
+                  show_on_qr,
+                  show_on_kiosk,
+                  show_on_eat_in,
+                  show_on_takeaway,
+                  show_for_dine_in,
+                  show_for_takeaway,
+                  promotion_type,
+                  button_action,
+                  start_date,
+                  end_date,
+                  start_time,
+                  end_time,
+                  meal_period,
+                  days_of_week,
+                  priority,
+                  created_at,
+                  updated_at
+                )
+                VALUES
+                (
+                  $1, $2, $3, $4, $5,
+                  $6, $7, $8, $9, $10,
+                  $11, $12, $13, $14, $15,
+                  $16, $17, $18, $19, $20,
+                  $21, $22, $23, $24, $25,
+                  $26, $27, $28, $29, $30,
+                  $31, $32, $33::jsonb, $34,
+                  NOW(), NOW()
+                )
+                RETURNING *
+                `,
+                [
+                  req.tenantRid,
+                  values.title,
+                  values.description,
+                  values.image_url,
+                  values.display_context,
+                  values.order_type,
+                  values.linked_item_id,
+                  values.linked_item_type,
+                  values.linked_category_id,
+                  values.button_text,
+                  values.action_type,
+                  values.action_target,
+                  values.start_at,
+                  values.end_at,
+                  values.event_date,
+                  values.event_time,
+                  values.event_end_time,
+                  values.active,
+                  values.sort_order,
+                  values.show_on_qr,
+                  values.show_on_kiosk,
+                  values.show_on_eat_in,
+                  values.show_on_takeaway,
+                  values.show_for_dine_in,
+                  values.show_for_takeaway,
+                  values.promotion_type,
+                  values.button_action,
+                  values.start_date,
+                  values.end_date,
+                  values.start_time,
+                  values.end_time,
+                  values.meal_period,
+                  JSON.stringify(
+                    values.days_of_week
+                  ),
+                  values.priority,
+                ]
+              );
+
+            await emitPromotionsSnapshotTx(
+              tx,
+              {
+                restaurantId:
+                  req.tenantRid,
+              }
+            );
+
+            return row;
+          }
+        );
+
+      return res
+        .status(201)
+        .json(saved);
+    } catch (error) {
+      cleanupFailedPromotionUpload(
+        req
+      );
+
+      if (
+        sendPromotionAuthorityError(
+          res,
+          error
+        )
+      ) {
+        return;
+      }
+
+      console.error(
+        "❌ POST /org/promotions failed:",
+        error
+      );
+
+      return res.status(500).json({
+        error:
+          "Failed to create promotion",
+
+        detail:
+          error?.message,
+      });
+    }
+  }
+);
+
+
+router.put(
+  "/promotions/:id",
+  requirePermission(
+    PERMISSIONS.PROMOTIONS_MANAGE
+  ),
+  requireCloudPromotionAuthority,
+  promoUpload.single("image"),
+  async (req, res) => {
+    try {
+      await ensurePromotionsTable(
+        req
+      );
+
+      const id =
+        Number(
+          req.params.id
+        );
+
+      if (
+        !Number.isSafeInteger(id) ||
+        id <= 0
+      ) {
+        cleanupFailedPromotionUpload(
+          req
+        );
+
+        return res.status(400).json({
+          error:
+            "Invalid promotion id",
+        });
+      }
+
+      const body =
+        req.body || {};
+
+      const saved =
+        await withTx(
+          async (tx) => {
+            const existing =
+              await tx.qGet(
+                `
+                SELECT *
+                FROM
+                  public.restaurant_promotions
+                WHERE
+                  id = $1
+                  AND restaurant_id = $2
+                FOR UPDATE
+                `,
+                [
+                  id,
+                  req.tenantRid,
+                ]
+              );
+
+            if (!existing) {
+              return null;
+            }
+
+            const imageUrl =
+              req.file
+                ? `/uploads/${req.tenantRid}/promotions/${req.file.filename}`
+                : (
+                    body.image_url !==
+                      undefined
+                      ? promotionOptionalText(
+                          body.image_url,
+                          null
+                        )
+                      : existing.image_url
+                  );
+
+            const values =
+              normalizePromotionMutation(
+                body,
+                existing,
+                imageUrl
+              );
+
+            const row =
+              await tx.qGet(
+                `
+                UPDATE
+                  public.restaurant_promotions
+                SET
+                  title = $1,
+                  description = $2,
+                  image_url = $3,
+                  display_context = $4,
+                  order_type = $5,
+                  linked_item_id = $6,
+                  linked_item_type = $7,
+                  linked_category_id = $8,
+                  button_text = $9,
+                  action_type = $10,
+                  action_target = $11,
+                  start_at = $12,
+                  end_at = $13,
+                  event_date = $14,
+                  event_time = $15,
+                  event_end_time = $16,
+                  active = $17,
+                  sort_order = $18,
+                  show_on_qr = $19,
+                  show_on_kiosk = $20,
+                  show_on_eat_in = $21,
+                  show_on_takeaway = $22,
+                  show_for_dine_in = $23,
+                  show_for_takeaway = $24,
+                  promotion_type = $25,
+                  button_action = $26,
+                  start_date = $27,
+                  end_date = $28,
+                  start_time = $29,
+                  end_time = $30,
+                  meal_period = $31,
+                  days_of_week = $32::jsonb,
+                  priority = $33,
+                  updated_at = NOW()
+                WHERE
+                  id = $34
+                  AND restaurant_id = $35
+                RETURNING *
+                `,
+                [
+                  values.title,
+                  values.description,
+                  values.image_url,
+                  values.display_context,
+                  values.order_type,
+                  values.linked_item_id,
+                  values.linked_item_type,
+                  values.linked_category_id,
+                  values.button_text,
+                  values.action_type,
+                  values.action_target,
+                  values.start_at,
+                  values.end_at,
+                  values.event_date,
+                  values.event_time,
+                  values.event_end_time,
+                  values.active,
+                  values.sort_order,
+                  values.show_on_qr,
+                  values.show_on_kiosk,
+                  values.show_on_eat_in,
+                  values.show_on_takeaway,
+                  values.show_for_dine_in,
+                  values.show_for_takeaway,
+                  values.promotion_type,
+                  values.button_action,
+                  values.start_date,
+                  values.end_date,
+                  values.start_time,
+                  values.end_time,
+                  values.meal_period,
+                  JSON.stringify(
+                    values.days_of_week
+                  ),
+                  values.priority,
+                  id,
+                  req.tenantRid,
+                ]
+              );
+
+            await emitPromotionsSnapshotTx(
+              tx,
+              {
+                restaurantId:
+                  req.tenantRid,
+              }
+            );
+
+            return row;
+          }
+        );
+
+      if (!saved) {
+        cleanupFailedPromotionUpload(
+          req
+        );
+
+        return res.status(404).json({
+          error:
+            "Promotion not found",
+        });
+      }
+
+      return res.json(
+        saved
+      );
+    } catch (error) {
+      cleanupFailedPromotionUpload(
+        req
+      );
+
+      if (
+        sendPromotionAuthorityError(
+          res,
+          error
+        )
+      ) {
+        return;
+      }
+
+      console.error(
+        "❌ PUT /org/promotions/:id failed:",
+        error
+      );
+
+      return res.status(500).json({
+        error:
+          "Failed to update promotion",
+      });
+    }
+  }
+);
+
+
+router.delete(
+  "/promotions/:id",
+  requirePermission(
+    PERMISSIONS.PROMOTIONS_MANAGE
+  ),
+  requireCloudPromotionAuthority,
+  async (req, res) => {
+    try {
+      await ensurePromotionsTable(
+        req
+      );
+
+      const id =
+        Number(
+          req.params.id
+        );
+
+      if (
+        !Number.isSafeInteger(id) ||
+        id <= 0
+      ) {
+        return res.status(400).json({
+          error:
+            "Invalid promotion id",
+        });
+      }
+
+      const deleted =
+        await withTx(
+          async (tx) => {
+            const row =
+              await tx.qGet(
+                `
+                DELETE FROM
+                  public.restaurant_promotions
+                WHERE
+                  id = $1
+                  AND restaurant_id = $2
+                RETURNING id
+                `,
+                [
+                  id,
+                  req.tenantRid,
+                ]
+              );
+
+            if (!row?.id) {
+              return null;
+            }
+
+            await emitPromotionsSnapshotTx(
+              tx,
+              {
+                restaurantId:
+                  req.tenantRid,
+              }
+            );
+
+            return row;
+          }
+        );
+
+      if (!deleted?.id) {
+        return res.status(404).json({
+          error:
+            "Promotion not found",
+        });
+      }
+
+      return res.json({
+        success:
+          true,
+
+        id:
+          deleted.id,
+      });
+    } catch (error) {
+      if (
+        sendPromotionAuthorityError(
+          res,
+          error
+        )
+      ) {
+        return;
+      }
+
+      console.error(
+        "❌ DELETE /org/promotions/:id failed:",
+        error
+      );
+
+      return res.status(500).json({
+        error:
+          "Failed to delete promotion",
+      });
+    }
+  }
+);
+
 module.exports = router;
