@@ -31,6 +31,25 @@ const {
 );
 
 const {
+  withTx,
+} = require(
+  "../dbCompat"
+);
+
+const {
+  MaksRuntimeRoleError,
+  assertCloudRuntime,
+} = require(
+  "../utils/runtimeRole"
+);
+
+const {
+  emitPricingRulesSnapshotTx,
+} = require(
+  "../edge/contracts/pricingRules"
+);
+
+const {
   buildAuthoritativeQuote,
   normalizeSurface,
 } = require(
@@ -84,6 +103,41 @@ function canManage(req) {
     permissionSubject(req),
     PERMISSIONS.PRICING_MANAGE
   );
+}
+
+function sendPricingAuthorityError(
+  res,
+  error
+) {
+  if (
+    !(error instanceof
+      MaksRuntimeRoleError)
+  ) {
+    return false;
+  }
+
+  if (
+    error.code ===
+      "MAKS_RUNTIME_ROLE_NOT_CLOUD"
+  ) {
+    res.status(409).json({
+      error:
+        "Pricing changes must be made through MAKS Cloud.",
+      code:
+        "PRICING_CLOUD_AUTHORITY_REQUIRED",
+    });
+
+    return true;
+  }
+
+  res.status(503).json({
+    error:
+      "Pricing changes are temporarily unavailable because the MAKS runtime role is not configured correctly.",
+    code:
+      "PRICING_RUNTIME_ROLE_UNAVAILABLE",
+  });
+
+  return true;
 }
 
 async function ensurePricingRulesTable(
@@ -296,57 +350,88 @@ router.post(
         });
       }
 
-      const saved = await req.qGet(
-        `
-        INSERT INTO public.pricing_rules (
-          restaurant_id,
-          name,
-          rule_type,
-          active,
-          priority,
-          conditions,
-          actions,
-          starts_at,
-          ends_at,
-          created_at,
-          updated_at
-        )
-        VALUES (
-          $1,
-          $2,
-          $3,
-          $4,
-          $5,
-          $6::jsonb,
-          $7::jsonb,
-          $8,
-          $9,
-          NOW(),
-          NOW()
-        )
-        RETURNING *
-        `,
-        [
-          rid,
-          name,
-          ruleType,
-          body.active !== false,
-          Number(
-            body.priority || 0
-          ),
-          JSON.stringify(
-            conditions
-          ),
-          JSON.stringify(actions),
-          body.starts_at || null,
-          body.ends_at || null,
-        ]
-      );
+      assertCloudRuntime();
+
+      const saved =
+        await withTx(
+          async (tx) => {
+            const row =
+              await tx.qGet(
+                `
+                INSERT INTO public.pricing_rules (
+                  restaurant_id,
+                  name,
+                  rule_type,
+                  active,
+                  priority,
+                  conditions,
+                  actions,
+                  starts_at,
+                  ends_at,
+                  created_at,
+                  updated_at
+                )
+                VALUES (
+                  $1,
+                  $2,
+                  $3,
+                  $4,
+                  $5,
+                  $6::jsonb,
+                  $7::jsonb,
+                  $8,
+                  $9,
+                  NOW(),
+                  NOW()
+                )
+                RETURNING *
+                `,
+                [
+                  rid,
+                  name,
+                  ruleType,
+                  body.active !== false,
+                  Number(
+                    body.priority || 0
+                  ),
+                  JSON.stringify(
+                    conditions
+                  ),
+                  JSON.stringify(
+                    actions
+                  ),
+                  body.starts_at ||
+                    null,
+                  body.ends_at ||
+                    null,
+                ]
+              );
+
+            await emitPricingRulesSnapshotTx(
+              tx,
+              {
+                restaurantId:
+                  rid,
+              }
+            );
+
+            return row;
+          }
+        );
 
       return res
         .status(201)
         .json(saved);
     } catch (error) {
+      if (
+        sendPricingAuthorityError(
+          res,
+          error
+        )
+      ) {
+        return;
+      }
+
       console.error(
         "❌ POST /pricing-rules failed:",
         error
@@ -484,15 +569,39 @@ router.delete(
         });
       }
 
+      assertCloudRuntime();
+
       const deleted =
-        await req.qGet(
-          `
-          DELETE FROM public.pricing_rules
-          WHERE id = $1
-            AND restaurant_id = $2
-          RETURNING id
-          `,
-          [id, rid]
+        await withTx(
+          async (tx) => {
+            const row =
+              await tx.qGet(
+                `
+                DELETE FROM public.pricing_rules
+                WHERE id = $1
+                  AND restaurant_id = $2
+                RETURNING id
+                `,
+                [
+                  id,
+                  rid,
+                ]
+              );
+
+            if (!row?.id) {
+              return null;
+            }
+
+            await emitPricingRulesSnapshotTx(
+              tx,
+              {
+                restaurantId:
+                  rid,
+              }
+            );
+
+            return row;
+          }
         );
 
       if (!deleted?.id) {
@@ -507,6 +616,15 @@ router.delete(
         id: deleted.id,
       });
     } catch (error) {
+      if (
+        sendPricingAuthorityError(
+          res,
+          error
+        )
+      ) {
+        return;
+      }
+
       console.error(
         "❌ DELETE /pricing-rules/:id failed:",
         error
