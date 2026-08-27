@@ -25,6 +25,13 @@ const {
 );
 
 const {
+  reconcileMenuAssetsOnce,
+} = require(
+  "./menuAssetTransport"
+);
+
+
+const {
   applyInboxOnce,
 } = require(
   "./applyEngine"
@@ -1404,9 +1411,72 @@ async function sendPromotionAssetCycle() {
         }
       );
     }
+
+    const menuResult =
+      await reconcileMenuAssetsOnce(
+        options
+      );
+
+    const menuActivity =
+      Number(
+        menuResult?.downloaded ||
+        0
+      ) +
+      Number(
+        menuResult?.rejected ||
+        0
+      ) +
+      Number(
+        menuResult?.failed ||
+        0
+      );
+
+    if (menuActivity > 0) {
+      const menuLogger =
+        menuResult?.success === true
+          ? console.log
+          : console.error;
+
+      menuLogger(
+        `[${nowIso()}] ${menuResult?.success === true ? "✅" : "❌"} MAKS Edge menu assets`,
+        {
+          scanned:
+            Number(
+              menuResult?.scanned ||
+              0
+            ),
+          downloaded:
+            Number(
+              menuResult?.downloaded ||
+              0
+            ),
+          unchanged:
+            Number(
+              menuResult?.unchanged ||
+              0
+            ),
+          skipped:
+            Number(
+              menuResult?.skipped ||
+              0
+            ),
+          rejected:
+            Number(
+              menuResult?.rejected ||
+              0
+            ),
+          failed:
+            Number(
+              menuResult?.failed ||
+              0
+            ),
+        }
+      );
+    }
+
   } catch (error) {
     console.error(
-      `[${nowIso()}] ❌ MAKS Edge promotion asset cycle failed`,
+      `[${nowIso()}] ❌ MAKS Edge asset cycle failed`,
       {
         error:
           String(

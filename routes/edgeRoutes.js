@@ -2077,4 +2077,480 @@ router.get(
 );
 
 
+
+/*
+ * =========================================================
+ * CLOUD → EDGE MENU IMAGE FETCH
+ * =========================================================
+ */
+
+const MENU_ASSET_MAX_BYTES =
+  4 * 1024 * 1024;
+
+function normalizeMenuAssetType(raw) {
+  const type =
+    String(raw || "")
+      .trim()
+      .toLowerCase();
+
+  if (
+    type === "meal" ||
+    type === "meals"
+  ) {
+    return "meal";
+  }
+
+  if (
+    type === "drink" ||
+    type === "drinks"
+  ) {
+    return "drink";
+  }
+
+  if (
+    type === "dessert" ||
+    type === "desserts"
+  ) {
+    return "dessert";
+  }
+
+  throw edgeAuthError(
+    400,
+    "EDGE_MENU_ASSET_TYPE_INVALID",
+    "Menu item type is invalid"
+  );
+}
+
+function menuAssetFilename({
+  restaurantId,
+  photoUrl,
+}) {
+  const rid =
+    Number(restaurantId);
+
+  const raw =
+    String(photoUrl || "").trim();
+
+  const prefix =
+    `/uploads/${rid}/menu-items/`;
+
+  if (
+    !Number.isSafeInteger(rid) ||
+    rid <= 0 ||
+    !raw.startsWith(prefix)
+  ) {
+    throw edgeAuthError(
+      409,
+      "EDGE_MENU_ASSET_PATH_INVALID",
+      "Menu image path is invalid"
+    );
+  }
+
+  const filename =
+    raw.slice(prefix.length);
+
+  if (
+    !filename ||
+    filename === "." ||
+    filename === ".." ||
+    filename.includes("/") ||
+    filename.includes("\\") ||
+    filename.includes("\0") ||
+    path.basename(filename) !==
+      filename
+  ) {
+    throw edgeAuthError(
+      409,
+      "EDGE_MENU_ASSET_PATH_INVALID",
+      "Menu image path is invalid"
+    );
+  }
+
+  let decoded = filename;
+
+  try {
+    decoded =
+      decodeURIComponent(filename);
+  } catch {
+    decoded = filename;
+  }
+
+  if (
+    decoded.includes("/") ||
+    decoded.includes("\\") ||
+    decoded === "." ||
+    decoded === ".."
+  ) {
+    throw edgeAuthError(
+      409,
+      "EDGE_MENU_ASSET_PATH_INVALID",
+      "Menu image path is invalid"
+    );
+  }
+
+  return filename;
+}
+
+async function resolveCloudMenuAsset({
+  restaurantId,
+  photoUrl,
+}) {
+  const rid =
+    Number(restaurantId);
+
+  const filename =
+    menuAssetFilename({
+      restaurantId: rid,
+      photoUrl,
+    });
+
+  const uploadsRoot =
+    promotionAssetUploadsRoot();
+
+  const directory =
+    path.resolve(
+      uploadsRoot,
+      String(rid),
+      "menu-items"
+    );
+
+  const target =
+    path.resolve(
+      directory,
+      filename
+    );
+
+  if (
+    !promotionAssetPathInside(
+      uploadsRoot,
+      directory
+    ) ||
+    !promotionAssetPathInside(
+      directory,
+      target
+    ) ||
+    target === directory
+  ) {
+    throw edgeAuthError(
+      409,
+      "EDGE_MENU_ASSET_PATH_INVALID",
+      "Menu image path escaped the restaurant uploads directory"
+    );
+  }
+
+  let rootReal;
+  let directoryReal;
+  let targetReal;
+  let lstat;
+
+  try {
+    [
+      rootReal,
+      directoryReal,
+      targetReal,
+      lstat,
+    ] =
+      await Promise.all([
+        fs.promises.realpath(
+          uploadsRoot
+        ),
+        fs.promises.realpath(
+          directory
+        ),
+        fs.promises.realpath(
+          target
+        ),
+        fs.promises.lstat(
+          target
+        ),
+      ]);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      throw edgeAuthError(
+        404,
+        "EDGE_MENU_ASSET_FILE_MISSING",
+        "Menu image file is not available"
+      );
+    }
+
+    throw error;
+  }
+
+  if (
+    !promotionAssetPathInside(
+      rootReal,
+      directoryReal
+    ) ||
+    !promotionAssetPathInside(
+      directoryReal,
+      targetReal
+    ) ||
+    lstat.isSymbolicLink() ||
+    !lstat.isFile()
+  ) {
+    throw edgeAuthError(
+      409,
+      "EDGE_MENU_ASSET_PATH_INVALID",
+      "Menu image file is invalid"
+    );
+  }
+
+  const size =
+    Number(lstat.size);
+
+  if (
+    !Number.isSafeInteger(size) ||
+    size < 0 ||
+    size >
+      MENU_ASSET_MAX_BYTES
+  ) {
+    throw edgeAuthError(
+      413,
+      "EDGE_MENU_ASSET_TOO_LARGE",
+      "Menu image file exceeds the Edge asset limit"
+    );
+  }
+
+  const sha256 =
+    await promotionAssetSha256(
+      targetReal
+    );
+
+  return {
+    filename,
+    filePath: targetReal,
+    size,
+    sha256,
+  };
+}
+
+router.get(
+  "/assets/menu/:type/:itemId/image",
+  async (req, res) => {
+    try {
+      const edge =
+        await authenticateEdgeRequest(
+          req
+        );
+
+      const restaurantId =
+        Number(
+          edge.restaurant_id
+        );
+
+      const itemType =
+        normalizeMenuAssetType(
+          req.params.type
+        );
+
+      const itemId =
+        Number(
+          req.params.itemId
+        );
+
+      if (
+        !Number.isSafeInteger(
+          itemId
+        ) ||
+        itemId <= 0
+      ) {
+        return res
+          .status(400)
+          .json({
+            success: false,
+            code:
+              "EDGE_MENU_ASSET_ID_INVALID",
+            error:
+              "Menu item id is invalid",
+          });
+      }
+
+      let item = null;
+
+      if (itemType === "meal") {
+        item =
+          await req.qGet(
+            `
+            SELECT
+              id,
+              photo_url
+            FROM
+              public.meals
+            WHERE
+              id = $1
+              AND restaurant_id = $2
+            LIMIT 1
+            `,
+            [
+              itemId,
+              restaurantId,
+            ]
+          );
+      } else {
+        item =
+          await req.qGet(
+            `
+            SELECT
+              id,
+              photo_url
+            FROM
+              public.menu_items
+            WHERE
+              id = $1
+              AND restaurant_id = $2
+              AND LOWER(
+                TRIM(
+                  COALESCE(type, '')
+                )
+              ) IN (
+                $3,
+                $4
+              )
+            LIMIT 1
+            `,
+            [
+              itemId,
+              restaurantId,
+              itemType,
+              `${itemType}s`,
+            ]
+          );
+      }
+
+      if (
+        !item?.id ||
+        !String(
+          item.photo_url || ""
+        ).trim()
+      ) {
+        return res
+          .status(404)
+          .json({
+            success: false,
+            code:
+              "EDGE_MENU_ASSET_NOT_FOUND",
+            error:
+              "Menu image was not found",
+          });
+      }
+
+      const asset =
+        await resolveCloudMenuAsset({
+          restaurantId,
+          photoUrl:
+            item.photo_url,
+        });
+
+      res.set(
+        "x-maks-asset-sha256",
+        asset.sha256
+      );
+
+      res.set(
+        "x-maks-asset-size",
+        String(asset.size)
+      );
+
+      res.set(
+        "cache-control",
+        "private, no-cache"
+      );
+
+      const localSha =
+        String(
+          req.headers[
+            "x-maks-local-sha256"
+          ] || ""
+        )
+          .trim()
+          .toLowerCase();
+
+      if (
+        /^[0-9a-f]{64}$/.test(
+          localSha
+        ) &&
+        localSha === asset.sha256
+      ) {
+        return res
+          .status(304)
+          .end();
+      }
+
+      res.type(
+        asset.filename
+      );
+
+      res.set(
+        "content-length",
+        String(asset.size)
+      );
+
+      const stream =
+        fs.createReadStream(
+          asset.filePath
+        );
+
+      stream.on(
+        "error",
+        (error) => {
+          console.error(
+            "❌ MAKS Edge menu asset stream failed:",
+            String(
+              error?.message ||
+              error
+            ).slice(0, 300)
+          );
+
+          if (!res.headersSent) {
+            res
+              .status(500)
+              .end();
+          } else {
+            res.destroy(error);
+          }
+        }
+      );
+
+      return stream.pipe(res);
+    } catch (error) {
+      if (
+        Number.isSafeInteger(
+          error?.statusCode
+        ) &&
+        error?.code
+      ) {
+        return res
+          .status(
+            error.statusCode
+          )
+          .json({
+            success: false,
+            code: error.code,
+            error:
+              error.message,
+          });
+      }
+
+      console.error(
+        "❌ MAKS Edge menu asset fetch failed:",
+        String(
+          error?.message ||
+          error
+        ).slice(0, 500)
+      );
+
+      return res
+        .status(500)
+        .json({
+          success: false,
+          code:
+            "EDGE_MENU_ASSET_FAILED",
+          error:
+            "Menu image fetch failed",
+        });
+    }
+  }
+);
+
+
 module.exports = router;
