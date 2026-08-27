@@ -852,6 +852,585 @@ test(
     );
 
     /* -----------------------------------------------------
+       LOST HTTP RESPONSE = SAFE IDEMPOTENT REPLAY
+    ----------------------------------------------------- */
+
+    await t.test(
+      "lost HTTP response retry replays completed POS submission exactly once",
+      async () => {
+        const submissionId =
+          require(
+            "node:crypto"
+          ).randomUUID();
+
+        const payload = {
+          ...orderPayload({
+            mealId:
+              fixtures.mealA,
+
+            quantity:
+              1,
+          }),
+
+          submission_id:
+            submissionId,
+        };
+
+        /*
+         * First request commits normally.
+         *
+         * The test deliberately does not use its response to
+         * decide whether another business operation is needed.
+         * Conceptually, the HTTP response is lost after commit.
+         */
+        const firstResponse =
+          await request(app)
+            .post(
+              "/orders/grouped"
+            )
+            .set(
+              "Authorization",
+              bearer(
+                tokenA
+              )
+            )
+            .send(
+              payload
+            );
+
+        assert.equal(
+          firstResponse.status,
+          201,
+          JSON.stringify(
+            firstResponse.body
+          )
+        );
+
+        assert.equal(
+          String(
+            firstResponse.body
+              ?.submission_id ||
+            ""
+          ),
+          submissionId
+        );
+
+        const batchId =
+          String(
+            firstResponse.body
+              ?.batch_id ||
+            ""
+          );
+
+        assert.match(
+          batchId,
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+          "Lost-response first request returned no valid batch_id"
+        );
+
+        /*
+         * Simulate the POS retry after it never received the
+         * first response: same tenant, exact same body, same
+         * client-generated submission UUID.
+         */
+        const replayResponse =
+          await request(app)
+            .post(
+              "/orders/grouped"
+            )
+            .set(
+              "Authorization",
+              bearer(
+                tokenA
+              )
+            )
+            .send(
+              payload
+            );
+
+        assert.equal(
+          replayResponse.status,
+          201,
+          JSON.stringify(
+            replayResponse.body
+          )
+        );
+
+        assert.equal(
+          String(
+            replayResponse.body
+              ?.submission_id ||
+            ""
+          ),
+          submissionId
+        );
+
+        assert.equal(
+          String(
+            replayResponse.body
+              ?.batch_id ||
+            ""
+          ),
+          batchId,
+          "Replay returned a different batch"
+        );
+
+        assert.deepEqual(
+          replayResponse.body,
+          firstResponse.body,
+          "Replay did not return the original HTTP result"
+        );
+
+        const batchRows =
+          await all(
+            `
+            SELECT id
+            FROM
+              public.order_batches
+            WHERE
+              restaurant_id = $1
+              AND id = $2::uuid
+            `,
+            [
+              fixtures.restaurantA,
+              batchId,
+            ]
+          );
+
+        assert.equal(
+          batchRows.length,
+          1,
+          "Lost-response retry duplicated order_batches"
+        );
+
+        const posRows =
+          await all(
+            `
+            SELECT id
+            FROM
+              public.pos_orders
+            WHERE
+              restaurant_id = $1
+              AND batch_id = $2::uuid
+            ORDER BY
+              id ASC
+            `,
+            [
+              fixtures.restaurantA,
+              batchId,
+            ]
+          );
+
+        assert.equal(
+          posRows.length,
+          1,
+          "Lost-response retry duplicated POS bill rows"
+        );
+
+        const kdsRows =
+          await all(
+            `
+            SELECT id
+            FROM
+              public.orders
+            WHERE
+              restaurant_id = $1
+              AND batch_id = $2::uuid
+            ORDER BY
+              id ASC
+            `,
+            [
+              fixtures.restaurantA,
+              batchId,
+            ]
+          );
+
+        assert.equal(
+          kdsRows.length,
+          1,
+          "Lost-response retry duplicated KDS/order rows"
+        );
+
+        const reservations =
+          await all(
+            `
+            SELECT
+              id,
+              submission_id,
+              quantity,
+              status
+            FROM
+              public.item_availability_reservations
+            WHERE
+              restaurant_id = $1
+              AND batch_id = $2::uuid
+              AND submission_id = $3::uuid
+            ORDER BY
+              id ASC
+            `,
+            [
+              fixtures.restaurantA,
+              batchId,
+              submissionId,
+            ]
+          );
+
+        assert.equal(
+          reservations.length,
+          1,
+          "Lost-response retry duplicated availability reservations"
+        );
+
+        assert.equal(
+          Number(
+            reservations[0]
+              ?.quantity
+          ),
+          1
+        );
+
+        assert.equal(
+          String(
+            reservations[0]
+              ?.status ||
+            ""
+          ),
+          "consumed"
+        );
+
+        const events =
+          await all(
+            `
+            SELECT
+              id,
+              idempotency_key,
+              payload
+            FROM
+              public.edge_outbox
+            WHERE
+              restaurant_id = $1
+              AND event_type =
+                'pos.order.submitted'
+              AND entity_id = $2
+            ORDER BY
+              id ASC
+            `,
+            [
+              fixtures.restaurantA,
+              batchId,
+            ]
+          );
+
+        assert.equal(
+          events.length,
+          1,
+          "Lost-response retry duplicated Edge outbox events"
+        );
+
+        assert.equal(
+          String(
+            events[0]
+              ?.idempotency_key ||
+            ""
+          ),
+          `pos.order.submitted:${submissionId}`
+        );
+
+        assert.equal(
+          String(
+            events[0]
+              ?.payload
+              ?.submission_id ||
+            ""
+          ),
+          submissionId
+        );
+
+        const idempotencyRows =
+          await all(
+            `
+            SELECT
+              id,
+              status,
+              response_status,
+              response_body
+            FROM
+              public.edge_idempotency
+            WHERE
+              restaurant_id = $1
+              AND scope = $2
+              AND idempotency_key = $3
+            ORDER BY
+              id ASC
+            `,
+            [
+              fixtures.restaurantA,
+              "pos.orders.grouped",
+              submissionId,
+            ]
+          );
+
+        assert.equal(
+          idempotencyRows.length,
+          1,
+          "Lost-response retry created multiple idempotency records"
+        );
+
+        assert.equal(
+          idempotencyRows[0]
+            ?.status,
+          "completed"
+        );
+
+        assert.equal(
+          Number(
+            idempotencyRows[0]
+              ?.response_status
+          ),
+          200
+        );
+
+        assert.equal(
+          String(
+            idempotencyRows[0]
+              ?.response_body
+              ?.batch_id ||
+            ""
+          ),
+          batchId
+        );
+
+        /*
+         * Same UUID with changed request content must fail
+         * closed and must not execute restaurant mutations.
+         */
+        const changedPayload = {
+          ...payload,
+
+          items:
+            payload.items.map(
+              (
+                item,
+                index
+              ) =>
+                index === 0
+                  ? {
+                      ...item,
+                      quantity:
+                        Number(
+                          item.quantity ||
+                          1
+                        ) + 1,
+                    }
+                  : item
+            ),
+        };
+
+        const conflictResponse =
+          await request(app)
+            .post(
+              "/orders/grouped"
+            )
+            .set(
+              "Authorization",
+              bearer(
+                tokenA
+              )
+            )
+            .send(
+              changedPayload
+            );
+
+        assert.equal(
+          conflictResponse.status,
+          409,
+          JSON.stringify(
+            conflictResponse.body
+          )
+        );
+
+        assert.equal(
+          conflictResponse.body
+            ?.code,
+          "EDGE_IDEMPOTENCY_CONFLICT"
+        );
+
+        const afterConflict =
+          {
+            batches:
+              Number(
+                (
+                  await one(
+                    `
+                    SELECT COUNT(*)::int
+                      AS count
+                    FROM
+                      public.order_batches
+                    WHERE
+                      restaurant_id = $1
+                      AND id = $2::uuid
+                    `,
+                    [
+                      fixtures.restaurantA,
+                      batchId,
+                    ]
+                  )
+                )?.count ||
+                0
+              ),
+
+            pos:
+              Number(
+                (
+                  await one(
+                    `
+                    SELECT COUNT(*)::int
+                      AS count
+                    FROM
+                      public.pos_orders
+                    WHERE
+                      restaurant_id = $1
+                      AND batch_id = $2::uuid
+                    `,
+                    [
+                      fixtures.restaurantA,
+                      batchId,
+                    ]
+                  )
+                )?.count ||
+                0
+              ),
+
+            kds:
+              Number(
+                (
+                  await one(
+                    `
+                    SELECT COUNT(*)::int
+                      AS count
+                    FROM
+                      public.orders
+                    WHERE
+                      restaurant_id = $1
+                      AND batch_id = $2::uuid
+                    `,
+                    [
+                      fixtures.restaurantA,
+                      batchId,
+                    ]
+                  )
+                )?.count ||
+                0
+              ),
+
+            reservations:
+              Number(
+                (
+                  await one(
+                    `
+                    SELECT COUNT(*)::int
+                      AS count
+                    FROM
+                      public.item_availability_reservations
+                    WHERE
+                      restaurant_id = $1
+                      AND batch_id = $2::uuid
+                      AND submission_id = $3::uuid
+                    `,
+                    [
+                      fixtures.restaurantA,
+                      batchId,
+                      submissionId,
+                    ]
+                  )
+                )?.count ||
+                0
+              ),
+
+            outbox:
+              Number(
+                (
+                  await one(
+                    `
+                    SELECT COUNT(*)::int
+                      AS count
+                    FROM
+                      public.edge_outbox
+                    WHERE
+                      restaurant_id = $1
+                      AND event_type =
+                        'pos.order.submitted'
+                      AND entity_id = $2
+                    `,
+                    [
+                      fixtures.restaurantA,
+                      batchId,
+                    ]
+                  )
+                )?.count ||
+                0
+              ),
+
+            idempotency:
+              Number(
+                (
+                  await one(
+                    `
+                    SELECT COUNT(*)::int
+                      AS count
+                    FROM
+                      public.edge_idempotency
+                    WHERE
+                      restaurant_id = $1
+                      AND scope = $2
+                      AND idempotency_key = $3
+                    `,
+                    [
+                      fixtures.restaurantA,
+                      "pos.orders.grouped",
+                      submissionId,
+                    ]
+                  )
+                )?.count ||
+                0
+              ),
+          };
+
+        assert.deepEqual(
+          afterConflict,
+          {
+            batches:
+              1,
+
+            pos:
+              1,
+
+            kds:
+              1,
+
+            reservations:
+              1,
+
+            outbox:
+              1,
+
+            idempotency:
+              1,
+          },
+          "Idempotency conflict changed committed restaurant state"
+        );
+
+        console.log(
+          "✅ Lost HTTP response replay returned original result exactly once"
+        );
+
+        console.log(
+          "✅ Same submission_id with changed payload failed closed"
+        );
+      }
+    );
+
+    /* -----------------------------------------------------
        APPEND TO EXISTING BATCH
     ----------------------------------------------------- */
 

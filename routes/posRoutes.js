@@ -18,6 +18,7 @@ const { audit } = require("../utils/audit");
 
 const {
   enqueueEdgeEventTx,
+  withEdgeOperation,
 } = require("../edge/syncStore");
 
 const {
@@ -4161,7 +4162,30 @@ const shouldAppendToExistingBatch =
  * batch_id identifies the whole ticket.
  * submissionId identifies this individual Send / append.
  */
+const requestedSubmissionId =
+  String(
+    req.body?.submission_id || ""
+  ).trim();
+
+if (
+  requestedSubmissionId &&
+  !isUuidLocal(
+    requestedSubmissionId
+  )
+) {
+  return res.status(400).json({
+    success: false,
+
+    error:
+      "submission_id must be a valid UUID.",
+
+    code:
+      "INVALID_SUBMISSION_ID",
+  });
+}
+
 const submissionId =
+  requestedSubmissionId ||
   require("crypto").randomUUID();
 
   console.log(
@@ -4181,7 +4205,21 @@ const submissionId =
   };
 
   try {
-    const result = await withTx(async (tx) => {
+    const operation =
+      await withEdgeOperation({
+        restaurantId,
+
+        scope:
+          "pos.orders.grouped",
+
+        idempotencyKey:
+          submissionId,
+
+        requestPayload:
+          req.body,
+
+        execute:
+          async ({ tx }) => {
       let tableAllergyCodes = [];
       let strictCrossContamination = false;
       let tableCovers = 1;
@@ -4936,9 +4974,16 @@ if (pricingDiscount > 0 && realBatchId) {
         ?.applied_rules || [],
   },
 };
+      },
     });
 
-    await audit(
+    const result =
+      operation.responseBody;
+
+
+
+    if (!operation.replayed) {
+      await audit(
       req,
       "POS_GROUPED_ORDER_CREATED",
       {
@@ -4949,6 +4994,9 @@ if (pricingDiscount > 0 && realBatchId) {
       },
       { entity: "order_batch", entity_id: result.batch_id }
     );
+    }
+
+
 
     
   return res.status(201).json({
@@ -4956,7 +5004,11 @@ if (pricingDiscount > 0 && realBatchId) {
   message:
     "✅ Grouped order placed successfully!",
 
-  batch_id: result.batch_id,
+  submission_id:
+    submissionId,
+
+  batch_id:
+    result.batch_id,
 
   pickup_number:
     result.pickup_number || null,
@@ -4986,6 +5038,32 @@ if (pricingDiscount > 0 && realBatchId) {
 });
 
     } catch (err) {
+
+  const idempotencyCode =
+    String(
+      err?.code || ""
+    );
+
+  if (
+    idempotencyCode.startsWith(
+      "EDGE_IDEMPOTENCY_"
+    )
+  ) {
+    return res
+      .status(409)
+      .json({
+        success: false,
+
+        error:
+          err.message,
+
+        detail:
+          err.message,
+
+        code:
+          idempotencyCode,
+      });
+  }
 
   // =====================================================
   // ITEM AVAILABILITY
