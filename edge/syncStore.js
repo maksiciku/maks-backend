@@ -1153,6 +1153,8 @@ async function claimInboxEvents({
   limit = 25,
 
   leaseSeconds = 30,
+
+  pool = null,
 }) {
   const rid =
     requireRestaurantId(
@@ -1184,7 +1186,8 @@ async function claimInboxEvents({
       }
     );
 
-  return withTx(
+  return runSyncTx(
+    pool,
     async (tx) =>
       tx.qAll(
         `
@@ -1276,6 +1279,8 @@ async function markInboxApplied({
   eventId,
 
   workerId,
+
+  pool = null,
 }) {
   const rid =
     requireRestaurantId(
@@ -1293,7 +1298,8 @@ async function markInboxApplied({
       workerId
     );
 
-  return withTx(
+  return runSyncTx(
+    pool,
     async (tx) => {
       const row =
         await tx.qGet(
@@ -1358,6 +1364,8 @@ async function failInboxEvent({
   lastError,
 
   retryDelaySeconds = 0,
+
+  pool = null,
 }) {
   const rid =
     requireRestaurantId(
@@ -1390,7 +1398,8 @@ async function failInboxEvent({
       }
     );
 
-  return withTx(
+  return runSyncTx(
+    pool,
     async (tx) => {
       const row =
         await tx.qGet(
@@ -1452,6 +1461,334 @@ async function failInboxEvent({
     }
   );
 }
+
+
+async function deadLetterInboxEvent({
+  restaurantId,
+
+  eventId,
+
+  workerId,
+
+  lastError,
+
+  pool = null,
+}) {
+  const rid =
+    requireRestaurantId(
+      restaurantId
+    );
+
+  const eid =
+    requireUuid(
+      eventId,
+      "eventId"
+    );
+
+  const worker =
+    normalizeWorkerId(
+      workerId
+    );
+
+  const errorText =
+    normalizeErrorText(
+      lastError
+    ) ||
+    "MAKS Edge inbox event was dead-lettered";
+
+  return runSyncTx(
+    pool,
+    async (tx) => {
+      const row =
+        await tx.qGet(
+          `
+          UPDATE
+            public.edge_inbox
+          SET
+            status =
+              'dead_letter',
+
+            locked_at =
+              NULL,
+
+            locked_by =
+              NULL,
+
+            last_error =
+              $4,
+
+            updated_at =
+              NOW()
+          WHERE
+            restaurant_id = $1
+            AND
+            event_id = $2
+            AND
+            status =
+              'applying'
+            AND
+            locked_by = $3
+          RETURNING *
+          `,
+          [
+            rid,
+            eid,
+            worker,
+            errorText,
+          ]
+        );
+
+      if (!row) {
+        throw new EdgeSyncError(
+          "EDGE_INBOX_NOT_OWNED",
+          "Inbox event is not owned by this worker"
+        );
+      }
+
+      return row;
+    }
+  );
+}
+
+
+async function applyClaimedInboxEvent({
+  restaurantId,
+
+  eventId,
+
+  workerId,
+
+  execute,
+
+  pool = null,
+}) {
+  const rid =
+    requireRestaurantId(
+      restaurantId
+    );
+
+  const eid =
+    requireUuid(
+      eventId,
+      "eventId"
+    );
+
+  const worker =
+    normalizeWorkerId(
+      workerId
+    );
+
+  if (
+    typeof execute !==
+      "function"
+  ) {
+    throw new EdgeSyncError(
+      "EDGE_INBOX_EXECUTE_REQUIRED",
+      "Inbox application requires an execute function"
+    );
+  }
+
+  return runSyncTx(
+    pool,
+    async (tx) => {
+      const event =
+        await tx.qGet(
+          `
+          SELECT *
+          FROM
+            public.edge_inbox
+          WHERE
+            restaurant_id = $1
+            AND
+            event_id = $2
+            AND
+            status =
+              'applying'
+            AND
+            locked_by = $3
+          FOR UPDATE
+          `,
+          [
+            rid,
+            eid,
+            worker,
+          ]
+        );
+
+      if (!event) {
+        throw new EdgeSyncError(
+          "EDGE_INBOX_NOT_OWNED",
+          "Inbox event is not owned by this worker"
+        );
+      }
+
+      const identity = {
+        event_id:
+          String(
+            event.event_id
+          ),
+
+        restaurant_id:
+          rid,
+
+        source:
+          event.source,
+
+        source_installation_id:
+          event.source_installation_id ||
+          null,
+
+        event_type:
+          event.event_type,
+
+        entity_type:
+          event.entity_type ||
+          null,
+
+        entity_id:
+          event.entity_id ||
+          null,
+
+        payload_hash:
+          event.payload_hash,
+      };
+
+      const gate =
+        await beginIdempotentOperationTx(
+          tx,
+          {
+            restaurantId:
+              rid,
+
+            scope:
+              "edge.inbox.apply",
+
+            idempotencyKey:
+              eid,
+
+            requestPayload:
+              identity,
+          }
+        );
+
+      if (
+        gate.state ===
+          "failed" ||
+        gate.state ===
+          "in_progress"
+      ) {
+        throw new EdgeSyncError(
+          gate.state === "failed"
+            ? "EDGE_IDEMPOTENCY_FAILED"
+            : "EDGE_IDEMPOTENCY_IN_PROGRESS",
+          gate.state === "failed"
+            ? "This inbox event previously failed permanently"
+            : "This inbox event is already being applied"
+        );
+      }
+
+      let result =
+        gate.responseBody;
+
+      const replayed =
+        gate.state ===
+        "completed";
+
+      if (!replayed) {
+        result =
+          await execute({
+            tx,
+
+            restaurantId:
+              rid,
+
+            event,
+
+            payload:
+              event.payload,
+          });
+
+        await completeIdempotentOperationTx(
+          tx,
+          {
+            id:
+              gate.record.id,
+
+            responseStatus:
+              200,
+
+            responseBody:
+              result ??
+              null,
+          }
+        );
+      }
+
+      const applied =
+        await tx.qGet(
+          `
+          UPDATE
+            public.edge_inbox
+          SET
+            status =
+              'applied',
+
+            applied_at =
+              COALESCE(
+                applied_at,
+                NOW()
+              ),
+
+            locked_at =
+              NULL,
+
+            locked_by =
+              NULL,
+
+            last_error =
+              NULL,
+
+            updated_at =
+              NOW()
+          WHERE
+            restaurant_id = $1
+            AND
+            event_id = $2
+            AND
+            status =
+              'applying'
+            AND
+            locked_by = $3
+          RETURNING *
+          `,
+          [
+            rid,
+            eid,
+            worker,
+          ]
+        );
+
+      if (!applied) {
+        throw new EdgeSyncError(
+          "EDGE_INBOX_NOT_OWNED",
+          "Inbox event is not owned by this worker"
+        );
+      }
+
+      return {
+        replayed,
+
+        event:
+          applied,
+
+        result:
+          result ??
+          null,
+      };
+    }
+  );
+}
+
 
 /* =========================================================
    IDEMPOTENCY
@@ -3149,6 +3486,8 @@ module.exports = {
   claimInboxEvents,
   markInboxApplied,
   failInboxEvent,
+  deadLetterInboxEvent,
+  applyClaimedInboxEvent,
 
   beginIdempotentOperationTx,
   completeIdempotentOperationTx,
