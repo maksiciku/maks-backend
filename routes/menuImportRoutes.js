@@ -8,7 +8,51 @@ const Tesseract = require("tesseract.js");
 const { execFile } = require("child_process");
 
 const router = express.Router();
+
+const {
+  withTx,
+} = require("../dbCompat");
+
+const {
+  emitMenuCatalogSnapshotTx,
+} = require("../edge/contracts/menuCatalog");
+
+const {
+  MaksRuntimeRoleError,
+  assertCloudRuntime,
+} = require("../utils/runtimeRole");
+
 const { parsePdfMenuV2 } = require("../utils/menuImporterV2");
+
+function sendMenuImportAuthorityError(res, error) {
+  if (!(error instanceof MaksRuntimeRoleError)) {
+    return false;
+  }
+
+  if (error.code === "MAKS_RUNTIME_ROLE_NOT_CLOUD") {
+    res.status(409).json({
+      error: "MENU_CATALOG_CLOUD_AUTHORITY_REQUIRED",
+    });
+    return true;
+  }
+
+  res.status(503).json({
+    error: "MENU_CATALOG_RUNTIME_ROLE_UNAVAILABLE",
+  });
+  return true;
+}
+
+function requireCloudMenuImportAuthority(req, res, next) {
+  try {
+    assertCloudRuntime();
+    next();
+  } catch (error) {
+    if (sendMenuImportAuthorityError(res, error)) {
+      return;
+    }
+    next(error);
+  }
+}
 
 async function extractTextWithPdfLayout(pdfPath) {
   const outPath = `${pdfPath}.layout.txt`;
@@ -815,162 +859,413 @@ const iconForType = (type) => {
   return "🍽️";
 };
 
-router.post("/commit", async (req, res) => {
-  try {
-    const rid = Number(req.tenantRid || req.user?.restaurant_id || 0);
-    if (!rid) return res.status(400).json({ error: "Missing tenant" });
-
-    const categories = Array.isArray(req.body?.categories)
-      ? req.body.categories
-      : [];
-
-    if (!categories.length) {
-      return res.status(400).json({ error: "No categories to import" });
-    }
-
-    const imported = {
-      categories: 0,
-      meals: 0,
-      drinks: 0,
-      desserts: 0,
-      skipped: 0,
-    };
-
-    for (const cat of categories) {
-      const catName = cleanName(cat.name || "Menu");
-const catType =
-  cat.type === "drinks" ||
-  cat.type === "desserts" ||
-  cat.type === "meals"
-    ? cat.type
-    : guessType(catName);
-          const items = Array.isArray(cat.items) ? cat.items : [];
-
-      if (!catName || !items.length) {
-        imported.skipped += items.length || 1;
-        continue;
-      }
-
-      const categoryRow = await req.qGet(
-        `
-        INSERT INTO public.categories (restaurant_id, name, type, icon)
-        VALUES ($1, $2, $3, $4)
-        ON CONFLICT (restaurant_id, name)
-        DO UPDATE SET type = EXCLUDED.type, icon = EXCLUDED.icon
-        RETURNING id
-        `,
-        [rid, catName, catType, iconForType(catType)]
-      );
-
-      const categoryId = Number(categoryRow?.id || 0);
-      if (!categoryId) {
-        imported.skipped += items.length;
-        continue;
-      }
-
-      imported.categories += 1;
-
-      for (const item of items) {
-        const itemName = cleanName(item.name);
-        const price = Number(item.price || 0);
-
-       
-        if (!itemName || !(price >= 0)) {
-          imported.skipped += 1;
-          continue;
-        }
-
-        const existing =
-  catType === "meals"
-    ? await req.qGet(
-        `SELECT id FROM public.meals WHERE restaurant_id = $1 AND LOWER(TRIM(name)) = LOWER(TRIM($2)) LIMIT 1`,
-        [rid, itemName]
-      )
-    : await req.qGet(
-        `SELECT id FROM public.menu_items WHERE restaurant_id = $1 AND LOWER(TRIM(name)) = LOWER(TRIM($2)) AND LOWER(TRIM(type)) = $3 LIMIT 1`,
-        [rid, itemName, catType === "drinks" ? "drink" : "dessert"]
-      );
-
-if (existing?.id) {
-  imported.skipped += 1;
-  continue;
-}
-
-        if (catType === "drinks") {
-          await req.qRun(
-            `
-            INSERT INTO public.menu_items
-              (restaurant_id, name, price, type, category_id, options_schema, allergens, calories)
-            VALUES ($1, $2, $3, 'drink', $4, $5, 'Review required', 0)
-            `,
-            [rid, itemName, price, categoryId, JSON.stringify([])]
-          );
-
-          imported.drinks += 1;
-          continue;
-        }
-
-        if (catType === "desserts") {
-          await req.qRun(
-            `
-            INSERT INTO public.menu_items
-              (restaurant_id, name, price, type, category_id, options_schema, allergens, calories)
-            VALUES ($1, $2, $3, 'dessert', $4, $5, 'Review required', 0)
-            `,
-            [rid, itemName, price, categoryId, JSON.stringify([])]
-          );
-
-          imported.desserts += 1;
-          continue;
-        }
-
-        await req.qRun(
-          `
-          INSERT INTO public.meals
-            (
-              restaurant_id,
-              user_id,
-              name,
-              ingredients,
-              allergens,
-              calories,
-              price,
-              category,
-              category_id,
-              paused,
-              options_schema,
-              created_at
-            )
-          VALUES
-            ($1, $2, $3, $4, 'Review required', 0, $5, $6, $7, false, $8, NOW())
-          `,
-          [
-            rid,
-            req.user?.id || null,
-            itemName,
-            JSON.stringify([]),
-            price,
-            catName,
-            categoryId,
-JSON.stringify([]),
-]
+router.post(
+  "/commit",
+  requireCloudMenuImportAuthority,
+  async (req, res) => {
+    try {
+      const rid =
+        Number(
+          req.tenantRid ||
+          req.user?.restaurant_id ||
+          0
         );
 
-        imported.meals += 1;
+      if (!rid) {
+        return res
+          .status(400)
+          .json({
+            error:
+              "Missing tenant",
+          });
       }
-    }
 
-    return res.json({
-      success: true,
-      imported,
-    });
-  } catch (err) {
-    console.error("❌ /menu-import/commit failed:", err);
-    return res.status(500).json({
-      error: "Failed to import menu",
-      detail: err.message,
-    });
+      const categories =
+        Array.isArray(
+          req.body?.categories
+        )
+          ? req.body.categories
+          : [];
+
+      if (!categories.length) {
+        return res
+          .status(400)
+          .json({
+            error:
+              "No categories to import",
+          });
+      }
+
+      const imported =
+        await withTx(
+          async (tx) => {
+            const result = {
+              categories: 0,
+              meals: 0,
+              drinks: 0,
+              desserts: 0,
+              skipped: 0,
+            };
+
+            for (
+              const cat of
+              categories
+            ) {
+              const catName =
+                cleanName(
+                  cat.name ||
+                  "Menu"
+                );
+
+              const catType =
+                cat.type ===
+                  "drinks" ||
+                cat.type ===
+                  "desserts" ||
+                cat.type ===
+                  "meals"
+                  ? cat.type
+                  : guessType(
+                      catName
+                    );
+
+              const items =
+                Array.isArray(
+                  cat.items
+                )
+                  ? cat.items
+                  : [];
+
+              if (
+                !catName ||
+                !items.length
+              ) {
+                result.skipped +=
+                  items.length ||
+                  1;
+
+                continue;
+              }
+
+              const categoryRow =
+                await tx.qGet(
+                  `
+                  INSERT INTO
+                    public.categories
+                  (
+                    restaurant_id,
+                    name,
+                    type,
+                    icon
+                  )
+                  VALUES
+                  (
+                    $1,
+                    $2,
+                    $3,
+                    $4
+                  )
+                  ON CONFLICT
+                  (
+                    restaurant_id,
+                    name
+                  )
+                  DO UPDATE
+                  SET
+                    type =
+                      EXCLUDED.type,
+                    icon =
+                      EXCLUDED.icon
+                  RETURNING id
+                  `,
+                  [
+                    rid,
+                    catName,
+                    catType,
+                    iconForType(
+                      catType
+                    ),
+                  ]
+                );
+
+              const categoryId =
+                Number(
+                  categoryRow?.id ||
+                  0
+                );
+
+              if (!categoryId) {
+                result.skipped +=
+                  items.length;
+
+                continue;
+              }
+
+              result.categories +=
+                1;
+
+              for (
+                const item of
+                items
+              ) {
+                const itemName =
+                  cleanName(
+                    item.name
+                  );
+
+                const price =
+                  Number(
+                    item.price ||
+                    0
+                  );
+
+                if (
+                  !itemName ||
+                  !(price >= 0)
+                ) {
+                  result.skipped +=
+                    1;
+
+                  continue;
+                }
+
+                const existing =
+                  catType ===
+                    "meals"
+                    ? await tx.qGet(
+                        `
+                        SELECT id
+                        FROM public.meals
+                        WHERE restaurant_id = $1
+                          AND LOWER(TRIM(name)) =
+                            LOWER(TRIM($2))
+                        LIMIT 1
+                        `,
+                        [
+                          rid,
+                          itemName,
+                        ]
+                      )
+                    : await tx.qGet(
+                        `
+                        SELECT id
+                        FROM public.menu_items
+                        WHERE restaurant_id = $1
+                          AND LOWER(TRIM(name)) =
+                            LOWER(TRIM($2))
+                          AND LOWER(TRIM(type)) = $3
+                        LIMIT 1
+                        `,
+                        [
+                          rid,
+                          itemName,
+                          catType ===
+                            "drinks"
+                            ? "drink"
+                            : "dessert",
+                        ]
+                      );
+
+                if (
+                  existing?.id
+                ) {
+                  result.skipped +=
+                    1;
+
+                  continue;
+                }
+
+                if (
+                  catType ===
+                  "drinks"
+                ) {
+                  await tx.qRun(
+                    `
+                    INSERT INTO
+                      public.menu_items
+                    (
+                      restaurant_id,
+                      name,
+                      price,
+                      type,
+                      category_id,
+                      options_schema,
+                      allergens,
+                      calories
+                    )
+                    VALUES
+                    (
+                      $1,
+                      $2,
+                      $3,
+                      'drink',
+                      $4,
+                      $5::jsonb,
+                      'Review required',
+                      0
+                    )
+                    `,
+                    [
+                      rid,
+                      itemName,
+                      price,
+                      categoryId,
+                      JSON.stringify(
+                        []
+                      ),
+                    ]
+                  );
+
+                  result.drinks +=
+                    1;
+
+                  continue;
+                }
+
+                if (
+                  catType ===
+                  "desserts"
+                ) {
+                  await tx.qRun(
+                    `
+                    INSERT INTO
+                      public.menu_items
+                    (
+                      restaurant_id,
+                      name,
+                      price,
+                      type,
+                      category_id,
+                      options_schema,
+                      allergens,
+                      calories
+                    )
+                    VALUES
+                    (
+                      $1,
+                      $2,
+                      $3,
+                      'dessert',
+                      $4,
+                      $5::jsonb,
+                      'Review required',
+                      0
+                    )
+                    `,
+                    [
+                      rid,
+                      itemName,
+                      price,
+                      categoryId,
+                      JSON.stringify(
+                        []
+                      ),
+                    ]
+                  );
+
+                  result.desserts +=
+                    1;
+
+                  continue;
+                }
+
+                await tx.qRun(
+                  `
+                  INSERT INTO
+                    public.meals
+                  (
+                    restaurant_id,
+                    user_id,
+                    name,
+                    ingredients,
+                    allergens,
+                    calories,
+                    price,
+                    category,
+                    category_id,
+                    paused,
+                    options_schema,
+                    created_at
+                  )
+                  VALUES
+                  (
+                    $1,
+                    $2,
+                    $3,
+                    $4,
+                    'Review required',
+                    0,
+                    $5,
+                    $6,
+                    $7,
+                    false,
+                    $8::jsonb,
+                    NOW()
+                  )
+                  `,
+                  [
+                    rid,
+                    req.user?.id ||
+                    null,
+                    itemName,
+                    JSON.stringify(
+                      []
+                    ),
+                    price,
+                    catName,
+                    categoryId,
+                    JSON.stringify(
+                      []
+                    ),
+                  ]
+                );
+
+                result.meals +=
+                  1;
+              }
+            }
+
+            await emitMenuCatalogSnapshotTx(
+              tx,
+              {
+                restaurantId:
+                  rid,
+              }
+            );
+
+            return result;
+          }
+        );
+
+      return res.json({
+        success: true,
+        imported,
+      });
+    } catch (error) {
+      console.error(
+        "❌ /menu-import/commit failed:",
+        error
+      );
+
+      if (
+        sendMenuImportAuthorityError(
+          res,
+          error
+        )
+      ) {
+        return;
+      }
+
+      return res
+        .status(500)
+        .json({
+          error:
+            "Failed to import menu",
+          detail:
+            error.message,
+        });
+    }
   }
-});
+);
 
 module.exports = router;
