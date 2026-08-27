@@ -22,6 +22,15 @@ const {
 } = require("../edge/syncStore");
 
 const {
+  emitMenuCatalogSnapshotTx,
+} = require("../edge/contracts/menuCatalog");
+
+const {
+  MaksRuntimeRoleError,
+  assertCloudRuntime,
+} = require("../utils/runtimeRole");
+
+const {
   ItemAvailabilityError,
   reserveItemsAvailability,
   consumeAvailabilityReservationsForBatch,
@@ -57,6 +66,36 @@ const POS_MANAGER = [
   "owner",
   "admin",
 ];
+
+function sendPosMenuCatalogAuthorityError(res, error) {
+  if (!(error instanceof MaksRuntimeRoleError)) {
+    return false;
+  }
+
+  if (error.code === "MAKS_RUNTIME_ROLE_NOT_CLOUD") {
+    res.status(409).json({
+      error: "MENU_CATALOG_CLOUD_AUTHORITY_REQUIRED",
+    });
+    return true;
+  }
+
+  res.status(503).json({
+    error: "MENU_CATALOG_RUNTIME_ROLE_UNAVAILABLE",
+  });
+  return true;
+}
+
+function requireCloudPosMenuCatalogAuthority(req, res, next) {
+  try {
+    assertCloudRuntime();
+    next();
+  } catch (error) {
+    if (sendPosMenuCatalogAuthorityError(res, error)) {
+      return;
+    }
+    next(error);
+  }
+}
 router.use(authenticateToken, loadMembership);
 // ----------------------------
 // Allowed EU allergen codes
@@ -12950,79 +12989,173 @@ router.post(
   }
 );
 
-router.patch("/availability", requireRole(...POS_STAFF), async (req, res) => {
-  try {
-    const restaurantId = Number(req.tenantRid || req.user?.restaurant_id || 0);
-
-    const itemId = Number(req.body?.item_id || 0);
-    const itemType = String(req.body?.item_type || "").trim().toLowerCase();
-    const outOfStock = !!req.body?.out_of_stock;
-
-    if (!restaurantId) {
-      return res.status(400).json({ error: "Missing restaurant context" });
-    }
-
-    if (!itemId) {
-      return res.status(400).json({ error: "item_id is required" });
-    }
-
-    if (!["meals", "drinks", "desserts"].includes(itemType)) {
-      return res.status(400).json({
-        error: "item_type must be 'meals', 'drinks', or 'desserts'",
-      });
-    }
-
-    if (itemType === "meals") {
-      const updated = await qGet(
-        `
-        UPDATE public.meals
-        SET out_of_stock = $1
-        WHERE restaurant_id = $2
-          AND id = $3
-        RETURNING id, name, out_of_stock
-        `,
-        [outOfStock, restaurantId, itemId]
+router.patch(
+  "/availability",
+  requireRole(...POS_STAFF),
+  requireCloudPosMenuCatalogAuthority,
+  async (req, res) => {
+    try {
+      const restaurantId = Number(
+        req.tenantRid || req.user?.restaurant_id || 0
       );
+      const itemId = Number(req.body?.item_id || 0);
+      const itemType = String(req.body?.item_type || "")
+        .trim()
+        .toLowerCase();
+      const outOfStock = !!req.body?.out_of_stock;
 
-      if (!updated?.id) {
-        return res.status(404).json({ error: "Meal not found" });
+      if (!restaurantId) {
+        return res.status(400).json({
+          error: "Missing restaurant context",
+        });
+      }
+
+      if (!itemId) {
+        return res.status(400).json({
+          error: "item_id is required",
+        });
+      }
+
+      if (!["meals", "drinks", "desserts"].includes(itemType)) {
+        return res.status(400).json({
+          error: "item_type must be 'meals', 'drinks', or 'desserts'",
+        });
+      }
+
+      const result = await withTx(async (tx) => {
+        if (itemType === "meals") {
+          const current = await tx.qGet(
+            `
+            SELECT id, name, out_of_stock
+            FROM public.meals
+            WHERE restaurant_id = $1
+              AND id = $2
+            FOR UPDATE
+            `,
+            [restaurantId, itemId]
+          );
+
+          if (!current?.id) {
+            return {
+              notFound: true,
+              itemSource: "meals",
+            };
+          }
+
+          if (!!current.out_of_stock === outOfStock) {
+            return {
+              notFound: false,
+              changed: false,
+              itemSource: "meals",
+              item: current,
+            };
+          }
+
+          const updated = await tx.qGet(
+            `
+            UPDATE public.meals
+            SET out_of_stock = $1
+            WHERE restaurant_id = $2
+              AND id = $3
+            RETURNING id, name, out_of_stock
+            `,
+            [outOfStock, restaurantId, itemId]
+          );
+
+          await emitMenuCatalogSnapshotTx(tx, {
+            restaurantId,
+          });
+
+          return {
+            notFound: false,
+            changed: true,
+            itemSource: "meals",
+            item: updated,
+          };
+        }
+
+        const expectedType =
+          itemType === "drinks" ? "drink" : "dessert";
+
+        const current = await tx.qGet(
+          `
+          SELECT id, name, type, out_of_stock
+          FROM public.menu_items
+          WHERE restaurant_id = $1
+            AND id = $2
+            AND LOWER(TRIM(COALESCE(type, ''))) = $3
+          FOR UPDATE
+          `,
+          [restaurantId, itemId, expectedType]
+        );
+
+        if (!current?.id) {
+          return {
+            notFound: true,
+            itemSource: "menu_items",
+          };
+        }
+
+        if (!!current.out_of_stock === outOfStock) {
+          return {
+            notFound: false,
+            changed: false,
+            itemSource: "menu_items",
+            item: current,
+          };
+        }
+
+        const updated = await tx.qGet(
+          `
+          UPDATE public.menu_items
+          SET out_of_stock = $1
+          WHERE restaurant_id = $2
+            AND id = $3
+            AND LOWER(TRIM(COALESCE(type, ''))) = $4
+          RETURNING id, name, type, out_of_stock
+          `,
+          [outOfStock, restaurantId, itemId, expectedType]
+        );
+
+        await emitMenuCatalogSnapshotTx(tx, {
+          restaurantId,
+        });
+
+        return {
+          notFound: false,
+          changed: true,
+          itemSource: "menu_items",
+          item: updated,
+        };
+      });
+
+      if (result?.notFound) {
+        return res.status(404).json({
+          error:
+            result.itemSource === "meals"
+              ? "Meal not found"
+              : "Menu item not found",
+        });
       }
 
       return res.json({
         success: true,
-        item_source: "meals",
-        item: updated,
+        item_source: result.itemSource,
+        item: result.item,
+      });
+    } catch (err) {
+      console.error("❌ PATCH /availability failed:", err);
+
+      if (sendPosMenuCatalogAuthorityError(res, err)) {
+        return;
+      }
+
+      return res.status(500).json({
+        error: "Failed to update item availability",
       });
     }
-
-    const expectedType = itemType === "drinks" ? "drink" : "dessert";
-
-    const updated = await qGet(
-      `
-      UPDATE public.menu_items
-      SET out_of_stock = $1
-      WHERE restaurant_id = $2
-        AND id = $3
-        AND LOWER(TRIM(COALESCE(type, ''))) = $4
-      RETURNING id, name, type, out_of_stock
-      `,
-      [outOfStock, restaurantId, itemId, expectedType]
-    );
-
-    if (!updated?.id) {
-      return res.status(404).json({ error: "Menu item not found" });
-    }
-
-    return res.json({
-      success: true,
-      item_source: "menu_items",
-      item: updated,
-    });
-  } catch (err) {
-    console.error("❌ PATCH /availability failed:", err);
-    return res.status(500).json({ error: "Failed to update item availability" });
   }
-});
+);
 
 router.post(
   "/cleanup-pending-qr-kiosk",

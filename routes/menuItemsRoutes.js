@@ -51,111 +51,115 @@ SELECT id, restaurant_id, name, type, price, category_id, paused, out_of_stock, 
   }
 });
 
-router.get("/:id/options", async (req, res) => {
-  try {
-    const itemId = Number(req.params.id || 0);
-
-    if (!itemId) {
-      return res.status(400).json({
-        error: "Invalid menu item id",
-      });
-    }
-
-    const source = String(
-      req.query.source || "menu_items"
-    ).toLowerCase();
-
-    let sql = "";
-    let table = "menu_items";
-
-    // ✅ meals come from meals table
-    if (source === "meals") {
-      table = "meals";
-    }
-
-    sql =
-      req.kind === "pg"
-        ? `
-          SELECT
-            id,
-            restaurant_id,
-            name,
-            paused,
-            out_of_stock,
-            options_schema
-          FROM public.${table}
-          WHERE id = $1
-          LIMIT 1
-        `
-        : `
-          SELECT
-            id,
-            restaurant_id,
-            name,
-            paused,
-            out_of_stock,
-            options_schema
-          FROM ${table}
-          WHERE id = ?
-          LIMIT 1
-        `;
-
-    const item = await req.qGet(sql, [itemId]);
-
-    if (!item) {
-      return res.status(404).json({
-        error: "Menu item not found",
-      });
-    }
-
-    if (
-      item.paused === true ||
-      Number(item.paused) === 1
-    ) {
-      return res.status(404).json({
-        error: "Item unavailable",
-      });
-    }
-
-    if (
-      item.out_of_stock === true ||
-      Number(item.out_of_stock) === 1
-    ) {
-      return res.status(404).json({
-        error: "Item unavailable",
-      });
-    }
-
-    let schema = {};
-
+router.get(
+  "/:id/options",
+  authenticateToken,
+  loadMembership,
+  async (req, res) => {
     try {
-      schema =
-        typeof item.options_schema === "string"
-          ? JSON.parse(item.options_schema || "{}")
-          : item.options_schema || {};
-    } catch {
-      schema = {};
+      const rid = ridOf(req);
+      const itemId = Number(req.params.id || 0);
+
+      if (!rid) {
+        return res.status(400).json({
+          error: "Missing restaurant context",
+        });
+      }
+
+      if (!itemId) {
+        return res.status(400).json({
+          error: "Invalid menu item id",
+        });
+      }
+
+      const source = String(
+        req.query.source || "menu_items"
+      )
+        .trim()
+        .toLowerCase();
+
+      const table =
+        source === "meals" ? "meals" : "menu_items";
+
+      const sql =
+        req.kind === "pg"
+          ? `
+            SELECT
+              id,
+              restaurant_id,
+              name,
+              paused,
+              out_of_stock,
+              options_schema
+            FROM public.${table}
+            WHERE restaurant_id = $1
+              AND id = $2
+            LIMIT 1
+          `
+          : `
+            SELECT
+              id,
+              restaurant_id,
+              name,
+              paused,
+              out_of_stock,
+              options_schema
+            FROM ${table}
+            WHERE restaurant_id = ?
+              AND id = ?
+            LIMIT 1
+          `;
+
+      const item = await req.qGet(sql, [rid, itemId]);
+
+      if (!item) {
+        return res.status(404).json({
+          error: "Menu item not found",
+        });
+      }
+
+      if (
+        item.paused === true ||
+        Number(item.paused) === 1 ||
+        item.out_of_stock === true ||
+        Number(item.out_of_stock) === 1
+      ) {
+        return res.status(404).json({
+          error: "Item unavailable",
+        });
+      }
+
+      let schema = {};
+
+      try {
+        schema =
+          typeof item.options_schema === "string"
+            ? JSON.parse(item.options_schema || "{}")
+            : item.options_schema || {};
+      } catch {
+        schema = {};
+      }
+
+      return res.json({
+        success: true,
+        modifiers: Array.isArray(schema.modifiers)
+          ? schema.modifiers
+          : [],
+        extras: Array.isArray(schema.extras)
+          ? schema.extras
+          : [],
+      });
+    } catch (err) {
+      console.error(
+        "❌ GET /menu-items/:id/options failed:",
+        err
+      );
+
+      return res.status(500).json({
+        error: "Failed to load item options",
+      });
     }
-
-    return res.json({
-      success: true,
-      modifiers: Array.isArray(schema.modifiers)
-        ? schema.modifiers
-        : [],
-      extras: Array.isArray(schema.extras)
-        ? schema.extras
-        : [],
-    });
-  } catch (err) {
-    console.error(
-      "❌ GET /menu-items/:id/options failed:",
-      err
-    );
-
-    return res.status(500).json({
-      error: "Failed to load item options",
-    });
   }
-});
+);
 
 module.exports = router;
