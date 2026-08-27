@@ -2224,6 +2224,33 @@ async function replaceLocalMenuCatalogTx(
   }
 
   /*
+   * Detach the previous local menu-group hierarchy before
+   * pruning obsolete groups.
+   *
+   * menu_groups.parent_id uses ON DELETE CASCADE. Without
+   * this step, deleting an obsolete parent can cascade-delete
+   * a retained child plus its category links and schedules
+   * before the authoritative hierarchy is rebuilt below.
+   *
+   * This runs inside the catalogue application transaction,
+   * so any later failure restores the previous hierarchy.
+   */
+  await tx.qRun(
+    `
+    UPDATE
+      public.menu_groups
+    SET
+      parent_id = NULL
+    WHERE
+      restaurant_id = $1
+      AND parent_id IS NOT NULL
+    `,
+    [
+      rid,
+    ]
+  );
+
+  /*
    * Prune only obsolete rows.
    * Existing item IDs are preserved so recipe rows linked
    * to unchanged meals/menu_items are not destroyed.
