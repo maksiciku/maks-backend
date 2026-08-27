@@ -1,6 +1,119 @@
 const router = require("express").Router();
 
+const {
+  withTx,
+} = require("../dbCompat");
+
+const {
+  emitMenuCatalogSnapshotTx,
+} = require("../edge/contracts/menuCatalog");
+
+const {
+  MaksRuntimeRoleError,
+  assertCloudRuntime,
+} = require("../utils/runtimeRole");
+
 const ridOf = (req) => Number(req.tenantRid || 0);
+
+function sendMenuCatalogAuthorityError(res, error) {
+  if (!(error instanceof MaksRuntimeRoleError)) {
+    return false;
+  }
+
+  if (error.code === "MAKS_RUNTIME_ROLE_NOT_CLOUD") {
+    res.status(409).json({
+      error: "MENU_CATALOG_CLOUD_AUTHORITY_REQUIRED",
+    });
+    return true;
+  }
+
+  res.status(503).json({
+    error: "MENU_CATALOG_RUNTIME_ROLE_UNAVAILABLE",
+  });
+  return true;
+}
+
+function requireCloudMenuCatalogAuthority(req, res, next) {
+  try {
+    assertCloudRuntime();
+    next();
+  } catch (error) {
+    if (sendMenuCatalogAuthorityError(res, error)) {
+      return;
+    }
+    next(error);
+  }
+}
+
+function sendMutationError(res, error, fallback) {
+  if (sendMenuCatalogAuthorityError(res, error)) {
+    return;
+  }
+
+  const status = Number(error?.status);
+
+  if (
+    Number.isInteger(status) &&
+    status >= 400 &&
+    status <= 599
+  ) {
+    res.status(status).json({
+      error: String(error.message || fallback),
+    });
+    return;
+  }
+
+  res.status(500).json({
+    error: fallback,
+  });
+}
+
+async function requireOwnedGroupTx(
+  tx,
+  rid,
+  groupId,
+  label = "Menu group"
+) {
+  const row = await tx.qGet(
+    `
+    SELECT id
+    FROM public.menu_groups
+    WHERE restaurant_id = $1
+      AND id = $2
+    LIMIT 1
+    `,
+    [rid, groupId]
+  );
+
+  if (!row) {
+    const error = new Error(`${label} not found`);
+    error.status = 404;
+    throw error;
+  }
+
+  return row;
+}
+
+async function requireOwnedCategoryTx(tx, rid, categoryId) {
+  const row = await tx.qGet(
+    `
+    SELECT id
+    FROM public.categories
+    WHERE restaurant_id = $1
+      AND id = $2
+    LIMIT 1
+    `,
+    [rid, categoryId]
+  );
+
+  if (!row) {
+    const error = new Error("Category not found");
+    error.status = 404;
+    throw error;
+  }
+
+  return row;
+}
 
 const normType = (t) => {
   const s = String(t || "").toLowerCase().trim();
@@ -258,95 +371,164 @@ router.get("/", async (req, res) => {
 });
 
 // POST /menu-groups
-router.post("/", async (req, res) => {
-  try {
-    const rid = ridOf(req);
-    if (!rid) return res.status(400).json({ error: "Missing rid" });
+router.post(
+  "/",
+  requireCloudMenuCatalogAuthority,
+  async (req, res) => {
+    try {
+      const rid = ridOf(req);
+      if (!rid) {
+        return res.status(400).json({ error: "Missing rid" });
+      }
 
-    const name = String(req.body?.name || "").trim();
-    if (!name) return res.status(400).json({ error: "Name required" });
+      const name = String(req.body?.name || "").trim();
+      if (!name) {
+        return res.status(400).json({ error: "Name required" });
+      }
 
-    const baseType = normType(req.body?.base_type);
-    const parentId = req.body?.parent_id ? Number(req.body.parent_id) : null;
+      const baseType = normType(req.body?.base_type);
+      const parentId = req.body?.parent_id
+        ? Number(req.body.parent_id)
+        : null;
 
-    const row = await req.qGet(
-      `
-      INSERT INTO public.menu_groups
-        (restaurant_id, name, base_type, parent_id, sort_order, show_pos, show_qr, show_kiosk)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      RETURNING *
-      `,
-      [
-        rid,
-        name,
-        baseType,
-        parentId,
-        Number(req.body?.sort_order || 0),
-        req.body?.show_pos !== false,
-        req.body?.show_qr !== false,
-        req.body?.show_kiosk !== false,
-      ]
-    );
+      const row = await withTx(async (tx) => {
+        if (parentId) {
+          await requireOwnedGroupTx(
+            tx,
+            rid,
+            parentId,
+            "Parent menu group"
+          );
+        }
 
-    res.json(row);
-  } catch (e) {
-    console.error("menu-groups POST error", e);
-    res.status(500).json({ error: "Failed to create menu group" });
+        const created = await tx.qGet(
+          `
+          INSERT INTO public.menu_groups
+            (
+              restaurant_id,
+              name,
+              base_type,
+              parent_id,
+              sort_order,
+              show_pos,
+              show_qr,
+              show_kiosk
+            )
+          VALUES
+            ($1, $2, $3, $4, $5, $6, $7, $8)
+          RETURNING *
+          `,
+          [
+            rid,
+            name,
+            baseType,
+            parentId,
+            Number(req.body?.sort_order || 0),
+            req.body?.show_pos !== false,
+            req.body?.show_qr !== false,
+            req.body?.show_kiosk !== false,
+          ]
+        );
+
+        await emitMenuCatalogSnapshotTx(tx, {
+          restaurantId: rid,
+        });
+
+        return created;
+      });
+
+      res.json(row);
+    } catch (error) {
+      console.error("menu-groups POST error", error);
+      sendMutationError(
+        res,
+        error,
+        "Failed to create menu group"
+      );
+    }
   }
-});
+);
 
 // PUT /menu-groups/:id
-router.put("/:id", async (req, res) => {
-  try {
-    const rid = ridOf(req);
-    if (!rid) return res.status(400).json({ error: "Missing rid" });
+router.put(
+  "/:id",
+  requireCloudMenuCatalogAuthority,
+  async (req, res) => {
+    try {
+      const rid = ridOf(req);
+      if (!rid) {
+        return res.status(400).json({ error: "Missing rid" });
+      }
 
-    const groupId = Number(req.params.id);
-    if (!groupId) return res.status(400).json({ error: "Missing group id" });
+      const groupId = Number(req.params.id);
+      if (!groupId) {
+        return res.status(400).json({ error: "Missing group id" });
+      }
 
-    const activeDays = Array.isArray(req.body?.active_days)
-      ? req.body.active_days
-      : [];
+      const activeDays = Array.isArray(req.body?.active_days)
+        ? req.body.active_days
+        : [];
 
-    const row = await req.qGet(
-      `
-      UPDATE public.menu_groups
-      SET
-        name = COALESCE(NULLIF(?, ''), name),
-        show_pos = ?,
-        show_qr = ?,
-        show_kiosk = ?,
-        active_days = CAST(? AS jsonb),
-        start_time = NULLIF(?, '')::time,
-        end_time = NULLIF(?, '')::time,
-        is_active = ?,
-        updated_at = now()
-      WHERE restaurant_id = ?
-        AND id = ?
-      RETURNING *
-      `,
-      [
-        String(req.body?.name || "").trim(),
-        req.body?.show_pos !== false,
-        req.body?.show_qr !== false,
-        req.body?.show_kiosk !== false,
-        JSON.stringify(activeDays),
-        String(req.body?.start_time || ""),
-        String(req.body?.end_time || ""),
-        req.body?.is_active !== false,
-        rid,
-        groupId,
-      ]
-    );
+      const row = await withTx(async (tx) => {
+        const updated = await tx.qGet(
+          `
+          UPDATE public.menu_groups
+          SET
+            name = COALESCE(NULLIF($1, ''), name),
+            show_pos = $2,
+            show_qr = $3,
+            show_kiosk = $4,
+            active_days = $5::jsonb,
+            start_time = NULLIF($6, '')::time,
+            end_time = NULLIF($7, '')::time,
+            is_active = $8,
+            updated_at = now()
+          WHERE restaurant_id = $9
+            AND id = $10
+          RETURNING *
+          `,
+          [
+            String(req.body?.name || "").trim(),
+            req.body?.show_pos !== false,
+            req.body?.show_qr !== false,
+            req.body?.show_kiosk !== false,
+            JSON.stringify(activeDays),
+            String(req.body?.start_time || ""),
+            String(req.body?.end_time || ""),
+            req.body?.is_active !== false,
+            rid,
+            groupId,
+          ]
+        );
 
-    if (!row) return res.status(404).json({ error: "Menu group not found" });
+        if (!updated) {
+          return null;
+        }
 
-    res.json(row);
-  } catch (e) {
-    console.error("menu-groups PUT error", e);
-    res.status(500).json({ error: "Failed to update menu group" });
+        await emitMenuCatalogSnapshotTx(tx, {
+          restaurantId: rid,
+        });
+
+        return updated;
+      });
+
+      if (!row) {
+        return res.status(404).json({
+          error: "Menu group not found",
+        });
+      }
+
+      res.json(row);
+    } catch (error) {
+      console.error("menu-groups PUT error", error);
+      sendMutationError(
+        res,
+        error,
+        "Failed to update menu group"
+      );
+    }
   }
-});
+);
 
 // GET /menu-groups/:id/schedules
 router.get("/:id/schedules", async (req, res) => {
@@ -375,173 +557,318 @@ router.get("/:id/schedules", async (req, res) => {
 });
 
 // POST /menu-groups/:id/schedules
-router.post("/:id/schedules", async (req, res) => {
-  try {
-    const rid = ridOf(req);
-    const groupId = Number(req.params.id);
+router.post(
+  "/:id/schedules",
+  requireCloudMenuCatalogAuthority,
+  async (req, res) => {
+    try {
+      const rid = ridOf(req);
+      const groupId = Number(req.params.id);
 
-    if (!rid || !groupId) return res.status(400).json({ error: "Missing rid/group" });
+      if (!rid || !groupId) {
+        return res.status(400).json({
+          error: "Missing rid/group",
+        });
+      }
 
-    const activeDays = Array.isArray(req.body?.active_days)
-      ? req.body.active_days
-      : [];
+      const activeDays = Array.isArray(req.body?.active_days)
+        ? req.body.active_days
+        : [];
 
-    const row = await req.qGet(
-      `
-      INSERT INTO public.menu_group_schedules
-        (restaurant_id, menu_group_id, active_days, start_time, end_time, priority, is_active)
-      VALUES (?, ?, CAST(? AS jsonb), NULLIF(?, '')::time, NULLIF(?, '')::time, ?, ?)
-      RETURNING *
-      `,
-      [
-        rid,
-        groupId,
-        JSON.stringify(activeDays),
-        String(req.body?.start_time || ""),
-        String(req.body?.end_time || ""),
-        Number(req.body?.priority || 0),
-        req.body?.is_active !== false,
-      ]
-    );
+      const row = await withTx(async (tx) => {
+        await requireOwnedGroupTx(tx, rid, groupId);
 
-    res.json(row);
-  } catch (e) {
-    console.error("menu group schedule POST error", e);
-    res.status(500).json({ error: "Failed to create schedule" });
+        const created = await tx.qGet(
+          `
+          INSERT INTO public.menu_group_schedules
+            (
+              restaurant_id,
+              menu_group_id,
+              active_days,
+              start_time,
+              end_time,
+              priority,
+              is_active
+            )
+          VALUES
+            (
+              $1,
+              $2,
+              $3::jsonb,
+              NULLIF($4, '')::time,
+              NULLIF($5, '')::time,
+              $6,
+              $7
+            )
+          RETURNING *
+          `,
+          [
+            rid,
+            groupId,
+            JSON.stringify(activeDays),
+            String(req.body?.start_time || ""),
+            String(req.body?.end_time || ""),
+            Number(req.body?.priority || 0),
+            req.body?.is_active !== false,
+          ]
+        );
+
+        await emitMenuCatalogSnapshotTx(tx, {
+          restaurantId: rid,
+        });
+
+        return created;
+      });
+
+      res.json(row);
+    } catch (error) {
+      console.error("menu group schedule POST error", error);
+      sendMutationError(
+        res,
+        error,
+        "Failed to create schedule"
+      );
+    }
   }
-});
+);
 
 // PUT /menu-groups/:id/schedules/:scheduleId
-router.put("/:id/schedules/:scheduleId", async (req, res) => {
-  try {
-    const rid = ridOf(req);
-    const groupId = Number(req.params.id);
-    const scheduleId = Number(req.params.scheduleId);
+router.put(
+  "/:id/schedules/:scheduleId",
+  requireCloudMenuCatalogAuthority,
+  async (req, res) => {
+    try {
+      const rid = ridOf(req);
+      const groupId = Number(req.params.id);
+      const scheduleId = Number(req.params.scheduleId);
 
-    if (!rid || !groupId || !scheduleId) {
-      return res.status(400).json({ error: "Missing schedule" });
+      if (!rid || !groupId || !scheduleId) {
+        return res.status(400).json({
+          error: "Missing schedule",
+        });
+      }
+
+      const activeDays = Array.isArray(req.body?.active_days)
+        ? req.body.active_days
+        : [];
+
+      const row = await withTx(async (tx) => {
+        const updated = await tx.qGet(
+          `
+          UPDATE public.menu_group_schedules
+          SET
+            active_days = $1::jsonb,
+            start_time = NULLIF($2, '')::time,
+            end_time = NULLIF($3, '')::time,
+            priority = $4,
+            is_active = $5,
+            updated_at = now()
+          WHERE restaurant_id = $6
+            AND menu_group_id = $7
+            AND id = $8
+          RETURNING *
+          `,
+          [
+            JSON.stringify(activeDays),
+            String(req.body?.start_time || ""),
+            String(req.body?.end_time || ""),
+            Number(req.body?.priority || 0),
+            req.body?.is_active !== false,
+            rid,
+            groupId,
+            scheduleId,
+          ]
+        );
+
+        if (!updated) {
+          return null;
+        }
+
+        await emitMenuCatalogSnapshotTx(tx, {
+          restaurantId: rid,
+        });
+
+        return updated;
+      });
+
+      if (!row) {
+        return res.status(404).json({
+          error: "Schedule not found",
+        });
+      }
+
+      res.json(row);
+    } catch (error) {
+      console.error("menu group schedule PUT error", error);
+      sendMutationError(
+        res,
+        error,
+        "Failed to update schedule"
+      );
     }
-
-    const activeDays = Array.isArray(req.body?.active_days)
-      ? req.body.active_days
-      : [];
-
-    const row = await req.qGet(
-      `
-      UPDATE public.menu_group_schedules
-      SET
-        active_days = CAST(? AS jsonb),
-        start_time = NULLIF(?, '')::time,
-        end_time = NULLIF(?, '')::time,
-        priority = ?,
-        is_active = ?,
-        updated_at = now()
-      WHERE restaurant_id = ?
-        AND menu_group_id = ?
-        AND id = ?
-      RETURNING *
-      `,
-      [
-        JSON.stringify(activeDays),
-        String(req.body?.start_time || ""),
-        String(req.body?.end_time || ""),
-        Number(req.body?.priority || 0),
-        req.body?.is_active !== false,
-        rid,
-        groupId,
-        scheduleId,
-      ]
-    );
-
-    if (!row) return res.status(404).json({ error: "Schedule not found" });
-
-    res.json(row);
-  } catch (e) {
-    console.error("menu group schedule PUT error", e);
-    res.status(500).json({ error: "Failed to update schedule" });
   }
-});
+);
 
 // DELETE /menu-groups/:id/schedules/:scheduleId
-router.delete("/:id/schedules/:scheduleId", async (req, res) => {
-  try {
-    const rid = ridOf(req);
-    const groupId = Number(req.params.id);
-    const scheduleId = Number(req.params.scheduleId);
+router.delete(
+  "/:id/schedules/:scheduleId",
+  requireCloudMenuCatalogAuthority,
+  async (req, res) => {
+    try {
+      const rid = ridOf(req);
+      const groupId = Number(req.params.id);
+      const scheduleId = Number(req.params.scheduleId);
 
-    await req.qRun(
-      `
-      DELETE FROM public.menu_group_schedules
-      WHERE restaurant_id = ?
-        AND menu_group_id = ?
-        AND id = ?
-      `,
-      [rid, groupId, scheduleId]
-    );
+      if (!rid || !groupId || !scheduleId) {
+        return res.status(400).json({
+          error: "Missing schedule",
+        });
+      }
 
-    res.json({ success: true });
-  } catch (e) {
-    console.error("menu group schedule DELETE error", e);
-    res.status(500).json({ error: "Failed to delete schedule" });
+      await withTx(async (tx) => {
+        const deleted = await tx.qGet(
+          `
+          DELETE FROM public.menu_group_schedules
+          WHERE restaurant_id = $1
+            AND menu_group_id = $2
+            AND id = $3
+          RETURNING id
+          `,
+          [rid, groupId, scheduleId]
+        );
+
+        if (deleted) {
+          await emitMenuCatalogSnapshotTx(tx, {
+            restaurantId: rid,
+          });
+        }
+      });
+
+      res.json({ success: true });
+    } catch (error) {
+      console.error("menu group schedule DELETE error", error);
+      sendMutationError(
+        res,
+        error,
+        "Failed to delete schedule"
+      );
+    }
   }
-});
+);
 
 // DELETE /menu-groups/:id
-router.delete("/:id", async (req, res) => {
-  try {
-    const rid = ridOf(req);
-    if (!rid) return res.status(400).json({ error: "Missing rid" });
+router.delete(
+  "/:id",
+  requireCloudMenuCatalogAuthority,
+  async (req, res) => {
+    try {
+      const rid = ridOf(req);
+      if (!rid) {
+        return res.status(400).json({ error: "Missing rid" });
+      }
 
-    const groupId = Number(req.params.id);
-    if (!groupId) return res.status(400).json({ error: "Missing group id" });
+      const groupId = Number(req.params.id);
+      if (!groupId) {
+        return res.status(400).json({ error: "Missing group id" });
+      }
 
-    await req.qRun(
-      `
-      DELETE FROM public.menu_groups
-      WHERE restaurant_id = ?
-        AND id = ?
-      `,
-      [rid, groupId]
-    );
+      await withTx(async (tx) => {
+        const deleted = await tx.qGet(
+          `
+          DELETE FROM public.menu_groups
+          WHERE restaurant_id = $1
+            AND id = $2
+          RETURNING id
+          `,
+          [rid, groupId]
+        );
 
-    res.json({ success: true });
-  } catch (e) {
-    console.error("menu-groups DELETE error", e);
-    res.status(500).json({ error: "Failed to delete menu group" });
+        if (deleted) {
+          await emitMenuCatalogSnapshotTx(tx, {
+            restaurantId: rid,
+          });
+        }
+      });
+
+      res.json({ success: true });
+    } catch (error) {
+      console.error("menu-groups DELETE error", error);
+      sendMutationError(
+        res,
+        error,
+        "Failed to delete menu group"
+      );
+    }
   }
-});
+);
 
 // POST /menu-groups/:id/categories
-router.post("/:id/categories", async (req, res) => {
-  try {
-    const rid = ridOf(req);
-    if (!rid) return res.status(400).json({ error: "Missing rid" });
+router.post(
+  "/:id/categories",
+  requireCloudMenuCatalogAuthority,
+  async (req, res) => {
+    try {
+      const rid = ridOf(req);
+      if (!rid) {
+        return res.status(400).json({ error: "Missing rid" });
+      }
 
-    const groupId = Number(req.params.id);
-    const categoryId = Number(req.body?.category_id);
+      const groupId = Number(req.params.id);
+      const categoryId = Number(req.body?.category_id);
 
-    if (!groupId || !categoryId) {
-      return res.status(400).json({ error: "Missing group/category" });
+      if (!groupId || !categoryId) {
+        return res.status(400).json({
+          error: "Missing group/category",
+        });
+      }
+
+      const row = await withTx(async (tx) => {
+        await requireOwnedGroupTx(tx, rid, groupId);
+        await requireOwnedCategoryTx(tx, rid, categoryId);
+
+        const linked = await tx.qGet(
+          `
+          INSERT INTO public.menu_group_categories
+            (
+              restaurant_id,
+              menu_group_id,
+              category_id,
+              sort_order
+            )
+          VALUES
+            ($1, $2, $3, $4)
+          ON CONFLICT
+            (restaurant_id, menu_group_id, category_id)
+          DO UPDATE
+          SET sort_order = excluded.sort_order
+          RETURNING *
+          `,
+          [
+            rid,
+            groupId,
+            categoryId,
+            Number(req.body?.sort_order || 0),
+          ]
+        );
+
+        await emitMenuCatalogSnapshotTx(tx, {
+          restaurantId: rid,
+        });
+
+        return linked;
+      });
+
+      res.json(row);
+    } catch (error) {
+      console.error("menu group assign category error", error);
+      sendMutationError(
+        res,
+        error,
+        "Failed to assign category"
+      );
     }
-
-    const row = await req.qGet(
-      `
-      INSERT INTO public.menu_group_categories
-        (restaurant_id, menu_group_id, category_id, sort_order)
-      VALUES (?, ?, ?, ?)
-      ON CONFLICT (restaurant_id, menu_group_id, category_id)
-      DO UPDATE SET sort_order = excluded.sort_order
-      RETURNING *
-      `,
-      [rid, groupId, categoryId, Number(req.body?.sort_order || 0)]
-    );
-
-    res.json(row);
-  } catch (e) {
-    console.error("menu group assign category error", e);
-    res.status(500).json({ error: "Failed to assign category" });
   }
-});
+);
 
 // GET /menu-groups/:id/categories
 router.get("/:id/categories", async (req, res) => {
@@ -573,33 +900,54 @@ router.get("/:id/categories", async (req, res) => {
 });
 
 // DELETE /menu-groups/:id/categories/:categoryId
-router.delete("/:id/categories/:categoryId", async (req, res) => {
-  try {
-    const rid = ridOf(req);
-    if (!rid) return res.status(400).json({ error: "Missing rid" });
+router.delete(
+  "/:id/categories/:categoryId",
+  requireCloudMenuCatalogAuthority,
+  async (req, res) => {
+    try {
+      const rid = ridOf(req);
+      if (!rid) {
+        return res.status(400).json({ error: "Missing rid" });
+      }
 
-    const groupId = Number(req.params.id);
-    const categoryId = Number(req.params.categoryId);
+      const groupId = Number(req.params.id);
+      const categoryId = Number(req.params.categoryId);
 
-    if (!groupId || !categoryId) {
-      return res.status(400).json({ error: "Missing group/category" });
+      if (!groupId || !categoryId) {
+        return res.status(400).json({
+          error: "Missing group/category",
+        });
+      }
+
+      await withTx(async (tx) => {
+        const deleted = await tx.qGet(
+          `
+          DELETE FROM public.menu_group_categories
+          WHERE restaurant_id = $1
+            AND menu_group_id = $2
+            AND category_id = $3
+          RETURNING id
+          `,
+          [rid, groupId, categoryId]
+        );
+
+        if (deleted) {
+          await emitMenuCatalogSnapshotTx(tx, {
+            restaurantId: rid,
+          });
+        }
+      });
+
+      res.json({ success: true });
+    } catch (error) {
+      console.error("menu group remove category error", error);
+      sendMutationError(
+        res,
+        error,
+        "Failed to remove category"
+      );
     }
-
-    await req.qRun(
-      `
-      DELETE FROM public.menu_group_categories
-      WHERE restaurant_id = ?
-        AND menu_group_id = ?
-        AND category_id = ?
-      `,
-      [rid, groupId, categoryId]
-    );
-
-    res.json({ success: true });
-  } catch (e) {
-    console.error("menu group remove category error", e);
-    res.status(500).json({ error: "Failed to remove category" });
   }
-});
+);
 
 module.exports = router;
