@@ -12,6 +12,12 @@ const {
   "./pushTransport"
 );
 
+const {
+  pullFromCloudOnce,
+} = require(
+  "./pullTransport"
+);
+
 
 function intervalFromEnv(
   name,
@@ -47,7 +53,7 @@ function intervalFromEnv(
 
 const VERSION =
   process.env.MAKS_EDGE_VERSION ||
-  "edge-agent-0.2.0";
+  "edge-agent-0.3.0";
 
 
 const CLOUD_URL =
@@ -101,7 +107,18 @@ const SYNC_MS =
   );
 
 
+const PULL_MS =
+  intervalFromEnv(
+    "MAKS_EDGE_PULL_MS",
+    5000,
+    1000
+  );
+
+
 const SYNC_BATCH_LIMIT =
+  25;
+
+const PULL_BATCH_LIMIT =
   25;
 
 const SYNC_LEASE_SECONDS =
@@ -170,10 +187,16 @@ let heartbeatSending =
 let syncSending =
   false;
 
+let pullSending =
+  false;
+
 let heartbeatTimer =
   null;
 
 let syncTimer =
+  null;
+
+let pullTimer =
   null;
 
 let previousCloudLatencyMs =
@@ -820,6 +843,169 @@ async function sendSyncCycle() {
 }
 
 
+async function sendPullCycle() {
+  if (
+    shuttingDown ||
+    pullSending ||
+    !authenticatedRestaurantId
+  ) {
+    return;
+  }
+
+  pullSending =
+    true;
+
+  try {
+    const result =
+      await pullFromCloudOnce({
+        pool,
+
+        cloudUrl:
+          CLOUD_URL,
+
+        installationId:
+          INSTALLATION_ID,
+
+        edgeSecret:
+          EDGE_SECRET,
+
+        restaurantId:
+          authenticatedRestaurantId,
+
+        limit:
+          PULL_BATCH_LIMIT,
+
+        timeoutMs:
+          10000,
+      });
+
+    if (
+      result?.success ===
+      true
+    ) {
+      const activity =
+        Number(
+          result.received ||
+          0
+        ) +
+        Number(
+          result.duplicates ||
+          0
+        ) +
+        Number(
+          result.acked ||
+          0
+        ) +
+        Number(
+          result.rejected ||
+          0
+        );
+
+      /*
+       * Successful empty polls are expected and should not
+       * flood restaurant logs every few seconds.
+       */
+      if (
+        activity > 0
+      ) {
+        console.log(
+          `[${nowIso()}] ✅ MAKS Edge sync pull`,
+          {
+            received:
+              Number(
+                result.received ||
+                0
+              ),
+
+            duplicates:
+              Number(
+                result.duplicates ||
+                0
+              ),
+
+            acked:
+              Number(
+                result.acked ||
+                0
+              ),
+
+            rejected:
+              Number(
+                result.rejected ||
+                0
+              ),
+
+            pending:
+              Number(
+                result.pending ||
+                0
+              ),
+          }
+        );
+      }
+
+      return;
+    }
+
+    console.error(
+      `[${nowIso()}] ❌ MAKS Edge sync pull failed`,
+      {
+        received:
+          Number(
+            result?.received ||
+            0
+          ),
+
+        duplicates:
+          Number(
+            result?.duplicates ||
+            0
+          ),
+
+        acked:
+          Number(
+            result?.acked ||
+            0
+          ),
+
+        rejected:
+          Number(
+            result?.rejected ||
+            0
+          ),
+
+        pending:
+          Number(
+            result?.pending ||
+            0
+          ),
+
+        code:
+          result?.error ||
+          "EDGE_PULL_FAILED",
+      }
+    );
+  } catch (error) {
+    console.error(
+      `[${nowIso()}] ❌ MAKS Edge pull cycle failed`,
+      {
+        error:
+          String(
+            error?.message ||
+            error
+          ).slice(
+            0,
+            500
+          ),
+      }
+    );
+  } finally {
+    pullSending =
+      false;
+  }
+}
+
+
 async function sendHeartbeat() {
   if (
     shuttingDown ||
@@ -1005,6 +1191,7 @@ async function sendHeartbeat() {
         setImmediate(
           () => {
             sendSyncCycle();
+            sendPullCycle();
           }
         );
       }
@@ -1109,6 +1296,17 @@ async function shutdown(
       null;
   }
 
+  if (
+    pullTimer
+  ) {
+    clearInterval(
+      pullTimer
+    );
+
+    pullTimer =
+      null;
+  }
+
   try {
     await pool.end();
   } finally {
@@ -1189,6 +1387,13 @@ console.log(
 );
 
 console.log(
+  `Pull: ${Math.round(
+    PULL_MS /
+    1000
+  )} seconds`
+);
+
+console.log(
   "Secret: configured (hidden)"
 );
 
@@ -1203,11 +1408,13 @@ console.log(
 
 /*
  * First heartbeat learns the authoritative restaurant.
- * First sync attempt before that safely does nothing.
+ * First push/pull attempts before that safely do nothing.
  */
 sendHeartbeat();
 
 sendSyncCycle();
+
+sendPullCycle();
 
 
 heartbeatTimer =
@@ -1221,4 +1428,11 @@ syncTimer =
   setInterval(
     sendSyncCycle,
     SYNC_MS
+  );
+
+
+pullTimer =
+  setInterval(
+    sendPullCycle,
+    PULL_MS
   );

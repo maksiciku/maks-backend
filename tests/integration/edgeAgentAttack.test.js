@@ -9,6 +9,12 @@ const { spawn } = require("node:child_process");
 const { once } = require("node:events");
 const { Pool } = require("pg");
 
+const {
+  hashJson,
+} = require(
+  "../../edge/syncStore"
+);
+
 const ROOT = path.resolve(
   __dirname,
   "../.."
@@ -214,11 +220,40 @@ async function getUnusedUrl() {
 async function createSyncCloudStub({
   restaurantId,
   pushAvailable = true,
+  pullAvailable = true,
+  pullEvents = [],
+  pullDelayMs = 0,
 } = {}) {
   const requests = [];
 
   const state = {
     pushAvailable,
+    pullAvailable,
+    pullEvents:
+      Array.isArray(
+        pullEvents
+      )
+        ? [
+            ...pullEvents,
+          ]
+        : [],
+
+    pullAckedEventIds:
+      new Set(),
+
+    pullDelayMs:
+      Math.max(
+        0,
+        Number(
+          pullDelayMs
+        ) || 0
+      ),
+
+    activePullRequests:
+      0,
+
+    maxConcurrentPullRequests:
+      0,
   };
 
   const server =
@@ -285,6 +320,12 @@ async function createSyncCloudStub({
               code:
                 "MAKS_TEST_NOT_FOUND",
             };
+
+            let responseDelayMs =
+              0;
+
+            let trackedPullRequest =
+              false;
 
             if (
               req.method ===
@@ -365,24 +406,245 @@ async function createSyncCloudStub({
                     "Simulated Cloud sync outage",
                 };
               }
+            } else if (
+              req.method ===
+                "POST" &&
+              req.url ===
+                "/edge/sync/pull"
+            ) {
+              trackedPullRequest =
+                true;
+
+              state.activePullRequests +=
+                1;
+
+              state.maxConcurrentPullRequests =
+                Math.max(
+                  state
+                    .maxConcurrentPullRequests,
+                  state
+                    .activePullRequests
+                );
+
+              responseDelayMs =
+                state.pullDelayMs;
+
+              if (
+                state
+                  .pullAvailable
+              ) {
+                status = 200;
+
+                const limit =
+                  Math.max(
+                    1,
+                    Math.min(
+                      25,
+                      Number(
+                        body?.limit
+                      ) || 25
+                    )
+                  );
+
+                const events =
+                  state
+                    .pullEvents
+                    .filter(
+                      (event) =>
+                        !state
+                          .pullAckedEventIds
+                          .has(
+                            String(
+                              event
+                                ?.event_id ||
+                              ""
+                            )
+                          )
+                    )
+                    .slice(
+                      0,
+                      limit
+                    );
+
+                responseBody = {
+                  success:
+                    true,
+
+                  restaurant_id:
+                    Number(
+                      restaurantId
+                    ),
+
+                  installation_id:
+                    String(
+                      req.headers[
+                        "x-edge-installation-id"
+                      ] || ""
+                    ),
+
+                  events,
+                };
+              } else {
+                status = 503;
+
+                responseBody = {
+                  success:
+                    false,
+
+                  code:
+                    "MAKS_TEST_PULL_UNAVAILABLE",
+
+                  error:
+                    "Simulated Cloud pull outage",
+                };
+              }
+            } else if (
+              req.method ===
+                "POST" &&
+              req.url ===
+                "/edge/sync/pull/ack"
+            ) {
+              if (
+                state
+                  .pullAvailable
+              ) {
+                status = 200;
+
+                const requested =
+                  Array.isArray(
+                    body?.event_ids
+                  )
+                    ? body.event_ids.map(
+                        (eventId) =>
+                          String(
+                            eventId ||
+                            ""
+                          )
+                      )
+                    : [];
+
+                const known =
+                  new Set(
+                    state
+                      .pullEvents
+                      .map(
+                        (event) =>
+                          String(
+                            event
+                              ?.event_id ||
+                            ""
+                          )
+                      )
+                  );
+
+                const acked =
+                  requested
+                    .filter(
+                      (eventId) =>
+                        known.has(
+                          eventId
+                        )
+                    );
+
+                for (
+                  const eventId of
+                  acked
+                ) {
+                  state
+                    .pullAckedEventIds
+                    .add(
+                      eventId
+                    );
+                }
+
+                responseBody = {
+                  success:
+                    true,
+
+                  restaurant_id:
+                    Number(
+                      restaurantId
+                    ),
+
+                  installation_id:
+                    String(
+                      req.headers[
+                        "x-edge-installation-id"
+                      ] || ""
+                    ),
+
+                  acked:
+                    acked.map(
+                      (eventId) => ({
+                        event_id:
+                          eventId,
+                      })
+                    ),
+                };
+              } else {
+                status = 503;
+
+                responseBody = {
+                  success:
+                    false,
+
+                  code:
+                    "MAKS_TEST_PULL_UNAVAILABLE",
+
+                  error:
+                    "Simulated Cloud pull ACK outage",
+                };
+              }
             }
 
-            record.responseStatus =
-              status;
+            const finishResponse =
+              () => {
+                if (
+                  trackedPullRequest
+                ) {
+                  state.activePullRequests =
+                    Math.max(
+                      0,
+                      state
+                        .activePullRequests -
+                      1
+                    );
+                }
 
-            res.statusCode =
-              status;
+                record.responseStatus =
+                  status;
 
-            res.setHeader(
-              "content-type",
-              "application/json"
-            );
+                if (
+                  res.destroyed
+                ) {
+                  return;
+                }
 
-            res.end(
-              JSON.stringify(
-                responseBody
-              )
-            );
+                res.statusCode =
+                  status;
+
+                res.setHeader(
+                  "content-type",
+                  "application/json"
+                );
+
+                res.end(
+                  JSON.stringify(
+                    responseBody
+                  )
+                );
+              };
+
+            if (
+              responseDelayMs > 0
+            ) {
+              setTimeout(
+                finishResponse,
+                responseDelayMs
+              );
+            } else {
+              finishResponse();
+            }
           }
         );
       }
@@ -440,6 +702,7 @@ function spawnAgent({
     "edge-agent-attack-0.1.0",
   heartbeatMs = "5000",
   syncMs = "1000",
+  pullMs = "1000",
 } = {}) {
   const env = {
     ...process.env,
@@ -464,6 +727,9 @@ function spawnAgent({
 
     MAKS_EDGE_SYNC_MS:
       syncMs,
+
+    MAKS_EDGE_PULL_MS:
+      pullMs,
   };
 
   const child = spawn(
@@ -1214,37 +1480,69 @@ test(
                 "1000",
             });
 
+          /*
+           * Automatic pull now runs beside push. A pull can
+           * legitimately observe the outbox while it is still
+           * pending and mark its own directional state pending.
+           *
+           * Recovery is complete only when the outbox is ACKed
+           * AND the aggregate sync state has settled to synced.
+           */
           await waitFor(
             async () => {
               const result =
                 await localPool.query(
                   `
                   SELECT
-                    status
+                    o.status
+                      AS outbox_status,
+
+                    s.sync_status,
+                    s.pending_outbox_events
                   FROM
-                    public.edge_outbox
+                    public.edge_outbox o
+                  LEFT JOIN
+                    public.edge_sync_state s
+                    ON
+                      s.restaurant_id =
+                        o.restaurant_id
+                      AND
+                      s.installation_id =
+                        $2::uuid
                   WHERE
-                    event_id =
+                    o.event_id =
                       $1::uuid
+                  LIMIT 1
                   `,
                   [
                     eventId,
+                    agent.installationId,
                   ]
                 );
 
+              const row =
+                result.rows?.[0];
+
               return (
-                result
-                  .rows?.[0]
-                  ?.status ===
-                "acked"
+                row
+                  ?.outbox_status ===
+                  "acked" &&
+                row
+                  ?.sync_status ===
+                  "synced" &&
+                Number(
+                  row
+                    ?.pending_outbox_events ||
+                  0
+                ) === 0
               );
             },
             {
               timeoutMs:
-                10000,
+                12000,
 
               message:
-                "Automatic Edge push did not ACK pending event",
+                "Automatic Edge push did not complete synced state",
             }
           );
 
@@ -1893,6 +2191,902 @@ test(
     );
 
 
+    await t.test(
+      "automatic Cloud pull stores one durable local event and ACKs Cloud",
+      async () => {
+        const localPool =
+          new Pool({
+            connectionString:
+              TEST_DATABASE_URL,
+          });
+
+        let restaurantId =
+          null;
+
+        let cloud =
+          null;
+
+        let agent =
+          null;
+
+        try {
+          const restaurant =
+            await localPool.query(
+              `
+              INSERT INTO
+                public.restaurants
+              (
+                name
+              )
+              VALUES
+              (
+                $1
+              )
+              RETURNING id
+              `,
+              [
+                `EDGE AGENT AUTO PULL ${crypto.randomUUID()}`,
+              ]
+            );
+
+          restaurantId =
+            Number(
+              restaurant
+                .rows[0]
+                .id
+            );
+
+          const eventId =
+            crypto.randomUUID();
+
+          const payload = {
+            schema_version:
+              1,
+
+            attack:
+              "automatic-pull",
+
+            restaurant_id:
+              restaurantId,
+          };
+
+          const cloudEvent = {
+            event_id:
+              eventId,
+
+            restaurant_id:
+              restaurantId,
+
+            event_type:
+              "restaurant.config.updated",
+
+            entity_type:
+              "restaurant_config",
+
+            entity_id:
+              String(
+                restaurantId
+              ),
+
+            payload,
+
+            payload_hash:
+              hashJson(
+                payload
+              ),
+          };
+
+          cloud =
+            await createSyncCloudStub({
+              restaurantId,
+
+              pullAvailable:
+                true,
+
+              pullEvents: [
+                cloudEvent,
+              ],
+            });
+
+          agent =
+            spawnAgent({
+              cloudUrl:
+                cloud.url,
+
+              databaseUrl:
+                TEST_DATABASE_URL,
+
+              heartbeatMs:
+                "5000",
+
+              syncMs:
+                "1000",
+
+              pullMs:
+                "1000",
+            });
+
+          await waitFor(
+            async () => {
+              const inbox =
+                await localPool.query(
+                  `
+                  SELECT
+                    COUNT(*)::int
+                      AS count
+                  FROM
+                    public.edge_inbox
+                  WHERE
+                    restaurant_id = $1
+                    AND
+                    event_id =
+                      $2::uuid
+                  `,
+                  [
+                    restaurantId,
+                    eventId,
+                  ]
+                );
+
+              return (
+                Number(
+                  inbox
+                    .rows?.[0]
+                    ?.count ||
+                  0
+                ) === 1 &&
+                cloud
+                  .state
+                  .pullAckedEventIds
+                  .has(
+                    eventId
+                  )
+              );
+            },
+            {
+              timeoutMs:
+                10000,
+
+              message:
+                "Automatic Edge pull did not durably receive and ACK Cloud event",
+            }
+          );
+
+          assert.equal(
+            agent.child.exitCode,
+            null
+          );
+
+          const inbox =
+            await localPool.query(
+              `
+              SELECT
+                status,
+                payload_hash
+              FROM
+                public.edge_inbox
+              WHERE
+                restaurant_id = $1
+                AND
+                event_id =
+                  $2::uuid
+              `,
+              [
+                restaurantId,
+                eventId,
+              ]
+            );
+
+          assert.equal(
+            inbox.rows.length,
+            1
+          );
+
+          assert.equal(
+            inbox
+              .rows[0]
+              .status,
+            "received"
+          );
+
+          assert.equal(
+            inbox
+              .rows[0]
+              .payload_hash,
+            cloudEvent
+              .payload_hash
+          );
+
+          const pullRequests =
+            cloud.requests.filter(
+              (entry) =>
+                entry.url ===
+                "/edge/sync/pull"
+            );
+
+          const ackRequests =
+            cloud.requests.filter(
+              (entry) =>
+                entry.url ===
+                "/edge/sync/pull/ack"
+            );
+
+          assert.ok(
+            pullRequests.some(
+              (entry) =>
+                entry
+                  .responseStatus ===
+                200
+            )
+          );
+
+          assert.ok(
+            ackRequests.some(
+              (entry) =>
+                entry
+                  .body
+                  ?.event_ids
+                  ?.includes(
+                    eventId
+                  )
+            )
+          );
+
+          const state =
+            await localPool.query(
+              `
+              SELECT
+                sync_status,
+                pull_status,
+                pending_inbox_events,
+                pull_consecutive_failures,
+                last_pull_success_at,
+                last_pull_error
+              FROM
+                public.edge_sync_state
+              WHERE
+                restaurant_id = $1
+                AND
+                installation_id =
+                  $2::uuid
+              `,
+              [
+                restaurantId,
+                agent.installationId,
+              ]
+            );
+
+          assert.equal(
+            state
+              .rows?.[0]
+              ?.sync_status,
+            "pending"
+          );
+
+          /*
+           * Pull transport itself is healthy once the event
+           * is durably received and ACKed. The aggregate
+           * remains pending because the inbox event has not
+           * been applied to business tables yet.
+           */
+          assert.equal(
+            state
+              .rows?.[0]
+              ?.pull_status,
+            "synced"
+          );
+
+          assert.equal(
+            Number(
+              state
+                .rows?.[0]
+                ?.pending_inbox_events ||
+              0
+            ),
+            1
+          );
+
+          assert.equal(
+            Number(
+              state
+                .rows?.[0]
+                ?.pull_consecutive_failures ||
+              0
+            ),
+            0
+          );
+
+          assert.ok(
+            state
+              .rows?.[0]
+              ?.last_pull_success_at
+          );
+
+          assert.equal(
+            state
+              .rows?.[0]
+              ?.last_pull_error,
+            null
+          );
+
+          assert.equal(
+            agent.output().includes(
+              agent.secret
+            ),
+            false
+          );
+
+          assert.equal(
+            agent.output().includes(
+              TEST_DATABASE_URL
+            ),
+            false
+          );
+
+          console.log(
+            "✅ 11 Automatic Cloud → Edge pull + ACK proven"
+          );
+        } finally {
+          if (agent) {
+            await stopAgent(
+              agent
+            );
+          }
+
+          if (cloud) {
+            await cloud.close();
+          }
+
+          if (
+            restaurantId
+          ) {
+            await localPool.query(
+              `
+              DELETE FROM
+                public.restaurants
+              WHERE
+                id = $1
+              `,
+              [
+                restaurantId,
+              ]
+            );
+          }
+
+          await localPool.end();
+        }
+      }
+    );
+
+
+    await t.test(
+      "automatic Cloud pull recovers after outage without restart",
+      async () => {
+        const localPool =
+          new Pool({
+            connectionString:
+              TEST_DATABASE_URL,
+          });
+
+        let restaurantId =
+          null;
+
+        let cloud =
+          null;
+
+        let agent =
+          null;
+
+        try {
+          const restaurant =
+            await localPool.query(
+              `
+              INSERT INTO
+                public.restaurants
+              (
+                name
+              )
+              VALUES
+              (
+                $1
+              )
+              RETURNING id
+              `,
+              [
+                `EDGE AGENT PULL RECOVERY ${crypto.randomUUID()}`,
+              ]
+            );
+
+          restaurantId =
+            Number(
+              restaurant
+                .rows[0]
+                .id
+            );
+
+          const eventId =
+            crypto.randomUUID();
+
+          const payload = {
+            schema_version:
+              1,
+
+            attack:
+              "automatic-pull-recovery",
+
+            restaurant_id:
+              restaurantId,
+          };
+
+          const cloudEvent = {
+            event_id:
+              eventId,
+
+            restaurant_id:
+              restaurantId,
+
+            event_type:
+              "restaurant.config.updated",
+
+            entity_type:
+              "restaurant_config",
+
+            entity_id:
+              String(
+                restaurantId
+              ),
+
+            payload,
+
+            payload_hash:
+              hashJson(
+                payload
+              ),
+          };
+
+          cloud =
+            await createSyncCloudStub({
+              restaurantId,
+
+              pullAvailable:
+                false,
+
+              pullEvents: [
+                cloudEvent,
+              ],
+            });
+
+          agent =
+            spawnAgent({
+              cloudUrl:
+                cloud.url,
+
+              databaseUrl:
+                TEST_DATABASE_URL,
+
+              heartbeatMs:
+                "5000",
+
+              syncMs:
+                "1000",
+
+              pullMs:
+                "1000",
+            });
+
+          await waitFor(
+            async () => {
+              const result =
+                await localPool.query(
+                  `
+                  SELECT
+                    sync_status,
+                    pull_status,
+                    pull_consecutive_failures,
+                    last_pull_error
+                  FROM
+                    public.edge_sync_state
+                  WHERE
+                    restaurant_id = $1
+                    AND
+                    installation_id =
+                      $2::uuid
+                  `,
+                  [
+                    restaurantId,
+                    agent.installationId,
+                  ]
+                );
+
+              const row =
+                result.rows?.[0];
+
+              return (
+                row
+                  ?.sync_status ===
+                  "error" &&
+                row
+                  ?.pull_status ===
+                  "error" &&
+                Number(
+                  row
+                    ?.pull_consecutive_failures ||
+                  0
+                ) >= 1 &&
+                typeof row
+                  ?.last_pull_error ===
+                  "string"
+              );
+            },
+            {
+              timeoutMs:
+                10000,
+
+              message:
+                "Simulated Cloud pull outage did not produce directional error state",
+            }
+          );
+
+          assert.equal(
+            agent.child.exitCode,
+            null
+          );
+
+          const beforeRecovery =
+            await localPool.query(
+              `
+              SELECT
+                COUNT(*)::int
+                  AS count
+              FROM
+                public.edge_inbox
+              WHERE
+                restaurant_id = $1
+                AND
+                event_id =
+                  $2::uuid
+              `,
+              [
+                restaurantId,
+                eventId,
+              ]
+            );
+
+          assert.equal(
+            Number(
+              beforeRecovery
+                .rows?.[0]
+                ?.count ||
+              0
+            ),
+            0
+          );
+
+          /*
+           * Cloud becomes reachable again.
+           *
+           * No agent restart.
+           * No manual pull command.
+           */
+          cloud.state.pullAvailable =
+            true;
+
+          await waitFor(
+            async () => {
+              const result =
+                await localPool.query(
+                  `
+                  SELECT
+                    (
+                      SELECT
+                        COUNT(*)::int
+                      FROM
+                        public.edge_inbox
+                      WHERE
+                        restaurant_id = $1
+                        AND
+                        event_id =
+                          $2::uuid
+                    ) AS inbox_count,
+
+                    s.sync_status,
+                    s.pull_status,
+                    s.pending_inbox_events,
+                    s.pull_consecutive_failures,
+                    s.last_pull_success_at,
+                    s.last_pull_error
+                  FROM
+                    public.edge_sync_state s
+                  WHERE
+                    s.restaurant_id = $1
+                    AND
+                    s.installation_id =
+                      $3::uuid
+                  `,
+                  [
+                    restaurantId,
+                    eventId,
+                    agent.installationId,
+                  ]
+                );
+
+              const row =
+                result.rows?.[0];
+
+              return (
+                Number(
+                  row
+                    ?.inbox_count ||
+                  0
+                ) === 1 &&
+                cloud
+                  .state
+                  .pullAckedEventIds
+                  .has(
+                    eventId
+                  ) &&
+                row
+                  ?.sync_status ===
+                  "pending" &&
+                row
+                  ?.pull_status ===
+                  "synced" &&
+                Number(
+                  row
+                    ?.pending_inbox_events ||
+                  0
+                ) === 1 &&
+                Number(
+                  row
+                    ?.pull_consecutive_failures ||
+                  0
+                ) === 0 &&
+                Boolean(
+                  row
+                    ?.last_pull_success_at
+                ) &&
+                row
+                  ?.last_pull_error ===
+                  null
+              );
+            },
+            {
+              timeoutMs:
+                12000,
+
+              message:
+                "Automatic Cloud pull did not recover after simulated outage",
+            }
+          );
+
+          assert.equal(
+            agent.child.exitCode,
+            null
+          );
+
+          const pullRequests =
+            cloud.requests.filter(
+              (entry) =>
+                entry.url ===
+                "/edge/sync/pull"
+            );
+
+          assert.ok(
+            pullRequests.some(
+              (entry) =>
+                entry
+                  .responseStatus ===
+                503
+            ),
+            "Expected at least one failed automatic pull"
+          );
+
+          assert.ok(
+            pullRequests.some(
+              (entry) =>
+                entry
+                  .responseStatus ===
+                200
+            ),
+            "Expected automatic pull recovery without restart"
+          );
+
+          console.log(
+            "✅ 12 Cloud pull outage automatically recovered"
+          );
+        } finally {
+          if (agent) {
+            await stopAgent(
+              agent
+            );
+          }
+
+          if (cloud) {
+            await cloud.close();
+          }
+
+          if (
+            restaurantId
+          ) {
+            await localPool.query(
+              `
+              DELETE FROM
+                public.restaurants
+              WHERE
+                id = $1
+              `,
+              [
+                restaurantId,
+              ]
+            );
+          }
+
+          await localPool.end();
+        }
+      }
+    );
+
+
+    await t.test(
+      "slow Cloud pull cannot overlap itself",
+      async () => {
+        const localPool =
+          new Pool({
+            connectionString:
+              TEST_DATABASE_URL,
+          });
+
+        let restaurantId =
+          null;
+
+        let cloud =
+          null;
+
+        let agent =
+          null;
+
+        try {
+          const restaurant =
+            await localPool.query(
+              `
+              INSERT INTO
+                public.restaurants
+              (
+                name
+              )
+              VALUES
+              (
+                $1
+              )
+              RETURNING id
+              `,
+              [
+                `EDGE AGENT PULL OVERLAP ${crypto.randomUUID()}`,
+              ]
+            );
+
+          restaurantId =
+            Number(
+              restaurant
+                .rows[0]
+                .id
+            );
+
+          cloud =
+            await createSyncCloudStub({
+              restaurantId,
+
+              pullAvailable:
+                true,
+
+              pullDelayMs:
+                2500,
+            });
+
+          agent =
+            spawnAgent({
+              cloudUrl:
+                cloud.url,
+
+              databaseUrl:
+                TEST_DATABASE_URL,
+
+              heartbeatMs:
+                "5000",
+
+              syncMs:
+                "1000",
+
+              pullMs:
+                "1000",
+            });
+
+          await waitFor(
+            () =>
+              cloud.requests.some(
+                (entry) =>
+                  entry.url ===
+                  "/edge/sync/pull"
+              ),
+            {
+              timeoutMs:
+                5000,
+
+              message:
+                "Agent did not start automatic pull",
+            }
+          );
+
+          /*
+           * The first pull is deliberately still in flight
+           * while another interval tick occurs.
+           */
+          await sleep(
+            1500
+          );
+
+          const pullRequests =
+            cloud.requests.filter(
+              (entry) =>
+                entry.url ===
+                "/edge/sync/pull"
+            );
+
+          assert.equal(
+            pullRequests.length,
+            1,
+            "Second pull overlapped while first was still in flight"
+          );
+
+          assert.equal(
+            cloud
+              .state
+              .maxConcurrentPullRequests,
+            1,
+            "Automatic pull concurrency exceeded one request"
+          );
+
+          assert.equal(
+            agent.child.exitCode,
+            null
+          );
+
+          console.log(
+            "✅ 13 Slow Cloud cannot create overlapping pulls"
+          );
+        } finally {
+          if (agent) {
+            await stopAgent(
+              agent
+            );
+          }
+
+          if (cloud) {
+            await cloud.close();
+          }
+
+          if (
+            restaurantId
+          ) {
+            await localPool.query(
+              `
+              DELETE FROM
+                public.restaurants
+              WHERE
+                id = $1
+              `,
+              [
+                restaurantId,
+              ]
+            );
+          }
+
+          await localPool.end();
+        }
+      }
+    );
+
+
     console.log(
       ""
     );
@@ -1902,7 +3096,7 @@ test(
     );
 
     console.log(
-      "✅ MAKS EDGE AGENT ATTACK: 10/10"
+      "MAKS EDGE AGENT ATTACK EXECUTION COMPLETE"
     );
 
     console.log(
