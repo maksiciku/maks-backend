@@ -48,6 +48,7 @@ const {
 
   claimOutboxEvents,
   ackOutboxEvent,
+  updateDirectionalSyncState,
 } = require(
   "../../edge/syncStore"
 );
@@ -1023,6 +1024,11 @@ test(
           );
 
           assert.equal(
+            state?.push_status,
+            "synced"
+          );
+
+          assert.equal(
             Number(
               state
                 ?.pending_outbox_events ||
@@ -1602,6 +1608,200 @@ test(
       );
 
 
+
+      await t.test(
+        "successful push cannot hide an existing pull failure",
+        async () => {
+          await updateDirectionalSyncState({
+            restaurantId:
+              restaurantB,
+
+            installationId:
+              edgeB.installationId,
+
+            direction:
+              "pull",
+
+            patch: {
+              status:
+                "error",
+
+              failureMode:
+                "increment",
+
+              lastAttemptAt:
+                new Date(),
+
+              lastError:
+                "PULL_STILL_BROKEN",
+            },
+
+            pool:
+              trackedLocalPool,
+          });
+
+          const eventId =
+            uuid();
+
+          await enqueueEdgeEvent({
+            eventId,
+
+            restaurantId:
+              restaurantB,
+
+            eventType:
+              "test.directional.push",
+
+            entityType:
+              "attack",
+
+            entityId:
+              uuid(),
+
+            idempotencyKey:
+              `directional-push:${eventId}`,
+
+            payload: {
+              directional:
+                "push-success-pull-failure",
+            },
+          });
+
+          const result =
+            await pushOutboxOnce({
+              pool:
+                trackedLocalPool,
+
+              cloudUrl:
+                "https://maks-cloud.test",
+
+              installationId:
+                edgeB.installationId,
+
+              edgeSecret:
+                edgeB.secret,
+
+              restaurantId:
+                restaurantB,
+
+              workerId:
+                `directional-push-${token}`,
+
+              fetchImpl:
+                makeFetchBridge(),
+            });
+
+          assert.equal(
+            result.success,
+            true
+          );
+
+          const state =
+            (
+              await trackedLocalPool.query(
+                `
+                SELECT
+                  sync_status,
+                  push_status,
+                  pull_status,
+                  last_error,
+                  push_consecutive_failures,
+                  pull_consecutive_failures
+                FROM
+                  public.edge_sync_state
+                WHERE
+                  restaurant_id = $1
+                  AND installation_id =
+                    $2::uuid
+                `,
+                [
+                  restaurantB,
+                  edgeB.installationId,
+                ]
+              )
+            ).rows[0];
+
+          assert.equal(
+            state?.push_status,
+            "synced"
+          );
+
+          assert.equal(
+            state?.pull_status,
+            "error"
+          );
+
+          assert.equal(
+            state?.sync_status,
+            "error",
+            "Successful push hid pull failure"
+          );
+
+          assert.match(
+            String(
+              state?.last_error ||
+              ""
+            ),
+            /Pull: PULL_STILL_BROKEN/
+          );
+
+          assert.equal(
+            Number(
+              state
+                ?.push_consecutive_failures ||
+              0
+            ),
+            0
+          );
+
+          assert.equal(
+            Number(
+              state
+                ?.pull_consecutive_failures ||
+              0
+            ),
+            1
+          );
+
+          /*
+           * Restore this test tenant's pull direction so
+           * later assertions are not contaminated.
+           */
+          await updateDirectionalSyncState({
+            restaurantId:
+              restaurantB,
+
+            installationId:
+              edgeB.installationId,
+
+            direction:
+              "pull",
+
+            patch: {
+              status:
+                "synced",
+
+              failureMode:
+                "reset",
+
+              lastSuccessAt:
+                new Date(),
+
+              lastError:
+                null,
+            },
+
+            pool:
+              trackedLocalPool,
+          });
+
+          console.log(
+            "✅ 11 Push success cannot hide pull failure"
+          );
+        }
+      );
+
+
       await t.test(
         "push batch is bounded to 25 events",
         async () => {
@@ -1644,7 +1844,7 @@ test(
           );
 
           console.log(
-            "✅ 11 Oversized push batch rejected"
+            "✅ 12 Oversized push batch rejected"
           );
         }
       );
@@ -1702,7 +1902,7 @@ test(
       );
 
       console.log(
-        "✅ 12 Final tenant isolation + explicit pool proof passed"
+        "✅ 13 Final tenant isolation + explicit pool proof passed"
       );
 
       console.log(

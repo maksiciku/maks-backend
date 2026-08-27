@@ -38,6 +38,7 @@ const {
 
   ensureSyncState,
   updateSyncState,
+  updateDirectionalSyncState,
 } = require(
   "../../edge/syncStore"
 );
@@ -1987,6 +1988,550 @@ test(
           );
         }
       );
+
+
+      await t.test(
+        "directional health never lets one success hide the opposite failure",
+        async () => {
+          const installationId =
+            uuid();
+
+          let state =
+            await updateDirectionalSyncState({
+              restaurantId:
+                restaurantA,
+
+              installationId,
+
+              direction:
+                "push",
+
+              patch: {
+                status:
+                  "error",
+
+                pendingOutboxEvents:
+                  1,
+
+                failureMode:
+                  "increment",
+
+                lastAttemptAt:
+                  new Date(),
+
+                lastError:
+                  "PUSH_OFFLINE",
+              },
+
+              pool,
+            });
+
+          assert.equal(
+            state.push_status,
+            "error"
+          );
+
+          assert.equal(
+            state.sync_status,
+            "error"
+          );
+
+          state =
+            await updateDirectionalSyncState({
+              restaurantId:
+                restaurantA,
+
+              installationId,
+
+              direction:
+                "pull",
+
+              patch: {
+                status:
+                  "synced",
+
+                pendingInboxEvents:
+                  0,
+
+                failureMode:
+                  "reset",
+
+                lastAttemptAt:
+                  new Date(),
+
+                lastSuccessAt:
+                  new Date(),
+
+                lastError:
+                  null,
+              },
+
+              pool,
+            });
+
+          assert.equal(
+            state.pull_status,
+            "synced"
+          );
+
+          assert.equal(
+            state.push_status,
+            "error"
+          );
+
+          assert.equal(
+            state.sync_status,
+            "error",
+            "Pull success hid a push failure"
+          );
+
+          assert.match(
+            String(
+              state.last_error ||
+              ""
+            ),
+            /Push: PUSH_OFFLINE/
+          );
+
+          state =
+            await updateDirectionalSyncState({
+              restaurantId:
+                restaurantA,
+
+              installationId,
+
+              direction:
+                "push",
+
+              patch: {
+                status:
+                  "synced",
+
+                pendingOutboxEvents:
+                  0,
+
+                failureMode:
+                  "reset",
+
+                lastSuccessAt:
+                  new Date(),
+
+                lastError:
+                  null,
+              },
+
+              pool,
+            });
+
+          assert.equal(
+            state.sync_status,
+            "synced"
+          );
+
+          state =
+            await updateDirectionalSyncState({
+              restaurantId:
+                restaurantA,
+
+              installationId,
+
+              direction:
+                "pull",
+
+              patch: {
+                status:
+                  "error",
+
+                failureMode:
+                  "increment",
+
+                lastError:
+                  "PULL_OFFLINE",
+              },
+
+              pool,
+            });
+
+          assert.equal(
+            state.sync_status,
+            "error"
+          );
+
+          state =
+            await updateDirectionalSyncState({
+              restaurantId:
+                restaurantA,
+
+              installationId,
+
+              direction:
+                "push",
+
+              patch: {
+                status:
+                  "synced",
+
+                failureMode:
+                  "reset",
+
+                lastSuccessAt:
+                  new Date(),
+
+                lastError:
+                  null,
+              },
+
+              pool,
+            });
+
+          assert.equal(
+            state.pull_status,
+            "error"
+          );
+
+          assert.equal(
+            state.sync_status,
+            "error",
+            "Push success hid a pull failure"
+          );
+
+          state =
+            await updateDirectionalSyncState({
+              restaurantId:
+                restaurantA,
+
+              installationId,
+
+              direction:
+                "pull",
+
+              patch: {
+                status:
+                  "synced",
+
+                pendingInboxEvents:
+                  1,
+
+                failureMode:
+                  "reset",
+
+                lastSuccessAt:
+                  new Date(),
+
+                lastError:
+                  null,
+              },
+
+              pool,
+            });
+
+          assert.equal(
+            state.sync_status,
+            "pending"
+          );
+
+          state =
+            await updateDirectionalSyncState({
+              restaurantId:
+                restaurantA,
+
+              installationId,
+
+              direction:
+                "pull",
+
+              patch: {
+                status:
+                  "synced",
+
+                pendingInboxEvents:
+                  0,
+
+                failureMode:
+                  "reset",
+
+                lastSuccessAt:
+                  new Date(),
+
+                lastError:
+                  null,
+              },
+
+              pool,
+            });
+
+          assert.equal(
+            state.sync_status,
+            "synced"
+          );
+
+          console.log(
+            "✅ 15 Directional aggregate health truth table proven"
+          );
+        }
+      );
+
+
+      await t.test(
+        "concurrent push and pull health updates remain race-safe",
+        async () => {
+          const installationId =
+            uuid();
+
+          await updateDirectionalSyncState({
+            restaurantId:
+              restaurantA,
+
+            installationId,
+
+            direction:
+              "push",
+
+            patch: {
+              status:
+                "synced",
+
+              failureMode:
+                "reset",
+
+              lastSuccessAt:
+                new Date(),
+
+              lastError:
+                null,
+            },
+
+            pool,
+          });
+
+          await updateDirectionalSyncState({
+            restaurantId:
+              restaurantA,
+
+            installationId,
+
+            direction:
+              "pull",
+
+            patch: {
+              status:
+                "synced",
+
+              failureMode:
+                "reset",
+
+              lastSuccessAt:
+                new Date(),
+
+              lastError:
+                null,
+            },
+
+            pool,
+          });
+
+          await Promise.all([
+            updateDirectionalSyncState({
+              restaurantId:
+                restaurantA,
+
+              installationId,
+
+              direction:
+                "push",
+
+              patch: {
+                status:
+                  "error",
+
+                failureMode:
+                  "increment",
+
+                lastError:
+                  "PUSH_RACE_FAILURE",
+              },
+
+              pool,
+            }),
+
+            updateDirectionalSyncState({
+              restaurantId:
+                restaurantA,
+
+              installationId,
+
+              direction:
+                "pull",
+
+              patch: {
+                status:
+                  "synced",
+
+                failureMode:
+                  "reset",
+
+                lastSuccessAt:
+                  new Date(),
+
+                lastError:
+                  null,
+              },
+
+              pool,
+            }),
+          ]);
+
+          let state =
+            (
+              await pool.query(
+                `
+                SELECT *
+                FROM
+                  public.edge_sync_state
+                WHERE
+                  restaurant_id = $1
+                  AND installation_id =
+                    $2::uuid
+                `,
+                [
+                  restaurantA,
+                  installationId,
+                ]
+              )
+            ).rows[0];
+
+          assert.equal(
+            state.push_status,
+            "error"
+          );
+
+          assert.equal(
+            state.pull_status,
+            "synced"
+          );
+
+          assert.equal(
+            state.sync_status,
+            "error"
+          );
+
+          await updateDirectionalSyncState({
+            restaurantId:
+              restaurantA,
+
+            installationId,
+
+            direction:
+              "push",
+
+            patch: {
+              status:
+                "synced",
+
+              failureMode:
+                "reset",
+
+              lastSuccessAt:
+                new Date(),
+
+              lastError:
+                null,
+            },
+
+            pool,
+          });
+
+          await Promise.all([
+            updateDirectionalSyncState({
+              restaurantId:
+                restaurantA,
+
+              installationId,
+
+              direction:
+                "push",
+
+              patch: {
+                status:
+                  "synced",
+
+                failureMode:
+                  "reset",
+
+                lastSuccessAt:
+                  new Date(),
+
+                lastError:
+                  null,
+              },
+
+              pool,
+            }),
+
+            updateDirectionalSyncState({
+              restaurantId:
+                restaurantA,
+
+              installationId,
+
+              direction:
+                "pull",
+
+              patch: {
+                status:
+                  "error",
+
+                failureMode:
+                  "increment",
+
+                lastError:
+                  "PULL_RACE_FAILURE",
+              },
+
+              pool,
+            }),
+          ]);
+
+          state =
+            (
+              await pool.query(
+                `
+                SELECT *
+                FROM
+                  public.edge_sync_state
+                WHERE
+                  restaurant_id = $1
+                  AND installation_id =
+                    $2::uuid
+                `,
+                [
+                  restaurantA,
+                  installationId,
+                ]
+              )
+            ).rows[0];
+
+          assert.equal(
+            state.push_status,
+            "synced"
+          );
+
+          assert.equal(
+            state.pull_status,
+            "error"
+          );
+
+          assert.equal(
+            state.sync_status,
+            "error"
+          );
+
+          console.log(
+            "✅ 16 Concurrent directional health race blocked"
+          );
+        }
+      );
+
 
       console.log("");
       console.log(

@@ -1889,6 +1889,834 @@ async function withEdgeOperation({
    SYNC STATE
 ========================================================= */
 
+
+const SYNC_STATUS_VALUES =
+  new Set([
+    "unknown",
+    "synced",
+    "pending",
+    "syncing",
+    "error",
+  ]);
+
+
+function normalizeSyncStatus(
+  value,
+  label
+) {
+  const status =
+    requireText(
+      value,
+      label,
+      {
+        max: 32,
+      }
+    );
+
+  if (
+    !SYNC_STATUS_VALUES.has(
+      status
+    )
+  ) {
+    throw new EdgeSyncError(
+      "EDGE_SYNC_STATUS_INVALID",
+      `Invalid ${label}`
+    );
+  }
+
+  return status;
+}
+
+
+function normalizeTimestamp(
+  value,
+  label
+) {
+  if (value === null) {
+    return null;
+  }
+
+  const date =
+    value instanceof Date
+      ? value
+      : new Date(
+          value
+        );
+
+  if (
+    Number.isNaN(
+      date.getTime()
+    )
+  ) {
+    throw new EdgeSyncError(
+      "EDGE_TIMESTAMP_INVALID",
+      `${label} is invalid`
+    );
+  }
+
+  return date;
+}
+
+
+function latestTimestamp(
+  first,
+  second
+) {
+  const values =
+    [
+      first,
+      second,
+    ]
+      .filter(Boolean)
+      .map(
+        (value) =>
+          value instanceof Date
+            ? value
+            : new Date(
+                value
+              )
+      )
+      .filter(
+        (value) =>
+          !Number.isNaN(
+            value.getTime()
+          )
+      );
+
+  if (!values.length) {
+    return null;
+  }
+
+  return new Date(
+    Math.max(
+      ...values.map(
+        (value) =>
+          value.getTime()
+      )
+    )
+  );
+}
+
+
+function deriveAggregateSyncState(
+  row
+) {
+  const pushStatus =
+    row.push_status ||
+    "unknown";
+
+  const pullStatus =
+    row.pull_status ||
+    "unknown";
+
+  const pendingOutbox =
+    Number(
+      row.pending_outbox_events ||
+      0
+    );
+
+  const pendingInbox =
+    Number(
+      row.pending_inbox_events ||
+      0
+    );
+
+  let syncStatus =
+    "unknown";
+
+  if (
+    pushStatus === "error" ||
+    pullStatus === "error"
+  ) {
+    syncStatus =
+      "error";
+  } else if (
+    pushStatus === "syncing" ||
+    pullStatus === "syncing"
+  ) {
+    syncStatus =
+      "syncing";
+  } else if (
+    pushStatus === "pending" ||
+    pullStatus === "pending" ||
+    pendingOutbox > 0 ||
+    pendingInbox > 0
+  ) {
+    syncStatus =
+      "pending";
+  } else if (
+    (
+      pushStatus === "synced" &&
+      [
+        "synced",
+        "unknown",
+      ].includes(
+        pullStatus
+      )
+    ) ||
+    (
+      pullStatus === "synced" &&
+      [
+        "synced",
+        "unknown",
+      ].includes(
+        pushStatus
+      )
+    )
+  ) {
+    /*
+     * Transitional compatibility:
+     * before automatic pull is wired, the untouched
+     * direction is "unknown". A known-good direction
+     * remains aggregate-synced unless the other direction
+     * has actually reported an error.
+     */
+    syncStatus =
+      "synced";
+  }
+
+  const failures =
+    Math.max(
+      Number(
+        row.push_consecutive_failures ||
+        0
+      ),
+      Number(
+        row.pull_consecutive_failures ||
+        0
+      )
+    );
+
+  const errors =
+    [];
+
+  if (
+    pushStatus === "error"
+  ) {
+    errors.push(
+      `Push: ${
+        String(
+          row.last_push_error ||
+          "MAKS Edge push failed"
+        ).slice(
+          0,
+          980
+        )
+      }`
+    );
+  }
+
+  if (
+    pullStatus === "error"
+  ) {
+    errors.push(
+      `Pull: ${
+        String(
+          row.last_pull_error ||
+          "MAKS Edge pull failed"
+        ).slice(
+          0,
+          980
+        )
+      }`
+    );
+  }
+
+  return {
+    syncStatus,
+
+    consecutiveFailures:
+      failures,
+
+    lastSuccessAt:
+      latestTimestamp(
+        row.last_success_at,
+        latestTimestamp(
+          row.last_push_success_at,
+          row.last_pull_success_at
+        )
+      ),
+
+    lastError:
+      errors.length
+        ? errors
+            .join(
+              " | "
+            )
+            .slice(
+              0,
+              2000
+            )
+        : null,
+  };
+}
+
+
+async function updateDirectionalSyncState({
+  restaurantId,
+
+  installationId,
+
+  direction,
+
+  patch,
+
+  pool = null,
+}) {
+  const rid =
+    requireRestaurantId(
+      restaurantId
+    );
+
+  const iid =
+    requireUuid(
+      installationId,
+      "installationId"
+    );
+
+  const directionSafe =
+    requireText(
+      direction,
+      "direction",
+      {
+        max: 16,
+      }
+    );
+
+  if (
+    ![
+      "push",
+      "pull",
+    ].includes(
+      directionSafe
+    )
+  ) {
+    throw new EdgeSyncError(
+      "EDGE_SYNC_DIRECTION_INVALID",
+      "Sync direction must be push or pull"
+    );
+  }
+
+  if (
+    !patch ||
+    typeof patch !==
+      "object" ||
+    Array.isArray(patch)
+  ) {
+    throw new EdgeSyncError(
+      "EDGE_SYNC_PATCH_INVALID",
+      "Directional sync-state patch must be an object"
+    );
+  }
+
+  const normalized = {};
+
+  if (
+    Object.prototype.hasOwnProperty.call(
+      patch,
+      "status"
+    )
+  ) {
+    normalized.status =
+      normalizeSyncStatus(
+        patch.status,
+        `${directionSafe}Status`
+      );
+  }
+
+  if (
+    Object.prototype.hasOwnProperty.call(
+      patch,
+      "pendingOutboxEvents"
+    )
+  ) {
+    normalized.pendingOutboxEvents =
+      boundedInteger(
+        patch.pendingOutboxEvents,
+        "pendingOutboxEvents",
+        {
+          min: 0,
+        }
+      );
+  }
+
+  if (
+    Object.prototype.hasOwnProperty.call(
+      patch,
+      "pendingInboxEvents"
+    )
+  ) {
+    normalized.pendingInboxEvents =
+      boundedInteger(
+        patch.pendingInboxEvents,
+        "pendingInboxEvents",
+        {
+          min: 0,
+        }
+      );
+  }
+
+  if (
+    Object.prototype.hasOwnProperty.call(
+      patch,
+      "failureMode"
+    )
+  ) {
+    const mode =
+      requireText(
+        patch.failureMode,
+        "failureMode",
+        {
+          max: 16,
+        }
+      );
+
+    if (
+      ![
+        "preserve",
+        "increment",
+        "reset",
+      ].includes(
+        mode
+      )
+    ) {
+      throw new EdgeSyncError(
+        "EDGE_SYNC_FAILURE_MODE_INVALID",
+        "failureMode must be preserve, increment or reset"
+      );
+    }
+
+    normalized.failureMode =
+      mode;
+  } else {
+    normalized.failureMode =
+      "preserve";
+  }
+
+  if (
+    Object.prototype.hasOwnProperty.call(
+      patch,
+      "lastAttemptAt"
+    )
+  ) {
+    normalized.lastAttemptAt =
+      normalizeTimestamp(
+        patch.lastAttemptAt,
+        "lastAttemptAt"
+      );
+  }
+
+  if (
+    Object.prototype.hasOwnProperty.call(
+      patch,
+      "lastSuccessAt"
+    )
+  ) {
+    normalized.lastSuccessAt =
+      normalizeTimestamp(
+        patch.lastSuccessAt,
+        "lastSuccessAt"
+      );
+  }
+
+  if (
+    Object.prototype.hasOwnProperty.call(
+      patch,
+      "lastError"
+    )
+  ) {
+    normalized.lastError =
+      normalizeErrorText(
+        patch.lastError
+      );
+  }
+
+  if (
+    Object.prototype.hasOwnProperty.call(
+      patch,
+      "lastAckedOutboxId"
+    )
+  ) {
+    normalized.lastAckedOutboxId =
+      patch.lastAckedOutboxId ===
+        null
+        ? null
+        : boundedInteger(
+            patch.lastAckedOutboxId,
+            "lastAckedOutboxId",
+            {
+              min: 0,
+            }
+          );
+  }
+
+  if (
+    Object.prototype.hasOwnProperty.call(
+      patch,
+      "lastAppliedInboxId"
+    )
+  ) {
+    normalized.lastAppliedInboxId =
+      patch.lastAppliedInboxId ===
+        null
+        ? null
+        : boundedInteger(
+            patch.lastAppliedInboxId,
+            "lastAppliedInboxId",
+            {
+              min: 0,
+            }
+          );
+  }
+
+  if (
+    Object.prototype.hasOwnProperty.call(
+      patch,
+      "cloudCursor"
+    )
+  ) {
+    normalized.cloudCursor =
+      optionalText(
+        patch.cloudCursor,
+        "cloudCursor",
+        {
+          max: 1000,
+        }
+      );
+  }
+
+  const supportedInputs =
+    [
+      "status",
+      "pendingOutboxEvents",
+      "pendingInboxEvents",
+      "failureMode",
+      "lastAttemptAt",
+      "lastSuccessAt",
+      "lastError",
+      "lastAckedOutboxId",
+      "lastAppliedInboxId",
+      "cloudCursor",
+    ];
+
+  const suppliedInputs =
+    Object.keys(
+      patch
+    );
+
+  if (
+    !suppliedInputs.length ||
+    suppliedInputs.some(
+      (key) =>
+        !supportedInputs.includes(
+          key
+        )
+    )
+  ) {
+    throw new EdgeSyncError(
+      "EDGE_SYNC_PATCH_INVALID",
+      "Directional sync-state patch contains unsupported fields"
+    );
+  }
+
+  return runSyncTx(
+    pool,
+    async (tx) => {
+      await tx.qRun(
+        `
+        INSERT INTO
+          public.edge_sync_state
+        (
+          restaurant_id,
+          installation_id
+        )
+        VALUES
+        (
+          $1,
+          $2
+        )
+        ON CONFLICT (
+          restaurant_id,
+          installation_id
+        )
+        DO NOTHING
+        `,
+        [
+          rid,
+          iid,
+        ]
+      );
+
+      const current =
+        await tx.qGet(
+          `
+          SELECT *
+          FROM
+            public.edge_sync_state
+          WHERE
+            restaurant_id = $1
+            AND
+            installation_id = $2
+          FOR UPDATE
+          `,
+          [
+            rid,
+            iid,
+          ]
+        );
+
+      if (!current) {
+        throw new EdgeSyncError(
+          "EDGE_SYNC_STATE_MISSING",
+          "Edge sync state could not be locked"
+        );
+      }
+
+      const next = {
+        ...current,
+      };
+
+      if (
+        Object.prototype.hasOwnProperty.call(
+          normalized,
+          "status"
+        )
+      ) {
+        next[
+          `${directionSafe}_status`
+        ] =
+          normalized.status;
+      }
+
+      if (
+        Object.prototype.hasOwnProperty.call(
+          normalized,
+          "pendingOutboxEvents"
+        )
+      ) {
+        next.pending_outbox_events =
+          normalized.pendingOutboxEvents;
+      }
+
+      if (
+        Object.prototype.hasOwnProperty.call(
+          normalized,
+          "pendingInboxEvents"
+        )
+      ) {
+        next.pending_inbox_events =
+          normalized.pendingInboxEvents;
+      }
+
+      const failureColumn =
+        `${directionSafe}_consecutive_failures`;
+
+      if (
+        normalized.failureMode ===
+          "increment"
+      ) {
+        next[failureColumn] =
+          Number(
+            current[failureColumn] ||
+            0
+          ) + 1;
+      } else if (
+        normalized.failureMode ===
+          "reset"
+      ) {
+        next[failureColumn] =
+          0;
+      }
+
+      const attemptColumn =
+        directionSafe ===
+          "push"
+          ? "last_push_at"
+          : "last_pull_at";
+
+      if (
+        Object.prototype.hasOwnProperty.call(
+          normalized,
+          "lastAttemptAt"
+        )
+      ) {
+        next[attemptColumn] =
+          normalized.lastAttemptAt;
+      }
+
+      const successColumn =
+        directionSafe ===
+          "push"
+          ? "last_push_success_at"
+          : "last_pull_success_at";
+
+      if (
+        Object.prototype.hasOwnProperty.call(
+          normalized,
+          "lastSuccessAt"
+        )
+      ) {
+        next[successColumn] =
+          normalized.lastSuccessAt;
+      }
+
+      const errorColumn =
+        directionSafe ===
+          "push"
+          ? "last_push_error"
+          : "last_pull_error";
+
+      if (
+        Object.prototype.hasOwnProperty.call(
+          normalized,
+          "lastError"
+        )
+      ) {
+        next[errorColumn] =
+          normalized.lastError;
+      }
+
+      if (
+        Object.prototype.hasOwnProperty.call(
+          normalized,
+          "lastAckedOutboxId"
+        )
+      ) {
+        next.last_acked_outbox_id =
+          normalized.lastAckedOutboxId;
+      }
+
+      if (
+        Object.prototype.hasOwnProperty.call(
+          normalized,
+          "lastAppliedInboxId"
+        )
+      ) {
+        next.last_applied_inbox_id =
+          normalized.lastAppliedInboxId;
+      }
+
+      if (
+        Object.prototype.hasOwnProperty.call(
+          normalized,
+          "cloudCursor"
+        )
+      ) {
+        next.cloud_cursor =
+          normalized.cloudCursor;
+      }
+
+      const aggregate =
+        deriveAggregateSyncState(
+          next
+        );
+
+      const row =
+        await tx.qGet(
+          `
+          UPDATE
+            public.edge_sync_state
+          SET
+            push_status = $3,
+            pull_status = $4,
+
+            pending_outbox_events = $5,
+            pending_inbox_events = $6,
+
+            last_acked_outbox_id = $7,
+            last_applied_inbox_id = $8,
+            cloud_cursor = $9,
+
+            last_push_at = $10,
+            last_pull_at = $11,
+
+            last_push_success_at = $12,
+            last_pull_success_at = $13,
+
+            last_push_error = $14,
+            last_pull_error = $15,
+
+            push_consecutive_failures = $16,
+            pull_consecutive_failures = $17,
+
+            sync_status = $18,
+            consecutive_failures = $19,
+            last_success_at = $20,
+            last_error = $21,
+
+            updated_at = NOW()
+          WHERE
+            restaurant_id = $1
+            AND installation_id = $2
+          RETURNING *
+          `,
+          [
+            rid,
+            iid,
+
+            next.push_status,
+            next.pull_status,
+
+            Number(
+              next.pending_outbox_events ||
+              0
+            ),
+            Number(
+              next.pending_inbox_events ||
+              0
+            ),
+
+            next.last_acked_outbox_id ??
+              null,
+            next.last_applied_inbox_id ??
+              null,
+            next.cloud_cursor ??
+              null,
+
+            next.last_push_at ||
+              null,
+            next.last_pull_at ||
+              null,
+
+            next.last_push_success_at ||
+              null,
+            next.last_pull_success_at ||
+              null,
+
+            next.last_push_error ||
+              null,
+            next.last_pull_error ||
+              null,
+
+            Number(
+              next.push_consecutive_failures ||
+              0
+            ),
+            Number(
+              next.pull_consecutive_failures ||
+              0
+            ),
+
+            aggregate.syncStatus,
+            aggregate.consecutiveFailures,
+            aggregate.lastSuccessAt,
+            aggregate.lastError,
+          ]
+        );
+
+      if (!row) {
+        throw new EdgeSyncError(
+          "EDGE_SYNC_STATE_MISSING",
+          "Edge directional sync state could not be updated"
+        );
+      }
+
+      return row;
+    }
+  );
+}
+
+
 async function ensureSyncState({
   restaurantId,
 
@@ -2329,4 +3157,5 @@ module.exports = {
 
   ensureSyncState,
   updateSyncState,
+  updateDirectionalSyncState,
 };

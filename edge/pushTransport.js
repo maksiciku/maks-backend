@@ -7,8 +7,7 @@ const {
   claimOutboxEvents,
   ackOutboxEvent,
   failOutboxEvent,
-  ensureSyncState,
-  updateSyncState,
+  updateDirectionalSyncState,
 } = require(
   "./syncStore"
 );
@@ -365,17 +364,6 @@ async function pushOutboxOnce({
       200
     );
 
-  const existingState =
-    await ensureSyncState({
-      restaurantId:
-        rid,
-
-      installationId:
-        iid,
-
-      pool,
-    });
-
   const claimed =
     await claimOutboxEvents({
       restaurantId:
@@ -398,25 +386,41 @@ async function pushOutboxOnce({
         rid
       );
 
-    await updateSyncState({
+    await updateDirectionalSyncState({
       restaurantId:
         rid,
 
       installationId:
         iid,
 
-      patch: {
-        syncStatus:
-          pending === 0
-            ? "synced"
-            : "pending",
+      direction:
+        "push",
 
-        pendingOutboxEvents:
-          pending,
+      patch:
+        pending === 0
+          ? {
+              status:
+                "synced",
 
-        lastError:
-          null,
-      },
+              pendingOutboxEvents:
+                0,
+
+              failureMode:
+                "reset",
+
+              lastError:
+                null,
+            }
+          : {
+              /*
+               * Work exists but no row is currently due
+               * (for example retry backoff). Preserve any
+               * existing push error instead of falsely
+               * clearing it just because nothing was claimed.
+               */
+              pendingOutboxEvents:
+                pending,
+            },
 
       pool,
     });
@@ -431,15 +435,18 @@ async function pushOutboxOnce({
     };
   }
 
-  await updateSyncState({
+  await updateDirectionalSyncState({
     restaurantId:
       rid,
 
     installationId:
       iid,
 
+    direction:
+      "push",
+
     patch: {
-      syncStatus:
+      status:
         "syncing",
 
       pendingOutboxEvents:
@@ -448,7 +455,7 @@ async function pushOutboxOnce({
           rid
         ),
 
-      lastPushAt:
+      lastAttemptAt:
         new Date(),
 
       lastError:
@@ -530,29 +537,25 @@ async function pushOutboxOnce({
         rid
       );
 
-    const failures =
-      Number(
-        existingState
-          ?.consecutive_failures ||
-        0
-      ) + 1;
-
-    await updateSyncState({
+    await updateDirectionalSyncState({
       restaurantId:
         rid,
 
       installationId:
         iid,
 
+      direction:
+        "push",
+
       patch: {
-        syncStatus:
+        status:
           "error",
 
         pendingOutboxEvents:
           pending,
 
-        consecutiveFailures:
-          failures,
+        failureMode:
+          "increment",
 
         lastError:
           String(
@@ -624,26 +627,25 @@ async function pushOutboxOnce({
         rid
       );
 
-    await updateSyncState({
+    await updateDirectionalSyncState({
       restaurantId:
         rid,
 
       installationId:
         iid,
 
+      direction:
+        "push",
+
       patch: {
-        syncStatus:
+        status:
           "error",
 
         pendingOutboxEvents:
           pending,
 
-        consecutiveFailures:
-          Number(
-            existingState
-              ?.consecutive_failures ||
-            0
-          ) + 1,
+        failureMode:
+          "increment",
 
         lastError:
           String(
@@ -833,62 +835,57 @@ async function pushOutboxOnce({
         )
       : null;
 
-  await updateSyncState({
+  const finalPatch = {
+    status:
+      fullySuccessful
+        ? (
+            pending === 0
+              ? "synced"
+              : "pending"
+          )
+        : "error",
+
+    pendingOutboxEvents:
+      pending,
+
+    failureMode:
+      fullySuccessful
+        ? "reset"
+        : "increment",
+
+    lastError:
+      fullySuccessful
+        ? null
+        : "One or more Edge events were rejected by Cloud",
+  };
+
+  if (
+    acknowledgedRows.length
+  ) {
+    finalPatch.lastSuccessAt =
+      new Date();
+  }
+
+  if (
+    highestAckedId !==
+      null
+  ) {
+    finalPatch.lastAckedOutboxId =
+      highestAckedId;
+  }
+
+  await updateDirectionalSyncState({
     restaurantId:
       rid,
 
     installationId:
       iid,
 
-    patch: {
-      syncStatus:
-        rejectedCount > 0
-          ? "error"
-          : (
-              pending === 0
-                ? "synced"
-                : "pending"
-            ),
+    direction:
+      "push",
 
-      pendingOutboxEvents:
-        pending,
-
-      consecutiveFailures:
-        fullySuccessful
-          ? 0
-          : (
-              Number(
-                existingState
-                  ?.consecutive_failures ||
-                0
-              ) + 1
-            ),
-
-      lastPushAt:
-        new Date(),
-
-      lastSuccessAt:
-        acknowledgedRows.length
-          ? new Date()
-          : (
-              existingState
-                ?.last_success_at ||
-              null
-            ),
-
-      lastAckedOutboxId:
-        highestAckedId ??
-        (
-          existingState
-            ?.last_acked_outbox_id ??
-          null
-        ),
-
-      lastError:
-        fullySuccessful
-          ? null
-          : "One or more Edge events were rejected by Cloud",
-    },
+    patch:
+      finalPatch,
 
     pool,
   });

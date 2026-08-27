@@ -1,11 +1,9 @@
 "use strict";
 
 const {
-  EdgeSyncError,
   hashJson,
   receiveInboxEvent,
-  ensureSyncState,
-  updateSyncState,
+  updateDirectionalSyncState,
 } = require(
   "./syncStore"
 );
@@ -233,7 +231,6 @@ async function updateFailureState({
   pool,
   restaurantId,
   installationId,
-  existingState,
   error,
 }) {
   const queues =
@@ -242,12 +239,15 @@ async function updateFailureState({
       restaurantId
     );
 
-  await updateSyncState({
+  await updateDirectionalSyncState({
     restaurantId,
     installationId,
 
+    direction:
+      "pull",
+
     patch: {
-      syncStatus:
+      status:
         "error",
 
       pendingOutboxEvents:
@@ -256,12 +256,8 @@ async function updateFailureState({
       pendingInboxEvents:
         queues.inbox,
 
-      consecutiveFailures:
-        Number(
-          existingState
-            ?.consecutive_failures ||
-          0
-        ) + 1,
+      failureMode:
+        "increment",
 
       lastError:
         String(
@@ -364,16 +360,29 @@ async function pullFromCloudOnce({
       10000
     );
 
-  const existingState =
-    await ensureSyncState({
-      restaurantId:
-        rid,
+  await updateDirectionalSyncState({
+    restaurantId:
+      rid,
 
-      installationId:
-        iid,
+    installationId:
+      iid,
 
-      pool,
-    });
+    direction:
+      "pull",
+
+    patch: {
+      status:
+        "syncing",
+
+      lastAttemptAt:
+        new Date(),
+
+      lastError:
+        null,
+    },
+
+    pool,
+  });
 
   let pullResponse;
   let pullBody;
@@ -417,7 +426,6 @@ async function pullFromCloudOnce({
         installationId:
           iid,
 
-        existingState,
 
         error:
           error?.message ||
@@ -470,7 +478,6 @@ async function pullFromCloudOnce({
         installationId:
           iid,
 
-        existingState,
 
         error:
           errorMessage,
@@ -517,7 +524,6 @@ async function pullFromCloudOnce({
         installationId:
           iid,
 
-        existingState,
 
         error:
           "Cloud pull tenant mismatch",
@@ -569,7 +575,6 @@ async function pullFromCloudOnce({
         installationId:
           iid,
 
-        existingState,
 
         error:
           "Cloud pull installation mismatch",
@@ -863,67 +868,53 @@ async function pullFromCloudOnce({
     ackFailure ===
       null;
 
-  await updateSyncState({
+  const finalPatch = {
+    status:
+      success
+        ? "synced"
+        : "error",
+
+    pendingOutboxEvents:
+      queues.outbox,
+
+    pendingInboxEvents:
+      queues.inbox,
+
+    failureMode:
+      success
+        ? "reset"
+        : "increment",
+
+    lastError:
+      success
+        ? null
+        : String(
+            ackFailure
+              ?.message ||
+            "One or more Cloud events were rejected"
+          ).slice(
+            0,
+            2000
+          ),
+  };
+
+  if (success) {
+    finalPatch.lastSuccessAt =
+      new Date();
+  }
+
+  await updateDirectionalSyncState({
     restaurantId:
       rid,
 
     installationId:
       iid,
 
-    patch: {
-      syncStatus:
-        success
-          ? (
-              (
-                queues.outbox +
-                queues.inbox
-              ) > 0
-                ? "pending"
-                : "synced"
-            )
-          : "error",
+    direction:
+      "pull",
 
-      pendingOutboxEvents:
-        queues.outbox,
-
-      pendingInboxEvents:
-        queues.inbox,
-
-      consecutiveFailures:
-        success
-          ? 0
-          : (
-              Number(
-                existingState
-                  ?.consecutive_failures ||
-                0
-              ) + 1
-            ),
-
-      lastPullAt:
-        new Date(),
-
-      lastSuccessAt:
-        success
-          ? new Date()
-          : (
-              existingState
-                ?.last_success_at ||
-              null
-            ),
-
-      lastError:
-        success
-          ? null
-          : String(
-              ackFailure
-                ?.message ||
-              "One or more Cloud events were rejected"
-            ).slice(
-              0,
-              2000
-            ),
-    },
+    patch:
+      finalPatch,
 
     pool,
   });
