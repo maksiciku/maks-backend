@@ -8,6 +8,65 @@ const { loadMembership } = require("../middleware/tenantMembership");
 const { getEffectivePrice } = require("./happyHourRoutes");
 
 const {
+  withTx,
+} = require("../dbCompat");
+
+const {
+  emitMenuCatalogSnapshotTx,
+} = require("../edge/contracts/menuCatalog");
+
+const {
+  MaksRuntimeRoleError,
+  assertCloudRuntime,
+} = require("../utils/runtimeRole");
+
+function sendMenuCatalogAuthorityError(res, error) {
+  if (!(error instanceof MaksRuntimeRoleError)) {
+    return false;
+  }
+
+  if (error.code === "MAKS_RUNTIME_ROLE_NOT_CLOUD") {
+    res.status(409).json({
+      error: "MENU_CATALOG_CLOUD_AUTHORITY_REQUIRED",
+    });
+    return true;
+  }
+
+  res.status(503).json({
+    error: "MENU_CATALOG_RUNTIME_ROLE_UNAVAILABLE",
+  });
+  return true;
+}
+
+function requireCloudMenuCatalogAuthority(req, res, next) {
+  try {
+    assertCloudRuntime();
+    next();
+  } catch (error) {
+    if (sendMenuCatalogAuthorityError(res, error)) {
+      return;
+    }
+    next(error);
+  }
+}
+
+async function requireOwnedCategoryTx(tx, rid, categoryId) {
+  const row = await tx.qGet(
+    `
+    SELECT id
+    FROM public.categories
+    WHERE restaurant_id = $1
+      AND id = $2
+    LIMIT 1
+    `,
+    [rid, categoryId]
+  );
+
+  return row || null;
+}
+
+
+const {
   saveMenuItemIngredientsAndRefreshNutrition,
 } = require("../utils/menuItemEngine");
 
@@ -258,124 +317,216 @@ router.post(
   ),
 
   requirePricingIfPresent,
+  requireCloudMenuCatalogAuthority,
 
   async (req, res) => {
-  try {
-    const rid = ridOf(req);
-    if (!rid) return res.status(400).json({ error: "No restaurant selected (missing rid)" });
+    try {
+      const rid = ridOf(req);
 
-const {
-  name,
-  price = 0,
-  vat_rate,
-  category_id = null,
-  options_schema = [],
-  ingredients = [],
-} = req.body || {};
-   const nm = String(name || "").trim();
-if (!nm) {
-  return res.status(400).json({
-    error: "name required",
-  });
-}
+      if (!rid) {
+        return res.status(400).json({
+          error:
+            "No restaurant selected (missing rid)",
+        });
+      }
 
+      const {
+        name,
+        price = 0,
+        vat_rate,
+        category_id = null,
+        options_schema = [],
+        ingredients = [],
+      } = req.body || {};
 
-    const cleanPrice = Number(price);
+      const nm =
+        String(name || "").trim();
 
-if (
-  !Number.isFinite(cleanPrice) ||
-  cleanPrice < 0
-) {
-  return res.status(400).json({
-    error:
-      "price must be a valid non-negative number",
-  });
-}
+      if (!nm) {
+        return res.status(400).json({
+          error: "name required",
+        });
+      }
 
-const vatRate =
-  normalizeVatRate(vat_rate);
+      const cleanPrice =
+        Number(price);
 
-const cleanOptionsSchema =
-  validateOptionsSchema(
-    options_schema
-  );
+      if (
+        !Number.isFinite(cleanPrice) ||
+        cleanPrice < 0
+      ) {
+        return res.status(400).json({
+          error:
+            "price must be a valid non-negative number",
+        });
+      }
 
-    let cid = category_id == null || category_id === "" ? null : Number(category_id);
+      const vatRate =
+        normalizeVatRate(vat_rate);
 
-    if (!cid) {
-      const def = await req.qGet(
-        `SELECT id FROM categories WHERE restaurant_id = $1 AND LOWER(type) LIKE 'dessert%' ORDER BY id ASC LIMIT 1`,
-        [rid]
-      );
-      if (!def?.id) return res.status(400).json({ error: "No dessert category exists. Create a dessert category first." });
-      cid = Number(def.id);
-    }
+      const cleanOptionsSchema =
+        validateOptionsSchema(
+          options_schema
+        );
 
-    const schemaStr =
-  JSON.stringify(
-    cleanOptionsSchema
-  );
-    const row = await req.qGet(
-  `
-  INSERT INTO public.menu_items (
-    restaurant_id,
-    name,
-    price,
-    vat_rate,
-    type,
-    category_id,
-    options_schema
-  )
-  VALUES (
-    $1,
-    $2,
-    $3,
-    $4,
-    'dessert',
-    $5,
-    $6
-  )
-  RETURNING *
-  `,
-  [
-    rid,
-    nm,
-    Number(
-      cleanPrice.toFixed(2)
-    ),
-    vatRate,
-    cid,
-    schemaStr,
-  ]
-);
+      const requestedCategoryId =
+        category_id == null ||
+        category_id === ""
+          ? null
+          : Number(category_id);
 
-    const refreshed = await saveMenuItemIngredientsAndRefreshNutrition(req, rid, row.id, ingredients);
+      const result =
+        await withTx(async (tx) => {
+          let cid =
+            requestedCategoryId;
 
-    res.status(201).json({
-      success: true,
-      item: refreshed.item || row,
-      total_cost: refreshed.total_cost,
-      allergens: refreshed.allergens,
-      calories: refreshed.calories,
-    });
-   } catch (e) {
-    console.error(
-      "❌ POST /desserts/items failed:",
-      e
-    );
+          if (cid) {
+            const ownedCategory =
+              await requireOwnedCategoryTx(
+                tx,
+                rid,
+                cid
+              );
 
-    const status =
-      Number(e?.status || 500);
+            if (!ownedCategory) {
+              return {
+                categoryNotFound: true,
+              };
+            }
+          } else {
+            const def =
+              await tx.qGet(
+                `
+                SELECT id
+                FROM public.categories
+                WHERE restaurant_id = $1
+                  AND LOWER(type) LIKE 'dessert%'
+                ORDER BY id ASC
+                LIMIT 1
+                `,
+                [rid]
+              );
 
-    return res
-      .status(status)
-      .json({
-        error:
-          status < 500
-            ? e.message
-            : "Failed to create dessert item",
+            if (!def?.id) {
+              return {
+                defaultCategoryMissing: true,
+              };
+            }
+
+            cid =
+              Number(def.id);
+          }
+
+          const row =
+            await tx.qGet(
+              `
+              INSERT INTO public.menu_items
+              (
+                restaurant_id,
+                name,
+                price,
+                vat_rate,
+                type,
+                category_id,
+                options_schema
+              )
+              VALUES
+              (
+                $1,
+                $2,
+                $3,
+                $4,
+                'dessert',
+                $5,
+                $6
+              )
+              RETURNING *
+              `,
+              [
+                rid,
+                nm,
+                Number(
+                  cleanPrice.toFixed(2)
+                ),
+                vatRate,
+                cid,
+                JSON.stringify(
+                  cleanOptionsSchema
+                ),
+              ]
+            );
+
+          const refreshed =
+            await saveMenuItemIngredientsAndRefreshNutrition(
+              tx,
+              rid,
+              row.id,
+              Array.isArray(ingredients)
+                ? ingredients
+                : []
+            );
+
+          await emitMenuCatalogSnapshotTx(
+            tx,
+            {
+              restaurantId:
+                rid,
+            }
+          );
+
+          return {
+            row,
+            refreshed,
+          };
+        });
+
+      if (result?.categoryNotFound) {
+        return res.status(404).json({
+          error:
+            "Dessert category not found",
+        });
+      }
+
+      if (result?.defaultCategoryMissing) {
+        return res.status(400).json({
+          error:
+            "No dessert category exists. Create a dessert category first.",
+        });
+      }
+
+      const refreshed =
+        result.refreshed;
+
+      return res.status(201).json({
+        success: true,
+        item:
+          refreshed.item ||
+          result.row,
+        total_cost:
+          refreshed.total_cost,
+        allergens:
+          refreshed.allergens,
+        calories:
+          refreshed.calories,
       });
-  }
+    } catch (e) {
+      console.error(
+        "❌ POST /desserts/items failed:",
+        e
+      );
+
+      const status =
+        Number(e?.status || 500);
+
+      return res
+        .status(status)
+        .json({
+          error:
+            status < 500
+              ? e.message
+              : "Failed to create dessert item",
+        });
+    }
   }
 );
 
@@ -465,31 +616,75 @@ router.delete(
     PERMISSIONS.MENU_DELETE
   ),
 
+  requireCloudMenuCatalogAuthority,
+
   async (req, res) => {
-  try {
-    const rid = ridOf(req);
-    const id = Number(req.params.id);
+    try {
+      const rid = ridOf(req);
+      const id = Number(req.params.id);
 
-    if (!rid) return res.status(400).json({ error: "Missing rid" });
-    if (!id) return res.status(400).json({ error: "Invalid id" });
+      if (!rid) {
+        return res.status(400).json({
+          error: "Missing rid",
+        });
+      }
 
-    const isPg = req.kind === "pg";
+      if (!id) {
+        return res.status(400).json({
+          error: "Invalid id",
+        });
+      }
 
-    const sql = isPg
-      ? `DELETE FROM public.menu_items WHERE id = $1 AND restaurant_id = $2 AND LOWER(TRIM(type))='dessert'`
-      : `DELETE FROM menu_items WHERE id = ? AND restaurant_id = ? AND LOWER(TRIM(type))='dessert'`;
+      const deleted =
+        await withTx(async (tx) => {
+          const row = await tx.qGet(
+            `
+            DELETE FROM public.menu_items
+            WHERE id = $1
+              AND restaurant_id = $2
+              AND LOWER(TRIM(type)) = 'dessert'
+            RETURNING id
+            `,
+            [id, rid]
+          );
 
-    const r = await req.qRun(sql, [id, rid]);
-    const changed = r?.changes ?? r?.rowCount ?? 0;
+          if (!row) {
+            return false;
+          }
 
-    if (!changed) return res.status(404).json({ error: "Dessert not found" });
+          await emitMenuCatalogSnapshotTx(
+            tx,
+            {
+              restaurantId: rid,
+            }
+          );
 
-    res.json({ success: true });
-  } catch (e) {
-    console.error("❌ DELETE /desserts/items/:id failed:", e);
-    res.status(500).json({ error: "Failed to delete dessert item" });
+          return true;
+        });
+
+      if (!deleted) {
+        return res.status(404).json({
+          error: "Dessert not found",
+        });
+      }
+
+      return res.json({
+        success: true,
+      });
+    } catch (e) {
+      console.error(
+        "❌ DELETE /desserts/items/:id failed:",
+        e
+      );
+
+      return res.status(500).json({
+        error:
+          "Failed to delete dessert item",
+      });
+    }
   }
-});
+);
+
 
 // ✅ PUT /desserts/items/:id
 router.put(
@@ -502,152 +697,303 @@ router.put(
   ),
 
   requirePricingIfPresent,
+  requireCloudMenuCatalogAuthority,
 
   async (req, res) => {
-  try {
-    const rid = ridOf(req);
-    const id = Number(req.params.id);
+    try {
+      const rid = ridOf(req);
+      const id = Number(req.params.id);
 
-    if (!rid) return res.status(400).json({ error: "Missing rid" });
-    if (!id) return res.status(400).json({ error: "Invalid id" });
+      if (!rid) {
+        return res.status(400).json({
+          error: "Missing rid",
+        });
+      }
 
-const {
-  name,
-  price,
-  vat_rate,
-  category_id,
-  options_schema,
-  out_of_stock,
-  photo_url,
-  ingredients,
-} = req.body || {};
+      if (!id) {
+        return res.status(400).json({
+          error: "Invalid id",
+        });
+      }
 
-    const sets = [];
-    const vals = [];
-    let i = 1;
+      const {
+        name,
+        price,
+        vat_rate,
+        category_id,
+        options_schema,
+        out_of_stock,
+        photo_url,
+        ingredients,
+      } = req.body || {};
 
-    const add = (col, val) => {
-      sets.push(`${col} = $${i++}`);
-      vals.push(val);
-    };
+      const sets = [];
+      const vals = [];
+      let i = 1;
 
-    if (name !== undefined) add("name", String(name || "").trim());
-if (price !== undefined) {
-  const cleanPrice =
-    Number(price);
+      const add = (col, val) => {
+        sets.push(`${col} = $${i++}`);
+        vals.push(val);
+      };
 
-  if (
-    !Number.isFinite(cleanPrice) ||
-    cleanPrice < 0
-  ) {
-    const err = new Error(
-      "price must be a valid non-negative number"
-    );
+      if (name !== undefined) {
+        add(
+          "name",
+          String(name || "").trim()
+        );
+      }
 
-    err.status = 400;
-    throw err;
-  }
+      if (price !== undefined) {
+        const cleanPrice =
+          Number(price);
 
-  add(
-    "price",
-    Number(
-      cleanPrice.toFixed(2)
-    )
-  );
-}
+        if (
+          !Number.isFinite(cleanPrice) ||
+          cleanPrice < 0
+        ) {
+          const err =
+            new Error(
+              "price must be a valid non-negative number"
+            );
 
-if (vat_rate !== undefined) {
-  add(
-    "vat_rate",
-    normalizeVatRate(
-      vat_rate
-    )
-  );
-}
-    if (category_id !== undefined) add("category_id", category_id === "" || category_id == null ? null : Number(category_id));
-if (options_schema !== undefined) {
-  const cleanSchema =
-    validateOptionsSchema(
-      options_schema || []
-    );
+          err.status = 400;
+          throw err;
+        }
 
-  add(
-    "options_schema",
-    JSON.stringify(
-      cleanSchema
-    )
-  );
-}
-    if (out_of_stock !== undefined) add("out_of_stock", !!out_of_stock);
-    if (photo_url !== undefined) add("photo_url", photo_url ? String(photo_url).trim() : null);
+        add(
+          "price",
+          Number(
+            cleanPrice.toFixed(2)
+          )
+        );
+      }
 
-    let updated = null;
+      if (vat_rate !== undefined) {
+        add(
+          "vat_rate",
+          normalizeVatRate(vat_rate)
+        );
+      }
 
-    if (sets.length) {
-      vals.push(id, rid);
+      const requestedCategoryId =
+        category_id === undefined
+          ? undefined
+          : category_id === "" ||
+            category_id == null
+            ? null
+            : Number(category_id);
 
-      updated = await req.qGet(
-        `
-        UPDATE public.menu_items
-        SET ${sets.join(", ")}
-        WHERE id = $${i++}
-          AND restaurant_id = $${i++}
-          AND LOWER(TRIM(type)) = 'dessert'
-        RETURNING *
-        `,
-        vals
-      );
+      if (category_id !== undefined) {
+        add(
+          "category_id",
+          requestedCategoryId
+        );
+      }
 
-      if (!updated) return res.status(404).json({ error: "Dessert not found" });
-    } else {
-      updated = await req.qGet(
-        `
-        SELECT *
-        FROM public.menu_items
-        WHERE id = $1
-          AND restaurant_id = $2
-          AND LOWER(TRIM(type)) = 'dessert'
-        LIMIT 1
-        `,
-        [id, rid]
-      );
+      if (options_schema !== undefined) {
+        const cleanSchema =
+          validateOptionsSchema(
+            options_schema || []
+          );
 
-      if (!updated) return res.status(404).json({ error: "Dessert not found" });
-    }
+        add(
+          "options_schema",
+          JSON.stringify(
+            cleanSchema
+          )
+        );
+      }
 
-    let refreshed = null;
+      if (out_of_stock !== undefined) {
+        add(
+          "out_of_stock",
+          !!out_of_stock
+        );
+      }
 
-    if (Array.isArray(ingredients)) {
-      refreshed = await saveMenuItemIngredientsAndRefreshNutrition(req, rid, id, ingredients);
-    }
+      if (photo_url !== undefined) {
+        add(
+          "photo_url",
+          photo_url
+            ? String(photo_url).trim()
+            : null
+        );
+      }
 
-    res.json({
-      success: true,
-      item: refreshed?.item || updated,
-      total_cost: refreshed?.total_cost,
-      allergens: refreshed?.allergens,
-      calories: refreshed?.calories,
-    });
-  } catch (e) {
-    console.error(
-      "❌ PUT /desserts/items/:id failed:",
-      e
-    );
+      const result =
+        await withTx(async (tx) => {
+          const current =
+            await tx.qGet(
+              `
+              SELECT *
+              FROM public.menu_items
+              WHERE id = $1
+                AND restaurant_id = $2
+                AND LOWER(TRIM(type)) = 'dessert'
+              LIMIT 1
+              `,
+              [id, rid]
+            );
 
-    const status =
-      Number(e?.status || 500);
+          if (!current) {
+            return {
+              notFound: true,
+            };
+          }
 
-    return res
-      .status(status)
-      .json({
-        error:
-          status < 500
-            ? e.message
-            : "Failed to update dessert item",
+          if (
+            requestedCategoryId !== undefined &&
+            requestedCategoryId !== null
+          ) {
+            const ownedCategory =
+              await requireOwnedCategoryTx(
+                tx,
+                rid,
+                requestedCategoryId
+              );
+
+            if (!ownedCategory) {
+              return {
+                categoryNotFound: true,
+              };
+            }
+          }
+
+          let updated =
+            current;
+
+          if (sets.length) {
+            const updateVals = [
+              ...vals,
+              id,
+              rid,
+            ];
+
+            const idParam = i++;
+            const ridParam = i++;
+
+            updated =
+              await tx.qGet(
+                `
+                UPDATE public.menu_items
+                SET ${sets.join(", ")}
+                WHERE id = $${idParam}
+                  AND restaurant_id = $${ridParam}
+                  AND LOWER(TRIM(type)) = 'dessert'
+                RETURNING *
+                `,
+                updateVals
+              );
+
+            if (!updated) {
+              return {
+                notFound: true,
+              };
+            }
+          }
+
+          let refreshed = null;
+
+          if (
+            Array.isArray(
+              ingredients
+            )
+          ) {
+            refreshed =
+              await saveMenuItemIngredientsAndRefreshNutrition(
+                tx,
+                rid,
+                id,
+                ingredients
+              );
+          }
+
+          const finalItem =
+            await tx.qGet(
+              `
+              SELECT *
+              FROM public.menu_items
+              WHERE id = $1
+                AND restaurant_id = $2
+                AND LOWER(TRIM(type)) = 'dessert'
+              LIMIT 1
+              `,
+              [id, rid]
+            );
+
+          if (
+            sets.length ||
+            Array.isArray(
+              ingredients
+            )
+          ) {
+            await emitMenuCatalogSnapshotTx(
+              tx,
+              {
+                restaurantId:
+                  rid,
+              }
+            );
+          }
+
+          return {
+            item:
+              refreshed?.item ||
+              finalItem ||
+              updated,
+            refreshed,
+          };
+        });
+
+      if (result?.notFound) {
+        return res.status(404).json({
+          error:
+            "Dessert not found",
+        });
+      }
+
+      if (result?.categoryNotFound) {
+        return res.status(404).json({
+          error:
+            "Dessert category not found",
+        });
+      }
+
+      return res.json({
+        success: true,
+        item:
+          result.item,
+        total_cost:
+          result.refreshed
+            ?.total_cost,
+        allergens:
+          result.refreshed
+            ?.allergens,
+        calories:
+          result.refreshed
+            ?.calories,
       });
-  }
+    } catch (e) {
+      console.error(
+        "❌ PUT /desserts/items/:id failed:",
+        e
+      );
+
+      const status =
+        Number(e?.status || 500);
+
+      return res
+        .status(status)
+        .json({
+          error:
+            status < 500
+              ? e.message
+              : "Failed to update dessert item",
+        });
+    }
   }
 );
+
 
 // GET /desserts/items/:id/ingredients
 router.get("/items/:id/ingredients", authenticateToken, loadMembership, async (req, res) => {

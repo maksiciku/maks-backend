@@ -6,6 +6,65 @@ const { authenticateToken } = require("../middleware/authMiddleware");
 const { loadMembership } = require("../middleware/tenantMembership");
 
 const { getEffectivePrice } = require("./happyHourRoutes");
+
+const {
+  withTx,
+} = require("../dbCompat");
+
+const {
+  emitMenuCatalogSnapshotTx,
+} = require("../edge/contracts/menuCatalog");
+
+const {
+  MaksRuntimeRoleError,
+  assertCloudRuntime,
+} = require("../utils/runtimeRole");
+
+function sendMenuCatalogAuthorityError(res, error) {
+  if (!(error instanceof MaksRuntimeRoleError)) {
+    return false;
+  }
+
+  if (error.code === "MAKS_RUNTIME_ROLE_NOT_CLOUD") {
+    res.status(409).json({
+      error: "MENU_CATALOG_CLOUD_AUTHORITY_REQUIRED",
+    });
+    return true;
+  }
+
+  res.status(503).json({
+    error: "MENU_CATALOG_RUNTIME_ROLE_UNAVAILABLE",
+  });
+  return true;
+}
+
+function requireCloudMenuCatalogAuthority(req, res, next) {
+  try {
+    assertCloudRuntime();
+    next();
+  } catch (error) {
+    if (sendMenuCatalogAuthorityError(res, error)) {
+      return;
+    }
+    next(error);
+  }
+}
+
+async function requireOwnedCategoryTx(tx, rid, categoryId) {
+  const row = await tx.qGet(
+    `
+    SELECT id
+    FROM public.categories
+    WHERE restaurant_id = $1
+      AND id = $2
+    LIMIT 1
+    `,
+    [rid, categoryId]
+  );
+
+  return row || null;
+}
+
 const {
   PERMISSIONS,
   requirePermission,
@@ -432,124 +491,193 @@ router.get("/sales-analytics", authenticateToken, loadMembership, async (req, re
   ),
 
   requirePricingIfPresent,
+  requireCloudMenuCatalogAuthority,
 
   async (req, res) => {
-  try {
-    const rid = ridOf(req);
-    if (!rid) return res.status(400).json({ error: "Missing rid" });
-
-    const nm = String(req.body?.name || "").trim();
-    if (!nm) return res.status(400).json({ error: "name required" });
-
-    const price = Number(req.body?.price || 0);
-
-    if (
-  !Number.isFinite(price) ||
-  price < 0
-) {
-  return res.status(400).json({
-    error:
-      "price must be a valid non-negative number",
-  });
-}
-
-const vatRate =
-  normalizeVatRate(
-    req.body?.vat_rate
-  );
-
-const cleanOptionsSchema =
-  validateOptionsSchema(
-    req.body?.options_schema || []
-  );
-
-    const ingredients = Array.isArray(req.body?.ingredients) ? req.body.ingredients : [];
-
-    let category_id =
-      req.body?.category_id == null || req.body?.category_id === ""
-        ? null
-        : Number(req.body.category_id);
-
-const options_schema =
-  JSON.stringify(
-    cleanOptionsSchema
-  );
-
-    if (!category_id) {
-      const def = await req.qGet(
-        `
-        SELECT id
-        FROM categories
-        WHERE restaurant_id = $1
-          AND LOWER(type) LIKE 'drink%'
-        ORDER BY id ASC
-        LIMIT 1
-        `,
-        [rid]
-      );
-
-      if (!def?.id) {
+    try {
+      const rid = ridOf(req);
+      if (!rid) {
         return res.status(400).json({
-          error: "No drink category exists. Create a drink category first.",
+          error: "Missing rid",
         });
       }
 
-      category_id = Number(def.id);
+      const nm = String(req.body?.name || "").trim();
+      if (!nm) {
+        return res.status(400).json({
+          error: "name required",
+        });
+      }
+
+      const price = Number(req.body?.price || 0);
+
+      if (!Number.isFinite(price) || price < 0) {
+        return res.status(400).json({
+          error: "price must be a valid non-negative number",
+        });
+      }
+
+      const vatRate = normalizeVatRate(
+        req.body?.vat_rate
+      );
+
+      const cleanOptionsSchema =
+        validateOptionsSchema(
+          req.body?.options_schema || []
+        );
+
+      const ingredients =
+        Array.isArray(req.body?.ingredients)
+          ? req.body.ingredients
+          : [];
+
+      const requestedCategoryId =
+        req.body?.category_id == null ||
+        req.body?.category_id === ""
+          ? null
+          : Number(req.body.category_id);
+
+      const result = await withTx(async (tx) => {
+        let categoryId = requestedCategoryId;
+
+        if (categoryId) {
+          const ownedCategory =
+            await requireOwnedCategoryTx(
+              tx,
+              rid,
+              categoryId
+            );
+
+          if (!ownedCategory) {
+            return {
+              categoryNotFound: true,
+            };
+          }
+        } else {
+          const def = await tx.qGet(
+            `
+            SELECT id
+            FROM public.categories
+            WHERE restaurant_id = $1
+              AND LOWER(type) LIKE 'drink%'
+            ORDER BY id ASC
+            LIMIT 1
+            `,
+            [rid]
+          );
+
+          if (!def?.id) {
+            return {
+              defaultCategoryMissing: true,
+            };
+          }
+
+          categoryId = Number(def.id);
+        }
+
+        const row = await tx.qGet(
+          `
+          INSERT INTO public.menu_items
+          (
+            restaurant_id,
+            name,
+            price,
+            vat_rate,
+            type,
+            category_id,
+            options_schema
+          )
+          VALUES
+          (
+            $1,
+            $2,
+            $3,
+            $4,
+            'drink',
+            $5,
+            $6
+          )
+          RETURNING *
+          `,
+          [
+            rid,
+            nm,
+            Number(price.toFixed(2)),
+            vatRate,
+            categoryId,
+            JSON.stringify(cleanOptionsSchema),
+          ]
+        );
+
+        const nutrition =
+          await saveMenuItemIngredientsAndRefreshNutrition(
+            tx,
+            rid,
+            row.id,
+            ingredients
+          );
+
+        const finalItem = await tx.qGet(
+          `
+          SELECT *
+          FROM public.menu_items
+          WHERE restaurant_id = $1
+            AND id = $2
+          LIMIT 1
+          `,
+          [rid, row.id]
+        );
+
+        await emitMenuCatalogSnapshotTx(
+          tx,
+          {
+            restaurantId: rid,
+          }
+        );
+
+        return {
+          item: finalItem || row,
+          nutrition,
+        };
+      });
+
+      if (result?.categoryNotFound) {
+        return res.status(404).json({
+          error: "Drink category not found",
+        });
+      }
+
+      if (result?.defaultCategoryMissing) {
+        return res.status(400).json({
+          error:
+            "No drink category exists. Create a drink category first.",
+        });
+      }
+
+      return res.status(201).json({
+        success: true,
+        item: result.item,
+        nutrition: result.nutrition,
+      });
+    } catch (e) {
+      console.error(
+        "❌ POST /drinks/items failed:",
+        e
+      );
+
+      const status =
+        Number(e?.status || 500);
+
+      return res
+        .status(status)
+        .json({
+          error:
+            status < 500
+              ? e.message
+              : "Failed to create drink item",
+        });
     }
-
-    const row = await req.qGet(
-      `
-      INSERT INTO public.menu_items (
-  restaurant_id,
-  name,
-  price,
-  vat_rate,
-  type,
-  category_id,
-  options_schema
-)
-VALUES (
-  $1,
-  $2,
-  $3,
-  $4,
-  'drink',
-  $5,
-  $6
-)
-      RETURNING *
-      `,
-[
-  rid,
-  nm,
-  Number(price.toFixed(2)),
-  vatRate,
-  category_id,
-  options_schema,
-]
-    );
-
-const nutrition = await saveMenuItemIngredientsAndRefreshNutrition(req, rid, row.id, ingredients);
-    const finalItem = await req.qGet(
-      `
-      SELECT *
-      FROM public.menu_items
-      WHERE restaurant_id = $1 AND id = $2
-      LIMIT 1
-      `,
-      [rid, row.id]
-    );
-
-    return res.status(201).json({
-      success: true,
-      item: finalItem || row,
-      nutrition,
-    });
-  } catch (e) {
-    console.error("❌ POST /drinks/items failed:", e);
-    return res.status(500).json({ error: "Failed to create drink item" });
   }
-}
 );
 
 // ✅ GET /drinks/items?category_id=123
@@ -645,138 +773,269 @@ router.put(
   ),
 
   requirePricingIfPresent,
+  requireCloudMenuCatalogAuthority,
 
   async (req, res) => {
-  try {
-    const rid = ridOf(req);
-    const id = Number(req.params.id);
+    try {
+      const rid = ridOf(req);
+      const id = Number(req.params.id);
 
-    if (!rid) return res.status(400).json({ error: "Missing rid" });
-    if (!id) return res.status(400).json({ error: "Invalid id" });
+      if (!rid) {
+        return res.status(400).json({
+          error: "Missing rid",
+        });
+      }
 
-    const {
-      name,
-      price,
+      if (!id) {
+        return res.status(400).json({
+          error: "Invalid id",
+        });
+      }
+
+      const {
+        name,
+        price,
         vat_rate,
-      category_id,
-      options_schema,
-      photo_url,
-      out_of_stock,
-      ingredients,
-    } = req.body || {};
+        category_id,
+        options_schema,
+        photo_url,
+        out_of_stock,
+        ingredients,
+      } = req.body || {};
 
-    const sets = [];
-    const vals = [];
+      const sets = [];
+      const vals = [];
+      let i = 1;
 
-    const add = (col, val) => {
-      sets.push(`${col} = ?`);
-      vals.push(val);
-    };
+      const add = (col, val) => {
+        sets.push(`${col} = $${i++}`);
+        vals.push(val);
+      };
 
-    if (name !== undefined) add("name", String(name || "").trim());
-if (price !== undefined) {
-  const cleanPrice =
-    Number(price);
+      if (name !== undefined) {
+        add(
+          "name",
+          String(name || "").trim()
+        );
+      }
 
-  if (
-    !Number.isFinite(cleanPrice) ||
-    cleanPrice < 0
-  ) {
-    const err =
-      new Error(
-        "price must be a valid non-negative number"
+      if (price !== undefined) {
+        const cleanPrice = Number(price);
+
+        if (
+          !Number.isFinite(cleanPrice) ||
+          cleanPrice < 0
+        ) {
+          const err = new Error(
+            "price must be a valid non-negative number"
+          );
+          err.status = 400;
+          throw err;
+        }
+
+        add(
+          "price",
+          Number(cleanPrice.toFixed(2))
+        );
+      }
+
+      if (vat_rate !== undefined) {
+        add(
+          "vat_rate",
+          normalizeVatRate(vat_rate)
+        );
+      }
+
+      const requestedCategoryId =
+        category_id === undefined
+          ? undefined
+          : category_id === "" ||
+            category_id == null
+            ? null
+            : Number(category_id);
+
+      if (category_id !== undefined) {
+        add(
+          "category_id",
+          requestedCategoryId
+        );
+      }
+
+      if (photo_url !== undefined) {
+        add(
+          "photo_url",
+          photo_url
+            ? String(photo_url).trim()
+            : null
+        );
+      }
+
+      if (out_of_stock !== undefined) {
+        add(
+          "out_of_stock",
+          !!out_of_stock
+        );
+      }
+
+      if (options_schema !== undefined) {
+        const cleanSchema =
+          validateOptionsSchema(
+            options_schema || []
+          );
+
+        add(
+          "options_schema",
+          JSON.stringify(cleanSchema)
+        );
+      }
+
+      const result = await withTx(async (tx) => {
+        const current = await tx.qGet(
+          `
+          SELECT *
+          FROM public.menu_items
+          WHERE restaurant_id = $1
+            AND id = $2
+            AND LOWER(TRIM(type)) IN ('drink', 'drinks')
+          LIMIT 1
+          `,
+          [rid, id]
+        );
+
+        if (!current) {
+          return {
+            notFound: true,
+          };
+        }
+
+        if (
+          requestedCategoryId !== undefined &&
+          requestedCategoryId !== null
+        ) {
+          const ownedCategory =
+            await requireOwnedCategoryTx(
+              tx,
+              rid,
+              requestedCategoryId
+            );
+
+          if (!ownedCategory) {
+            return {
+              categoryNotFound: true,
+            };
+          }
+        }
+
+        let updated = current;
+
+        if (sets.length) {
+          const updateVals = [
+            ...vals,
+            id,
+            rid,
+          ];
+
+          const idParam = i++;
+          const ridParam = i++;
+
+          updated = await tx.qGet(
+            `
+            UPDATE public.menu_items
+            SET ${sets.join(", ")}
+            WHERE id = $${idParam}
+              AND restaurant_id = $${ridParam}
+              AND LOWER(TRIM(type)) IN ('drink', 'drinks')
+            RETURNING *
+            `,
+            updateVals
+          );
+
+          if (!updated) {
+            return {
+              notFound: true,
+            };
+          }
+        }
+
+        let nutrition = null;
+
+        if (Array.isArray(ingredients)) {
+          nutrition =
+            await saveMenuItemIngredientsAndRefreshNutrition(
+              tx,
+              rid,
+              id,
+              ingredients
+            );
+        }
+
+        const finalItem = await tx.qGet(
+          `
+          SELECT *
+          FROM public.menu_items
+          WHERE restaurant_id = $1
+            AND id = $2
+            AND LOWER(TRIM(type)) IN ('drink', 'drinks')
+          LIMIT 1
+          `,
+          [rid, id]
+        );
+
+        if (
+          sets.length ||
+          Array.isArray(ingredients)
+        ) {
+          await emitMenuCatalogSnapshotTx(
+            tx,
+            {
+              restaurantId: rid,
+            }
+          );
+        }
+
+        return {
+          item: finalItem || updated,
+          nutrition,
+        };
+      });
+
+      if (result?.notFound) {
+        return res.status(404).json({
+          error: "Drink item not found",
+        });
+      }
+
+      if (result?.categoryNotFound) {
+        return res.status(404).json({
+          error: "Drink category not found",
+        });
+      }
+
+      return res.json({
+        success: true,
+        item: result.item,
+      });
+    } catch (e) {
+      console.error(
+        "❌ PUT /drinks/items/:id failed:",
+        e
       );
 
-    err.status = 400;
-    throw err;
+      const status =
+        Number(e?.status || 500);
+
+      return res
+        .status(status)
+        .json({
+          error:
+            status < 500
+              ? e.message
+              : "Failed to update drink item",
+        });
+    }
   }
+);
 
-  add(
-    "price",
-    Number(
-      cleanPrice.toFixed(2)
-    )
-  );
-}
-
-if (vat_rate !== undefined) {
-  add(
-    "vat_rate",
-    normalizeVatRate(
-      vat_rate
-    )
-  );
-}    
-    if (category_id !== undefined) {
-      add("category_id", category_id === "" || category_id == null ? null : Number(category_id));
-    }
-    if (photo_url !== undefined) add("photo_url", photo_url ? String(photo_url).trim() : null);
-    if (out_of_stock !== undefined) add("out_of_stock", !!out_of_stock);
-
-    if (options_schema !== undefined) {
-  const cleanSchema =
-    validateOptionsSchema(
-      options_schema || []
-    );
-
-  add(
-    "options_schema",
-    JSON.stringify(
-      cleanSchema
-    )
-  );
-}
-
-    if (sets.length) {
-      vals.push(id, rid);
-
-      const r = await req.qRun(
-        `
-        UPDATE menu_items
-        SET ${sets.join(", ")}
-        WHERE id = ?
-          AND restaurant_id = ?
-          AND LOWER(TRIM(type)) IN ('drink', 'drinks')
-        `,
-        vals
-      );
-
-      const changed = r?.rowCount ?? r?.changes ?? 0;
-      if (!changed) return res.status(404).json({ error: "Drink item not found" });
-    }
-
-    if (Array.isArray(ingredients)) {
-await saveMenuItemIngredientsAndRefreshNutrition(req, rid, id, ingredients);    }
-
-    const updated = await req.qGet(
-      `
-      SELECT *
-      FROM menu_items
-      WHERE id = ?
-        AND restaurant_id = ?
-        AND LOWER(TRIM(type)) IN ('drink', 'drinks')
-      LIMIT 1
-      `,
-      [id, rid]
-    );
-
-    res.json({ success: true, item: updated });
-  } catch (e) {
-    console.error("❌ PUT /drinks/items/:id failed:", e);
-const status =
-  Number(e?.status || 500);
-
-return res
-  .status(status)
-  .json({
-    error:
-      status < 500
-        ? e.message
-        : "Failed to create drink item",
-  });
-
-}
-});
 // ✅ DELETE /drinks/items/:id
 router.delete(
   "/items/:id",
@@ -787,29 +1046,76 @@ router.delete(
     PERMISSIONS.MENU_DELETE
   ),
 
+  requireCloudMenuCatalogAuthority,
+
   async (req, res) => {
-  try {
-    const rid = ridOf(req);
-    const id = Number(req.params.id);
+    try {
+      const rid = ridOf(req);
+      const id = Number(req.params.id);
 
-    if (!rid) return res.status(400).json({ error: "No restaurant selected (missing rid)" });
-    if (!id) return res.status(400).json({ error: "Invalid id" });
+      if (!rid) {
+        return res.status(400).json({
+          error:
+            "No restaurant selected (missing rid)",
+        });
+      }
 
-    const r = await req.qRun(
-      `DELETE FROM menu_items WHERE id = ${p(req, 1)} AND restaurant_id = ${p(req, 2)} AND LOWER(type) = 'drink'`,
-      [id, rid]
-    );
+      if (!id) {
+        return res.status(400).json({
+          error: "Invalid id",
+        });
+      }
 
-    const changed = r?.rowCount ?? r?.changes ?? 0;
-    if (!changed) return res.status(404).json({ error: "Drink item not found" });
+      const deleted =
+        await withTx(async (tx) => {
+          const row = await tx.qGet(
+            `
+            DELETE FROM public.menu_items
+            WHERE id = $1
+              AND restaurant_id = $2
+              AND LOWER(TRIM(type)) = 'drink'
+            RETURNING id
+            `,
+            [id, rid]
+          );
 
-    res.json({ success: true });
-  } catch (e) {
-    console.error("❌ DELETE /drinks/items/:id failed:", e);
-    res.status(500).json({ error: "Failed to delete drink item" });
+          if (!row) {
+            return false;
+          }
+
+          await emitMenuCatalogSnapshotTx(
+            tx,
+            {
+              restaurantId: rid,
+            }
+          );
+
+          return true;
+        });
+
+      if (!deleted) {
+        return res.status(404).json({
+          error: "Drink item not found",
+        });
+      }
+
+      return res.json({
+        success: true,
+      });
+    } catch (e) {
+      console.error(
+        "❌ DELETE /drinks/items/:id failed:",
+        e
+      );
+
+      return res.status(500).json({
+        error:
+          "Failed to delete drink item",
+      });
+    }
   }
-}
 );
+
 
 router.get("/items/:id/ingredients", authenticateToken, loadMembership, async (req, res) => {
   try {
