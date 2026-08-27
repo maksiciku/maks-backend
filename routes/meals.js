@@ -20,6 +20,88 @@ const {
   kind,
   withTx,
 } = require("../dbCompat");
+
+const {
+  MaksRuntimeRoleError,
+  assertCloudRuntime,
+} = require(
+  "../utils/runtimeRole"
+);
+
+const {
+  emitMenuCatalogSnapshotTx,
+} = require(
+  "../edge/contracts/menuCatalog"
+);
+
+
+function sendMealAuthorityError(
+  res,
+  error
+) {
+  if (
+    !(
+      error instanceof
+        MaksRuntimeRoleError
+    )
+  ) {
+    return false;
+  }
+
+  if (
+    error.code ===
+      "MAKS_RUNTIME_ROLE_NOT_CLOUD"
+  ) {
+    res.status(409).json({
+      error:
+        "Meal changes must be made through MAKS Cloud.",
+
+      code:
+        "MENU_CATALOG_CLOUD_AUTHORITY_REQUIRED",
+    });
+
+    return true;
+  }
+
+  res.status(503).json({
+    error:
+      "Meal changes are temporarily unavailable because the MAKS runtime role is not configured correctly.",
+
+    code:
+      "MENU_CATALOG_RUNTIME_ROLE_UNAVAILABLE",
+  });
+
+  return true;
+}
+
+
+function requireCloudMealAuthority(
+  req,
+  res,
+  next
+) {
+  try {
+    assertCloudRuntime();
+
+    return next();
+  } catch (
+    error
+  ) {
+    if (
+      sendMealAuthorityError(
+        res,
+        error
+      )
+    ) {
+      return;
+    }
+
+    return next(
+      error
+    );
+  }
+}
+
 const ridOf = (req) => Number(req.tenantRid || req.user?.restaurant_id || 0);
 const { getMealPortionsLeft } = require("../utils/novaDeduct");
 
@@ -1053,6 +1135,14 @@ availability.manually_stopped,
               mealId
             );
 
+          await emitMenuCatalogSnapshotTx(
+            tx,
+            {
+              restaurantId:
+                rid,
+            }
+          );
+
           return {
             mealId,
             nutrition,
@@ -1116,6 +1206,15 @@ manually_stopped:
 
       });
   } catch (e) {
+    if (
+      sendMealAuthorityError(
+        res,
+        e
+      )
+    ) {
+      return;
+    }
+
     console.error(
       "❌ POST /meals failed:",
       e
@@ -1153,6 +1252,8 @@ router.post(
   requirePermission(
     PERMISSIONS.MENU_CREATE
   ),
+
+  requireCloudMealAuthority,
 
   requirePricingIfPresent,
 
@@ -1456,6 +1557,8 @@ router.put(
   requirePermission(
     PERMISSIONS.MENU_EDIT
   ),
+
+  requireCloudMealAuthority,
 
   requirePricingIfPresent,
 
@@ -1969,6 +2072,24 @@ out_of_stock
                 ]
               );
 
+            const catalogueChanged =
+              sets.length >
+                0 ||
+              ingredients !==
+                undefined;
+
+            if (
+              catalogueChanged
+            ) {
+              await emitMenuCatalogSnapshotTx(
+                tx,
+                {
+                  restaurantId:
+                    rid,
+                }
+              );
+            }
+
             return {
               updated,
               nutrition,
@@ -1992,6 +2113,15 @@ out_of_stock
         },
       });
     } catch (e) {
+      if (
+        sendMealAuthorityError(
+          res,
+          e
+        )
+      ) {
+        return;
+      }
+
       console.error(
         "❌ PUT /meals/:id failed:",
         e
@@ -2026,24 +2156,123 @@ router.delete(
     PERMISSIONS.MENU_DELETE
   ),
 
+  requireCloudMealAuthority,
+
   async (req, res) => {
-  try {
-    const rid = req.tenantRid;
-    const id  = Number(req.params.id);
+    try {
+      const rid =
+        Number(
+          req.tenantRid ||
+          0
+        );
 
-    const r = await qRun(
-      `DELETE FROM meals WHERE id = ? AND restaurant_id = ?`,
-      [id, rid]
-    );
+      const id =
+        Number(
+          req.params.id
+        );
 
-    if (!r.changes) return res.status(404).json({ error: 'Meal not found' });
+      if (
+        !rid
+      ) {
+        return res
+          .status(401)
+          .json({
+            error:
+              "Missing restaurant context",
+          });
+      }
 
-    res.json({ success: true });
-  } catch (e) {
-    console.error('❌ DELETE /meals/:id failed:', e.message);
-    res.status(500).json({ error: 'Failed to delete meal' });
+      if (
+        !Number.isSafeInteger(
+          id
+        ) ||
+        id <= 0
+      ) {
+        return res
+          .status(400)
+          .json({
+            error:
+              "Invalid meal id",
+          });
+      }
+
+      const deleted =
+        await withTx(
+          async (tx) => {
+            const row =
+              await tx.qGet(
+                `
+                DELETE FROM
+                  public.meals
+                WHERE
+                  id = $1
+                  AND restaurant_id = $2
+                RETURNING
+                  id
+                `,
+                [
+                  id,
+                  rid,
+                ]
+              );
+
+            if (
+              row?.id
+            ) {
+              await emitMenuCatalogSnapshotTx(
+                tx,
+                {
+                  restaurantId:
+                    rid,
+                }
+              );
+            }
+
+            return row;
+          }
+        );
+
+      if (
+        !deleted?.id
+      ) {
+        return res
+          .status(404)
+          .json({
+            error:
+              "Meal not found",
+          });
+      }
+
+      return res.json({
+        success:
+          true,
+      });
+    } catch (
+      error
+    ) {
+      if (
+        sendMealAuthorityError(
+          res,
+          error
+        )
+      ) {
+        return;
+      }
+
+      console.error(
+        "❌ DELETE /meals/:id failed:",
+        error
+      );
+
+      return res
+        .status(500)
+        .json({
+          error:
+            "Failed to delete meal",
+        });
+    }
   }
-});
+);
 
 // GET /meals/:id/ingredients
 router.get('/:id/ingredients', async (req, res) => {
