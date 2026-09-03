@@ -4,7 +4,7 @@ const router = express.Router();
 const {
   authenticateToken,
 } = require("../middleware/authMiddleware");
-const { qAll, qGet, qRun, kind } = require("../dbCompat");
+const { qAll, qGet, qRun, withTx, kind } = require("../dbCompat");
 const { loadMembership } = require("../middleware/tenantMembership");
 
 const {
@@ -12,6 +12,14 @@ const {
   requirePermission,
 } = require(
   "../middleware/accessControl"
+);
+
+const {
+  emitKdsBatchSnapshotTx,
+  emitKdsKitchenSnapshotTx,
+  isKdsEdgeProducerRuntime,
+} = require(
+  "../edge/contracts/kdsOperations"
 );
 
 router.use(authenticateToken);
@@ -111,6 +119,45 @@ function requireItemStatePermission(
   return requirePermission(
     permission
   )(req, res, next);
+}
+
+async function emitKdsBatchIfEdge(
+  tx,
+  restaurantId,
+  batchId
+) {
+  if (
+    !isKdsEdgeProducerRuntime()
+  ) {
+    return null;
+  }
+
+  return emitKdsBatchSnapshotTx(
+    tx,
+    {
+      restaurantId,
+      batchId,
+    }
+  );
+}
+
+
+async function emitKdsKitchenIfEdge(
+  tx,
+  restaurantId
+) {
+  if (
+    !isKdsEdgeProducerRuntime()
+  ) {
+    return null;
+  }
+
+  return emitKdsKitchenSnapshotTx(
+    tx,
+    {
+      restaurantId,
+    }
+  );
 }
 
 /**
@@ -422,34 +469,6 @@ router.post(
         });
       }
 
-      /*
-       * SECURITY BOUNDARY
-       *
-       * A syntactically valid UUID is NOT enough.
-       *
-       * The batch must actually belong to the
-       * authenticated restaurant.
-       */
-      const ownedBatch = await qGet(
-  `
-  SELECT id
-  FROM public.order_batches
-  WHERE restaurant_id = $1
-    AND id = $2::uuid
-  LIMIT 1
-  `,
-  [
-    rid,
-    batchId,
-  ]
-);
-
-if (!ownedBatch) {
-  return res.status(404).json({
-    error: "KDS batch not found",
-  });
-}
-
       const stationKeyRaw =
         req.headers["x-station-key"] ||
         req.query.station ||
@@ -473,11 +492,15 @@ if (!ownedBatch) {
           .filter(Boolean);
 
       const stationKeys =
-        many.length
-          ? many
-          : one
-            ? [one]
-            : [];
+        Array.from(
+          new Set(
+            many.length
+              ? many
+              : one
+                ? [one]
+                : []
+          )
+        );
 
       if (!stationKeys.length) {
         return res.status(400).json({
@@ -486,43 +509,110 @@ if (!ownedBatch) {
         });
       }
 
-      for (const sk of stationKeys) {
-        await qRun(
-          `
-          INSERT INTO public.kds_station_ack (
-            restaurant_id,
-            device_id,
-            batch_id,
-            station_key
-          )
-          VALUES (
-            $1,
-            $2,
-            $3::uuid,
-            $4
-          )
-          ON CONFLICT (
-            restaurant_id,
-            device_id,
-            batch_id,
-            station_key
-          )
-          DO UPDATE SET
-            acked_at = now()
-          `,
-          [
-            rid,
-            deviceId,
-            batchId,
-            sk,
-          ]
+      const operation =
+        await withTx(
+          async (tx) => {
+            /*
+             * SECURITY BOUNDARY:
+             * resolve ownership inside the same
+             * transaction that writes KDS state.
+             */
+            const ownedBatch =
+              await tx.qGet(
+                `
+                SELECT id
+                FROM public.order_batches
+                WHERE
+                  restaurant_id = $1
+                  AND id = $2::uuid
+                LIMIT 1
+                `,
+                [
+                  rid,
+                  batchId,
+                ]
+              );
+
+            if (
+              !ownedBatch
+            ) {
+              return {
+                owned:
+                  false,
+                sync:
+                  null,
+              };
+            }
+
+            for (
+              const sk of
+              stationKeys
+            ) {
+              await tx.qRun(
+                `
+                INSERT INTO public.kds_station_ack (
+                  restaurant_id,
+                  device_id,
+                  batch_id,
+                  station_key
+                )
+                VALUES (
+                  $1,
+                  $2,
+                  $3::uuid,
+                  $4
+                )
+                ON CONFLICT (
+                  restaurant_id,
+                  device_id,
+                  batch_id,
+                  station_key
+                )
+                DO UPDATE SET
+                  acked_at = now()
+                `,
+                [
+                  rid,
+                  deviceId,
+                  batchId,
+                  sk,
+                ]
+              );
+            }
+
+            const sync =
+              await emitKdsBatchIfEdge(
+                tx,
+                rid,
+                batchId
+              );
+
+            return {
+              owned:
+                true,
+              sync,
+            };
+          }
         );
+
+      if (
+        !operation.owned
+      ) {
+        return res.status(404).json({
+          error:
+            "KDS batch not found",
+        });
       }
 
       return res.json({
         success: true,
         batchId,
         stationKeys,
+        edge_revision:
+          operation
+            .sync
+            ?.revision ??
+          null,
       });
     } catch (e) {
       console.error(
@@ -578,9 +668,6 @@ router.post(
           ? req.body.rows
           : [];
 
-      /*
-       * Collect only syntactically valid UUIDs.
-       */
       const requestedBatchIds =
         Array.from(
           new Set(
@@ -600,126 +687,174 @@ router.post(
         return res.json({
           success: true,
           processed: 0,
+          synced_batches: [],
         });
       }
 
-      /*
-       * SECURITY BOUNDARY
-       *
-       * Never create ACK state merely because
-       * the browser supplied a valid UUID.
-       *
-       * Resolve batch ownership from PostgreSQL.
-       */
-      const ownedRows =
-        await qAll(
-          `
-          SELECT id
-          FROM public.order_batches
-          WHERE restaurant_id = $1
-            AND id =
-              ANY($2::uuid[])
-          `,
-          [
-            rid,
-            requestedBatchIds,
-          ]
-        );
+      const operation =
+        await withTx(
+          async (tx) => {
+            const ownedRows =
+              await tx.qAll(
+                `
+                SELECT id
+                FROM public.order_batches
+                WHERE restaurant_id = $1
+                  AND id =
+                    ANY($2::uuid[])
+                `,
+                [
+                  rid,
+                  requestedBatchIds,
+                ]
+              );
 
-      const ownedBatchIds =
-        new Set(
-          (ownedRows || []).map(
-            (row) =>
-              String(row.id)
-          )
-        );
+            const ownedBatchIds =
+              new Set(
+                (ownedRows || [])
+                  .map(
+                    (row) =>
+                      String(
+                        row.id
+                      )
+                  )
+              );
 
-      let processed = 0;
+            let processed = 0;
 
-      for (const r of rows) {
-        const batchId =
-          String(
-            r?.batch_id || ""
-          ).trim();
+            const touchedBatchIds =
+              new Set();
 
-        if (
-          !isUuid(batchId)
-        ) {
-          continue;
-        }
+            for (
+              const r of
+              rows
+            ) {
+              const batchId =
+                String(
+                  r?.batch_id || ""
+                ).trim();
 
-        /*
-         * Foreign/nonexistent batches are ignored.
-         * Most importantly: no state is written.
-         */
-        if (
-          !ownedBatchIds.has(
-            batchId
-          )
-        ) {
-          continue;
-        }
-
-        const stations =
-          Array.isArray(
-            r?.stations
-          )
-            ? r.stations
-            : [];
-
-        const normalizedStations =
-          Array.from(
-            new Set(
-              stations
-                .map(
-                  normalizeStationKey
+              if (
+                !isUuid(
+                  batchId
+                ) ||
+                !ownedBatchIds.has(
+                  batchId
                 )
-                .filter(Boolean)
-            )
-          );
+              ) {
+                continue;
+              }
 
-        for (
-          const stationKey
-          of normalizedStations
-        ) {
-          await qRun(
-            `
-            INSERT INTO public.kds_station_ack (
-              restaurant_id,
-              device_id,
-              batch_id,
-              station_key
-            )
-            VALUES (
-              $1,
-              $2,
-              $3::uuid,
-              $4
-            )
-            ON CONFLICT (
-              restaurant_id,
-              device_id,
-              batch_id,
-              station_key
-            )
-            DO UPDATE SET
-              acked_at = now()
-            `,
-            [
-              rid,
-              deviceId,
-              batchId,
-              stationKey,
-            ]
-          );
+              const stations =
+                Array.isArray(
+                  r?.stations
+                )
+                  ? r.stations
+                  : [];
 
-          processed += 1;
-        }
-      }
+              const normalizedStations =
+                Array.from(
+                  new Set(
+                    stations
+                      .map(
+                        normalizeStationKey
+                      )
+                      .filter(Boolean)
+                  )
+                );
+
+              for (
+                const stationKey
+                of normalizedStations
+              ) {
+                await tx.qRun(
+                  `
+                  INSERT INTO public.kds_station_ack (
+                    restaurant_id,
+                    device_id,
+                    batch_id,
+                    station_key
+                  )
+                  VALUES (
+                    $1,
+                    $2,
+                    $3::uuid,
+                    $4
+                  )
+                  ON CONFLICT (
+                    restaurant_id,
+                    device_id,
+                    batch_id,
+                    station_key
+                  )
+                  DO UPDATE SET
+                    acked_at = now()
+                  `,
+                  [
+                    rid,
+                    deviceId,
+                    batchId,
+                    stationKey,
+                  ]
+                );
+
+                processed += 1;
+
+                touchedBatchIds.add(
+                  batchId
+                );
+              }
+            }
+
+            const synced = [];
+
+            /*
+             * Stable order prevents two concurrent
+             * bulk requests from taking per-batch
+             * revision locks in opposite order.
+             */
+            const orderedBatchIds =
+              [...touchedBatchIds]
+                .sort();
+
+            for (
+              const batchId of
+              orderedBatchIds
+            ) {
+              const sync =
+                await emitKdsBatchIfEdge(
+                  tx,
+                  rid,
+                  batchId
+                );
+
+              if (
+                sync
+              ) {
+                synced.push({
+                  batch_id:
+                    batchId,
+                  revision:
+                    sync.revision,
+                });
+              }
+            }
+
+            return {
+              processed,
+              synced,
+            };
+          }
+        );
 
       return res.json({
         success: true,
-        processed,
+        processed:
+          operation
+            .processed,
+        synced_batches:
+          operation
+            .synced,
       });
     } catch (e) {
       console.error(
@@ -745,40 +880,122 @@ router.post(
   try {
     const rid = Number(req.tenantRid || 0);
     const deviceId = String(req.headers["x-kds-device"] || "").trim();
-    const { batchId } = req.params;
+    const batchId = String(req.params.batchId || "").trim();
 
     if (!rid) return res.status(401).json({ error: "Missing tenantRid" });
     if (!deviceId) return res.status(400).json({ error: "Missing x-kds-device" });
     if (!isUuid(batchId)) return res.status(400).json({ error: "Invalid batchId" });
 
-    const stations = Array.isArray(req.body?.stations) ? req.body.stations : [];
+    const stations =
+      Array.isArray(req.body?.stations)
+        ? Array.from(
+            new Set(
+              req.body.stations
+                .map(
+                  normalizeStationKey
+                )
+                .filter(Boolean)
+            )
+          )
+        : [];
 
-    if (stations.length) {
-      for (const stRaw of stations) {
-        const st = normalizeStationKey(stRaw);
-        if (!st) continue;
-        await qRun(
-          `
-          DELETE FROM public.kds_station_ack
-          WHERE restaurant_id = $1 AND device_id = $2 AND batch_id = $3::uuid AND station_key = $4
-          `,
-          [rid, deviceId, batchId, st]
-        );
-      }
-    } else {
-      await qRun(
-        `
-        DELETE FROM public.kds_station_ack
-        WHERE restaurant_id = $1 AND device_id = $2 AND batch_id = $3::uuid
-        `,
-        [rid, deviceId, batchId]
+    const operation =
+      await withTx(
+        async (tx) => {
+          const ownedBatch =
+            await tx.qGet(
+              `
+              SELECT id
+              FROM public.order_batches
+              WHERE
+                restaurant_id = $1
+                AND id = $2::uuid
+              LIMIT 1
+              `,
+              [
+                rid,
+                batchId,
+              ]
+            );
+
+          /*
+           * Preserve the existing harmless/no-op
+           * behaviour for foreign or missing batches.
+           */
+          if (
+            !ownedBatch
+          ) {
+            return {
+              owned:
+                false,
+              sync:
+                null,
+            };
+          }
+
+          if (
+            stations.length
+          ) {
+            await tx.qRun(
+              `
+              DELETE FROM public.kds_station_ack
+              WHERE
+                restaurant_id = $1
+                AND device_id = $2
+                AND batch_id = $3::uuid
+                AND station_key =
+                  ANY($4::text[])
+              `,
+              [
+                rid,
+                deviceId,
+                batchId,
+                stations,
+              ]
+            );
+          } else {
+            await tx.qRun(
+              `
+              DELETE FROM public.kds_station_ack
+              WHERE
+                restaurant_id = $1
+                AND device_id = $2
+                AND batch_id = $3::uuid
+              `,
+              [
+                rid,
+                deviceId,
+                batchId,
+              ]
+            );
+          }
+
+          const sync =
+            await emitKdsBatchIfEdge(
+              tx,
+              rid,
+              batchId
+            );
+
+          return {
+            owned:
+              true,
+            sync,
+          };
+        }
       );
-    }
 
-    res.json({ success: true });
+    return res.json({
+      success: true,
+      edge_revision:
+        operation
+          .sync
+          ?.revision ??
+        null,
+    });
   } catch (e) {
     console.error("❌ POST /kds/live/:batchId/unack failed:", e);
-    res.status(500).json({ error: "Failed to unack" });
+    return res.status(500).json({ error: "Failed to unack" });
   }
 });
 
@@ -815,20 +1032,52 @@ router.put(
 
     const next = !!req.body?.is_paused;
 
-    await qRun(
-      `
-      INSERT INTO public.kitchen_state (restaurant_id, is_paused, updated_at)
-      VALUES ($1, $2, now())
-      ON CONFLICT (restaurant_id)
-      DO UPDATE SET is_paused = EXCLUDED.is_paused, updated_at = now()
-      `,
-      [rid, next]
-    );
+    const operation =
+      await withTx(
+        async (tx) => {
+          await tx.qRun(
+            `
+            INSERT INTO public.kitchen_state (
+              restaurant_id,
+              is_paused,
+              updated_at
+            )
+            VALUES (
+              $1,
+              $2,
+              now()
+            )
+            ON CONFLICT (restaurant_id)
+            DO UPDATE SET
+              is_paused =
+                EXCLUDED.is_paused,
+              updated_at =
+                now()
+            `,
+            [
+              rid,
+              next,
+            ]
+          );
 
-    res.json({ success: true, is_paused: next });
+          return emitKdsKitchenIfEdge(
+            tx,
+            rid
+          );
+        }
+      );
+
+    return res.json({
+      success: true,
+      is_paused: next,
+      edge_revision:
+        operation
+          ?.revision ??
+        null,
+    });
   } catch (e) {
     console.error("❌ PUT /kds/kitchen/pause-status failed:", e);
-    res.status(500).json({ error: "Failed to update pause status" });
+    return res.status(500).json({ error: "Failed to update pause status" });
   }
 });
 
@@ -890,44 +1139,116 @@ router.put(
 
     const isWorking = !!req.body?.is_working;
     const isHidden = !!req.body?.is_hidden;
-const item = await qGet(
-  `
-  SELECT id
-  FROM public.pos_orders
-  WHERE restaurant_id = $1
-    AND batch_id = $2::uuid
-    AND LOWER(TRIM(item_name)) =
-        LOWER(TRIM($3))
-  LIMIT 1
-  `,
-  [
-    rid,
-    batchId,
-    itemName,
-  ]
-);
 
-if (!item) {
-  return res.status(404).json({
-    error: "KDS item not found",
-  });
-}
-    await qRun(
-      `
-      INSERT INTO public.kds_item_state (
-        restaurant_id, station_key, batch_id, item_name, mods_line,
-        is_working, is_hidden, updated_by_device, updated_at
-      )
-      VALUES ($1, $2, $3::uuid, $4, $5, $6, $7, $8, now())
-      ON CONFLICT (restaurant_id, station_key, batch_id, item_name, mods_line)
-      DO UPDATE SET
-        is_working = EXCLUDED.is_working,
-        is_hidden = EXCLUDED.is_hidden,
-        updated_by_device = EXCLUDED.updated_by_device,
-        updated_at = now()
-      `,
-      [rid, stationKey, batchId, itemName, modsLine, isWorking, isHidden, deviceId]
-    );
+    const operation =
+      await withTx(
+        async (tx) => {
+          const item =
+            await tx.qGet(
+              `
+              SELECT id
+              FROM public.pos_orders
+              WHERE
+                restaurant_id = $1
+                AND batch_id = $2::uuid
+                AND LOWER(TRIM(item_name)) =
+                    LOWER(TRIM($3))
+              LIMIT 1
+              `,
+              [
+                rid,
+                batchId,
+                itemName,
+              ]
+            );
+
+          if (
+            !item
+          ) {
+            return {
+              found:
+                false,
+              sync:
+                null,
+            };
+          }
+
+          await tx.qRun(
+            `
+            INSERT INTO public.kds_item_state (
+              restaurant_id,
+              station_key,
+              batch_id,
+              item_name,
+              mods_line,
+              is_working,
+              is_hidden,
+              updated_by_device,
+              updated_at
+            )
+            VALUES (
+              $1,
+              $2,
+              $3::uuid,
+              $4,
+              $5,
+              $6,
+              $7,
+              $8,
+              now()
+            )
+            ON CONFLICT (
+              restaurant_id,
+              station_key,
+              batch_id,
+              item_name,
+              mods_line
+            )
+            DO UPDATE SET
+              is_working =
+                EXCLUDED.is_working,
+              is_hidden =
+                EXCLUDED.is_hidden,
+              updated_by_device =
+                EXCLUDED.updated_by_device,
+              updated_at =
+                now()
+            `,
+            [
+              rid,
+              stationKey,
+              batchId,
+              itemName,
+              modsLine,
+              isWorking,
+              isHidden,
+              deviceId,
+            ]
+          );
+
+          const sync =
+            await emitKdsBatchIfEdge(
+              tx,
+              rid,
+              batchId
+            );
+
+          return {
+            found:
+              true,
+            sync,
+          };
+        }
+      );
+
+    if (
+      !operation.found
+    ) {
+      return res.status(404).json({
+        error:
+          "KDS item not found",
+      });
+    }
 
     return res.json({
       success: true,
@@ -936,6 +1257,11 @@ if (!item) {
       mods_line: modsLine,
       is_working: isWorking,
       is_hidden: isHidden,
+      edge_revision:
+        operation
+          .sync
+          ?.revision ??
+        null,
     });
   } catch (e) {
     console.error("❌ PUT /kds/live/item-state failed:", e);
@@ -955,35 +1281,122 @@ router.post(
     if (!rid) return res.status(401).json({ error: "Missing tenantRid" });
     if (!isUuid(batchId)) return res.status(400).json({ error: "Invalid batchId" });
 
-    const bodyStations = Array.isArray(req.body?.stations) ? req.body.stations : [];
-    const normalizedStations = bodyStations.map(normalizeStationKey).filter(Boolean);
+    const bodyStations =
+      Array.isArray(req.body?.stations)
+        ? req.body.stations
+        : [];
 
-    if (normalizedStations.length) {
-      await qRun(
-        `
-        UPDATE public.kds_item_state
-        SET is_hidden = false,
-            updated_at = now()
-        WHERE restaurant_id = $1
-          AND batch_id = $2::uuid
-          AND station_key = ANY($3::text[])
-        `,
-        [rid, batchId, normalizedStations]
+    const normalizedStations =
+      Array.from(
+        new Set(
+          bodyStations
+            .map(
+              normalizeStationKey
+            )
+            .filter(Boolean)
+        )
       );
-    } else {
-      await qRun(
-        `
-        UPDATE public.kds_item_state
-        SET is_hidden = false,
-            updated_at = now()
-        WHERE restaurant_id = $1
-          AND batch_id = $2::uuid
-        `,
-        [rid, batchId]
-      );
-    }
 
-    return res.json({ success: true, batchId, stations: normalizedStations });
+    const operation =
+      await withTx(
+        async (tx) => {
+          const ownedBatch =
+            await tx.qGet(
+              `
+              SELECT id
+              FROM public.order_batches
+              WHERE
+                restaurant_id = $1
+                AND id = $2::uuid
+              LIMIT 1
+              `,
+              [
+                rid,
+                batchId,
+              ]
+            );
+
+          /*
+           * Preserve existing no-op success for a
+           * foreign/nonexistent batch while ensuring
+           * no sync event is manufactured for it.
+           */
+          if (
+            !ownedBatch
+          ) {
+            return {
+              owned:
+                false,
+              sync:
+                null,
+            };
+          }
+
+          if (
+            normalizedStations.length
+          ) {
+            await tx.qRun(
+              `
+              UPDATE public.kds_item_state
+              SET
+                is_hidden = false,
+                updated_at = now()
+              WHERE
+                restaurant_id = $1
+                AND batch_id = $2::uuid
+                AND station_key =
+                  ANY($3::text[])
+              `,
+              [
+                rid,
+                batchId,
+                normalizedStations,
+              ]
+            );
+          } else {
+            await tx.qRun(
+              `
+              UPDATE public.kds_item_state
+              SET
+                is_hidden = false,
+                updated_at = now()
+              WHERE
+                restaurant_id = $1
+                AND batch_id = $2::uuid
+              `,
+              [
+                rid,
+                batchId,
+              ]
+            );
+          }
+
+          const sync =
+            await emitKdsBatchIfEdge(
+              tx,
+              rid,
+              batchId
+            );
+
+          return {
+            owned:
+              true,
+            sync,
+          };
+        }
+      );
+
+    return res.json({
+      success: true,
+      batchId,
+      stations:
+        normalizedStations,
+      edge_revision:
+        operation
+          .sync
+          ?.revision ??
+        null,
+    });
   } catch (e) {
     console.error("❌ POST /kds/live/:batchId/items/show-all failed:", e);
     return res.status(500).json({ error: "Failed to restore batch items" });
