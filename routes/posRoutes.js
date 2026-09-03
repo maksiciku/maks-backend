@@ -34,6 +34,12 @@ const {
 );
 
 const {
+  emitFinancialSettlementRecordedTx,
+} = require(
+  "../edge/contracts/financialOperations"
+);
+
+const {
   MaksRuntimeRoleError,
   assertCloudRuntime,
 } = require("../utils/runtimeRole");
@@ -1453,6 +1459,7 @@ async function recordPayment({
 
 async function createPaymentSettlement({
   tx,
+  settlementId = null,
   restaurantId,
   tableNumber,
   batchId = null,
@@ -1481,6 +1488,25 @@ async function createPaymentSettlement({
   if (!tx?.qGet) {
     throw new Error(
       "createPaymentSettlement requires an active database transaction"
+    );
+  }
+
+  const safeSettlementId =
+    settlementId == null ||
+    settlementId === ""
+      ? null
+      : String(
+          settlementId
+        ).trim();
+
+  if (
+    safeSettlementId &&
+    !isUuid(
+      safeSettlementId
+    )
+  ) {
+    throw new Error(
+      "Invalid payment settlement UUID"
     );
   }
 
@@ -1531,7 +1557,8 @@ async function createPaymentSettlement({
 
       source,
       created_by_user_id,
-      created_at
+      created_at,
+      id
     )
     VALUES (
       $1,
@@ -1558,7 +1585,11 @@ async function createPaymentSettlement({
 
       $18,
       $19,
-      NOW()
+      NOW(),
+      COALESCE(
+        $20::uuid,
+        gen_random_uuid()
+      )
     )
     RETURNING *
     `,
@@ -1600,6 +1631,8 @@ async function createPaymentSettlement({
       createdByUserId
         ? Number(createdByUserId)
         : null,
+
+      safeSettlementId,
     ]
   );
 
@@ -7840,6 +7873,17 @@ vat: {
           );
         }
 
+        await emitFinancialSettlementRecordedTx(
+          tx,
+          {
+            restaurantId:
+              rid,
+
+            settlementId:
+              settlement.id,
+          }
+        );
+
         await emitTableOperationalIfEdge(
           tx,
           rid,
@@ -8998,6 +9042,16 @@ router.post(
                 table
               );
             }
+
+            await emitFinancialSettlementRecordedTx(
+              tx,
+              {
+                restaurantId,
+
+                settlementId:
+                  settlement.id,
+              }
+            );
 
             await emitTableOperationalIfEdge(
               tx,
