@@ -312,6 +312,42 @@ await qRun(`
       await qRun(`ALTER TABLE public.pos_orders ADD COLUMN IF NOT EXISTS invoice_number INTEGER;`);
       await qRun(`ALTER TABLE public.pos_orders ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'pos';`);
       await qRun(`ALTER TABLE public.pos_orders ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;`);
+      /*
+       * MAKS EDGE operational identity.
+       *
+       * BIGSERIAL ids are local to one PostgreSQL database
+       * and MUST NOT be treated as Cloud/Edge identity.
+       *
+       * One submission UUID + row ordinal is stable across
+       * independent databases and will later be used by
+       * payment replication as well.
+       */
+      await qRun(`
+        ALTER TABLE public.pos_orders
+        ADD COLUMN IF NOT EXISTS
+          edge_submission_id UUID;
+      `);
+
+      await qRun(`
+        ALTER TABLE public.pos_orders
+        ADD COLUMN IF NOT EXISTS
+          edge_row_ordinal INTEGER;
+      `);
+
+      await qRun(`
+        CREATE UNIQUE INDEX IF NOT EXISTS
+          ux_pos_orders_edge_submission_row
+        ON public.pos_orders (
+          restaurant_id,
+          batch_id,
+          edge_submission_id,
+          edge_row_ordinal
+        )
+        WHERE
+          edge_submission_id IS NOT NULL
+          AND edge_row_ordinal IS NOT NULL;
+      `);
+
 
       // -------------------------
       // PG indexes
@@ -4593,6 +4629,53 @@ console.log(
 
       let pickupNumber = null;
 
+if (tx.kind === "pg") {
+  await tx.qGet(
+    `
+    SELECT
+      pg_advisory_xact_lock(
+        hashtextextended(
+          $1,
+          0
+        )
+      ) AS locked
+    `,
+    [
+      `maks:pos:${restaurantId}:${batchId}`,
+    ]
+  );
+}
+
+const existingKdsOrderIds =
+  tx.kind === "pg"
+    ? new Set(
+        (
+          await tx.qAll(
+            `
+            SELECT id
+            FROM public.orders
+            WHERE restaurant_id = $1
+              AND batch_id = $2::uuid
+            ORDER BY id ASC
+            `,
+            [
+              restaurantId,
+              batchId,
+            ]
+          )
+        )
+          .map(
+            (row) =>
+              Number(row.id)
+          )
+          .filter(
+            (id) =>
+              Number.isSafeInteger(id) &&
+              id > 0
+          )
+      )
+    : new Set();
+
 if (!shouldAppendToExistingBatch) {
   const created = await createOrderBatch(tx, {
     restaurantId,
@@ -4629,6 +4712,36 @@ items: trustedItems,
       if (!isUuid(realBatchId)) {
         throw new Error(`insertPosItems returned non-uuid batchId: ${realBatchId}`);
       }
+
+
+      const createdKdsOrderIds =
+        tx.kind === "pg"
+          ? (
+              await tx.qAll(
+                `
+                SELECT id
+                FROM public.orders
+                WHERE restaurant_id = $1
+                  AND batch_id = $2::uuid
+                ORDER BY id ASC
+                `,
+                [
+                  restaurantId,
+                  realBatchId,
+                ]
+              )
+            )
+              .map(
+                (row) =>
+                  Number(row.id)
+              )
+              .filter(
+                (id) =>
+                  Number.isSafeInteger(id) &&
+                  id > 0 &&
+                  !existingKdsOrderIds.has(id)
+              )
+          : [];
 
       /*
        * =====================================================
@@ -4732,6 +4845,48 @@ items: trustedItems,
           createdPosOrderIds.push(
             ...newIds
           );
+        }
+      }
+
+
+      if (tx.kind === "pg") {
+        for (
+          let index = 0;
+          index < createdPosOrderIds.length;
+          index += 1
+        ) {
+          const stamped =
+            await tx.qGet(
+              `
+              UPDATE public.pos_orders
+              SET
+                edge_submission_id =
+                  $1::uuid,
+                edge_row_ordinal =
+                  $2
+              WHERE
+                restaurant_id = $3
+                AND id = $4
+                AND batch_id =
+                  $5::uuid
+              RETURNING id
+              `,
+              [
+                submissionId,
+                index + 1,
+                restaurantId,
+                createdPosOrderIds[
+                  index
+                ],
+                realBatchId,
+              ]
+            );
+
+          if (!stamped?.id) {
+            throw new Error(
+              "Failed to stamp stable POS operational identity"
+            );
+          }
         }
       }
 
@@ -4899,6 +5054,143 @@ if (pricingDiscount > 0 && realBatchId) {
           );
         }
 
+        const batchSnapshot =
+          await tx.qGet(
+            `
+            SELECT
+              id,
+              restaurant_id,
+              table_number,
+              order_type,
+              pickup_number,
+              requested_payment_method,
+              delivery_status,
+              delivery_code,
+              created_at
+            FROM
+              public.order_batches
+            WHERE
+              restaurant_id = $1
+              AND id = $2::uuid
+            LIMIT 1
+            `,
+            [
+              restaurantId,
+              realBatchId,
+            ]
+          );
+
+        if (!batchSnapshot?.id) {
+          throw new Error(
+            "POS Edge event cannot snapshot order batch"
+          );
+        }
+
+        const posRowSnapshots =
+          await tx.qAll(
+            `
+            SELECT
+              id,
+              restaurant_id,
+              table_number,
+              meal_id,
+              menu_item_id,
+              stock_id,
+              item_name,
+              quantity,
+              total_price,
+              vat_rate,
+              vat_gross,
+              vat_net,
+              vat_amount,
+              item_type,
+              order_status,
+              paid,
+              options,
+              note,
+              batch_id,
+              created_at,
+              category_id,
+              is_starred,
+              is_priority,
+              table_allergy_codes,
+              item_allergen_contains,
+              allergen_conflicts,
+              strict_cross_contamination,
+              table_covers,
+              amount_paid,
+              remaining_price,
+              source,
+              expires_at,
+              edge_submission_id,
+              edge_row_ordinal
+            FROM
+              public.pos_orders
+            WHERE
+              restaurant_id = $1
+              AND id =
+                ANY($2::bigint[])
+            ORDER BY
+              edge_row_ordinal ASC
+            `,
+            [
+              restaurantId,
+              createdPosOrderIds,
+            ]
+          );
+
+        if (
+          posRowSnapshots.length !==
+          createdPosOrderIds.length
+        ) {
+          throw new Error(
+            "POS Edge event snapshot row count mismatch"
+          );
+        }
+
+        const kdsRowSnapshots =
+          createdKdsOrderIds.length
+            ? await tx.qAll(
+                `
+                SELECT
+                  id,
+                  restaurant_id,
+                  table_number,
+                  items,
+                  total_price,
+                  paid,
+                  created_at,
+                  options,
+                  note,
+                  special_requests,
+                  payment_method,
+                  paid_at,
+                  order_type,
+                  meal_name,
+                  category,
+                  station,
+                  quantity,
+                  order_status,
+                  batch_id,
+                  price_per_unit,
+                  category_id,
+                  is_priority
+                FROM
+                  public.orders
+                WHERE
+                  restaurant_id = $1
+                  AND id =
+                    ANY($2::bigint[])
+                ORDER BY
+                  id ASC
+                `,
+                [
+                  restaurantId,
+                  createdKdsOrderIds,
+                ]
+              )
+            : [];
+
         await enqueueEdgeEventTx(
           tx,
           {
@@ -4923,7 +5215,7 @@ if (pricingDiscount > 0 && realBatchId) {
               `pos.order.submitted:${submissionId}`,
 
             payload: {
-              schema_version: 1,
+              schema_version: 2,
 
               restaurant_id:
                 Number(
@@ -4940,6 +5232,15 @@ if (pricingDiscount > 0 && realBatchId) {
 
               pos_order_ids:
                 createdPosOrderIds,
+
+              batch:
+                batchSnapshot,
+
+              pos_rows:
+                posRowSnapshots,
+
+              kds_rows:
+                kdsRowSnapshots,
 
               order_type:
                 safeOrderType,

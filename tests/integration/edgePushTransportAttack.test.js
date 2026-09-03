@@ -96,7 +96,7 @@ function makeEvent({
   },
 
   eventType =
-    "pos.order.submitted",
+    "edge.transport.attack.v1",
 
   entityType =
     "order_batch",
@@ -869,7 +869,7 @@ test(
               restaurantA,
 
             eventType:
-              "pos.order.submitted",
+              "edge.transport.attack.v1",
 
             entityType:
               "order_batch",
@@ -1292,7 +1292,7 @@ test(
               restaurantA,
 
             eventType:
-              "pos.order.submitted",
+              "edge.transport.attack.v1",
 
             entityType:
               "order_batch",

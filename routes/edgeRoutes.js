@@ -678,6 +678,15 @@ router.post(
   }
 );
 
+const {
+  POS_ORDER_SUBMITTED_EVENT_TYPE,
+  PosOperationalSyncError,
+  validatePosOrderSubmittedEvent,
+  applyPosOrderSubmittedCloud,
+} = require(
+  "../edge/contracts/posOperations"
+);
+
 /*
  * =========================================================
  * EDGE → CLOUD PUSH TRANSPORT
@@ -885,6 +894,24 @@ router.post(
         }
 
         try {
+          if (
+            String(
+              rawEvent
+                ?.event_type ||
+              ""
+            ) ===
+            POS_ORDER_SUBMITTED_EVENT_TYPE
+          ) {
+            validatePosOrderSubmittedEvent(
+              rawEvent,
+              {
+                restaurantId,
+                sourceInstallationId:
+                  installationId,
+              }
+            );
+          }
+
           const received =
             await receiveInboxEvent({
               eventId,
@@ -916,6 +943,29 @@ router.post(
                   ?.payload,
             });
 
+          let applied =
+            null;
+
+          if (
+            String(
+              rawEvent
+                ?.event_type ||
+              ""
+            ) ===
+            POS_ORDER_SUBMITTED_EVENT_TYPE
+          ) {
+            applied =
+              await applyPosOrderSubmittedCloud({
+                event:
+                  rawEvent,
+
+                restaurantId,
+
+                sourceInstallationId:
+                  installationId,
+              });
+          }
+
           acked.push({
             event_id:
               eventId,
@@ -923,12 +973,17 @@ router.post(
             duplicate:
               received
                 ?.duplicate ===
-              true,
+                true ||
+              applied
+                ?.duplicate ===
+                true,
           });
         } catch (error) {
           if (
             error instanceof
-              EdgeSyncError
+              EdgeSyncError ||
+            error instanceof
+              PosOperationalSyncError
           ) {
             rejected.push({
               event_id:

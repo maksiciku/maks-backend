@@ -716,6 +716,161 @@ test(
           "pos.order.submitted"
         );
 
+
+        assert.equal(
+          Number(
+            event.payload
+              ?.schema_version
+          ),
+          2,
+          "POS Edge event did not use operational schema v2"
+        );
+
+        assert.equal(
+          String(
+            event.payload
+              ?.batch?.id ||
+            ""
+          ),
+          firstBatchId,
+          "POS Edge event batch snapshot does not match ticket"
+        );
+
+        assert.equal(
+          Number(
+            event.payload
+              ?.batch
+              ?.restaurant_id
+          ),
+          Number(
+            fixtures.restaurantA
+          ),
+          "POS Edge event batch snapshot crossed tenant"
+        );
+
+        assert.deepEqual(
+          sortedNumeric(
+            (
+              event.payload
+                ?.pos_rows ||
+              []
+            ).map(
+              (row) =>
+                row.id
+            )
+          ),
+          sortedNumeric(
+            event.payload
+              ?.pos_order_ids ||
+            []
+          ),
+          "POS Edge row snapshots do not match authoritative POS ids"
+        );
+
+        assert.equal(
+          (
+            event.payload
+              ?.pos_rows ||
+            []
+          ).length,
+          firstPosIds.length,
+          "POS Edge event did not snapshot every authoritative POS row"
+        );
+
+        for (
+          let index = 0;
+          index <
+            (
+              event.payload
+                ?.pos_rows ||
+              []
+            ).length;
+          index += 1
+        ) {
+          const row =
+            event.payload
+              .pos_rows[index];
+
+          assert.equal(
+            String(
+              row.edge_submission_id ||
+              ""
+            ),
+            String(
+              event.payload
+                .submission_id
+            ),
+            "POS Edge stable submission id mismatch"
+          );
+
+          assert.equal(
+            Number(
+              row.edge_row_ordinal
+            ),
+            index + 1,
+            "POS Edge row ordinal is not stable/consecutive"
+          );
+
+          assert.equal(
+            Number(
+              row.restaurant_id
+            ),
+            Number(
+              fixtures.restaurantA
+            ),
+            "POS Edge row snapshot crossed tenant"
+          );
+
+          assert.equal(
+            String(
+              row.batch_id
+            ),
+            firstBatchId,
+            "POS Edge row snapshot crossed batch"
+          );
+        }
+
+        assert.ok(
+          Array.isArray(
+            event.payload
+              ?.kds_rows
+          ),
+          "POS Edge event kds_rows is missing"
+        );
+
+        assert.ok(
+          event.payload
+            .kds_rows.length > 0,
+          "Normal POS send produced no KDS row snapshot"
+        );
+
+        for (
+          const row of
+          event.payload.kds_rows
+        ) {
+          assert.equal(
+            Number(
+              row.restaurant_id
+            ),
+            Number(
+              fixtures.restaurantA
+            ),
+            "KDS snapshot crossed tenant"
+          );
+
+          assert.equal(
+            String(
+              row.batch_id
+            ),
+            firstBatchId,
+            "KDS snapshot crossed batch"
+          );
+        }
+
+        console.log(
+          "✅ POS operational schema v2 snapshots + stable row identity proven"
+        );
+
         assert.equal(
           event.entity_type,
           "order_batch"
@@ -1703,6 +1858,40 @@ test(
             appendEvent.payload
               ?.pos_order_ids
           );
+
+        assert.equal(
+          Number(
+            appendEvent.payload
+              ?.schema_version
+          ),
+          2
+        );
+
+        assert.equal(
+          (
+            appendEvent.payload
+              ?.pos_rows ||
+            []
+          ).length,
+          appendedIds.length,
+          "Append snapshot included old POS rows"
+        );
+
+        for (
+          const row of
+          appendEvent.payload
+            .pos_rows || []
+        ) {
+          assert.equal(
+            String(
+              row.edge_submission_id ||
+              ""
+            ),
+            appendSubmissionId,
+            "Append POS row reused old submission identity"
+          );
+        }
+
 
         assert.equal(
           appendedIds.length,
