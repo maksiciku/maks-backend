@@ -1289,6 +1289,8 @@ async function recordPayment({
   cashupSessionId = null,
   refPaymentId = null,
   settlementId = null,
+  paymentUuid = null,
+  refPaymentUuid = null,
 }) {
   if (!tx?.qGet) {
     throw new Error("recordPayment requires an active database transaction");
@@ -1320,6 +1322,40 @@ async function recordPayment({
       ? String(settlementId)
       : null;
 
+  const rawPaymentUuid =
+    paymentUuid == null
+      ? ""
+      : String(paymentUuid).trim();
+
+  if (
+    rawPaymentUuid &&
+    !isUuid(rawPaymentUuid)
+  ) {
+    throw new Error(
+      "Invalid payment UUID"
+    );
+  }
+
+  const safePaymentUuid =
+    rawPaymentUuid || null;
+
+  const rawRefPaymentUuid =
+    refPaymentUuid == null
+      ? ""
+      : String(refPaymentUuid).trim();
+
+  if (
+    rawRefPaymentUuid &&
+    !isUuid(rawRefPaymentUuid)
+  ) {
+    throw new Error(
+      "Invalid reference payment UUID"
+    );
+  }
+
+  const safeRefPaymentUuid =
+    rawRefPaymentUuid || null;
+
   const row = await tx.qGet(
     `
     INSERT INTO public.payments (
@@ -1335,7 +1371,9 @@ async function recordPayment({
       source,
       cashup_session_id,
       ref_payment_id,
-      settlement_id
+      settlement_id,
+      payment_uuid,
+      ref_payment_uuid
     )
     VALUES (
       $1,
@@ -1350,7 +1388,12 @@ async function recordPayment({
       $9,
       $10,
       $11,
-      $12::uuid
+      $12::uuid,
+      COALESCE(
+        $13::uuid,
+        gen_random_uuid()
+      ),
+      $14::uuid
     )
     RETURNING
       id,
@@ -1360,6 +1403,8 @@ async function recordPayment({
       method,
       batch_id,
       settlement_id,
+      payment_uuid,
+      ref_payment_uuid,
       created_at
     `,
     [
@@ -1381,6 +1426,8 @@ async function recordPayment({
         ? Number(refPaymentId)
         : null,
       safeSettlementId,
+      safePaymentUuid,
+      safeRefPaymentUuid,
     ]
   );
 
@@ -1396,6 +1443,10 @@ async function recordPayment({
     method: row.method,
     batchId: row.batch_id || null,
     settlementId: row.settlement_id || null,
+    paymentUuid:
+      row.payment_uuid || null,
+    refPaymentUuid:
+      row.ref_payment_uuid || null,
     createdAt: row.created_at,
   };
 }
@@ -10703,6 +10754,29 @@ router.post(
   throw err;
 }
 
+      const originalPaymentUuid =
+        isPg
+          ? String(
+              pay.payment_uuid || ""
+            ).trim()
+          : null;
+
+      if (
+        isPg &&
+        !isUuid(originalPaymentUuid)
+      ) {
+        const err =
+          new Error(
+            "Original payment is missing stable UUID identity"
+          );
+
+        err.status = 500;
+        err.code =
+          "PAYMENT_UUID_REQUIRED";
+
+        throw err;
+      }
+
       const paymentStatus =
   String(
     pay.status || ""
@@ -10915,19 +10989,31 @@ if (
         throw new Error("Unable to restore full refund amount to POS orders safely");
       }
 
-      await recordPayment({
-         tx,
-        restaurantId: rid,
-        tableNumber: pay.table_number,
-        amount: -Math.abs(refundAmount),
-        method: pay.method,
-        userId: req.user?.id || null,
-        batchId: refundBatchId,
-        terminalRef: pay.terminal_ref || null,
-        posOrderIds: touchedIds,
-        source: "refund",
-        refPaymentId: id,
-      });
+      const recordedRefund =
+        await recordPayment({
+          tx,
+          restaurantId: rid,
+          tableNumber:
+            pay.table_number,
+          amount:
+            -Math.abs(refundAmount),
+          method:
+            pay.method,
+          userId:
+            req.user?.id || null,
+          batchId:
+            refundBatchId,
+          terminalRef:
+            pay.terminal_ref || null,
+          posOrderIds:
+            touchedIds,
+          source:
+            "refund",
+          refPaymentId:
+            id,
+          refPaymentUuid:
+            originalPaymentUuid,
+        });
 
       const refundedAfter =
   round2(
@@ -10996,6 +11082,10 @@ await tx.qRun(
         unpaid_left: unpaidLeft,
         table_status: unpaidLeft > 0 ? "occupied" : "occupied_paid",
         payment_batch_id: refundBatchId,
+        payment_uuid:
+          recordedRefund.paymentUuid,
+        ref_payment_uuid:
+          recordedRefund.refPaymentUuid,
       };
     });
 

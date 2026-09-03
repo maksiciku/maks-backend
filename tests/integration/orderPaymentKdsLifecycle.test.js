@@ -1522,6 +1522,24 @@ test(
         )
       )
     );
+
+    assert.match(
+      String(
+        res.body?.payment_uuid ||
+        ""
+      ),
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+      "Refund response is missing payment_uuid"
+    );
+
+    assert.match(
+      String(
+        res.body?.ref_payment_uuid ||
+        ""
+      ),
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+      "Refund response is missing ref_payment_uuid"
+    );
   }
 );
 
@@ -1598,7 +1616,9 @@ test(
     const original =
       await dbQuery(
         `
-        SELECT status
+        SELECT
+          status,
+          payment_uuid
         FROM payments
         WHERE id = $1
           AND restaurant_id = $2
@@ -1624,6 +1644,8 @@ test(
           amount,
           source,
           ref_payment_id,
+          payment_uuid,
+          ref_payment_uuid,
           restaurant_id
         FROM payments
         WHERE restaurant_id = $1
@@ -1654,6 +1676,51 @@ test(
           .ref_payment_id
       ),
       paymentA
+    );
+
+    const originalPaymentUuid =
+      String(
+        original.rows[0]
+          .payment_uuid ||
+        ""
+      );
+
+    const refundPaymentUuid =
+      String(
+        refunds.rows[0]
+          .payment_uuid ||
+        ""
+      );
+
+    const refundRefPaymentUuid =
+      String(
+        refunds.rows[0]
+          .ref_payment_uuid ||
+        ""
+      );
+
+    assert.match(
+      originalPaymentUuid,
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+      "Original payment is missing payment_uuid"
+    );
+
+    assert.match(
+      refundPaymentUuid,
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+      "Refund payment is missing payment_uuid"
+    );
+
+    assert.equal(
+      refundRefPaymentUuid,
+      originalPaymentUuid,
+      "Refund ref_payment_uuid does not match original payment_uuid"
+    );
+
+    assert.notEqual(
+      refundPaymentUuid,
+      originalPaymentUuid,
+      "Refund tender reused original payment_uuid"
     );
   }
 );

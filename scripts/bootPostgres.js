@@ -36,6 +36,10 @@ const {
 } = require('../migrations/canonicalFinancialLedger.pg');
 
 const {
+  runCanonicalEdgeFinancialIdentityPg,
+} = require('../migrations/canonicalEdgeFinancialIdentity.pg');
+
+const {
   runCanonicalCommercialPricingPg,
 } = require('../migrations/canonicalCommercialPricing.pg');
 
@@ -112,6 +116,10 @@ async function main() {
     });
 
     await runCanonicalFinancialLedgerPg({
+      pool,
+    });
+
+    await runCanonicalEdgeFinancialIdentityPg({
       pool,
     });
 
