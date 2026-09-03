@@ -4,6 +4,12 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const request = require("supertest");
 
+const originalRuntimeRole =
+  process.env.MAKS_RUNTIME_ROLE;
+
+process.env.MAKS_RUNTIME_ROLE =
+  "cloud";
+
 const { resetTestData } =
   require("../setup/resetTestData");
 
@@ -148,8 +154,21 @@ test.before(async () => {
 });
 
 test.after(async () => {
-  if (dbPool) {
-    await dbPool.end();
+  try {
+    if (dbPool) {
+      await dbPool.end();
+    }
+  } finally {
+    if (
+      originalRuntimeRole == null
+    ) {
+      delete process.env
+        .MAKS_RUNTIME_ROLE;
+    } else {
+      process.env
+        .MAKS_RUNTIME_ROLE =
+        originalRuntimeRole;
+    }
   }
 });
 
