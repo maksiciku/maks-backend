@@ -4,6 +4,20 @@
 const express =
   require("express");
 
+const {
+  withTx:
+    fallbackWithTx,
+} = require(
+  "../dbCompat"
+);
+
+const {
+  emitTableOperationalSnapshotTx,
+  isTableEdgeProducerRuntime,
+} = require(
+  "../edge/contracts/tableOperations"
+);
+
 const ALLOWED_ALLERGEN_CODES =
   new Set([
     "celery",
@@ -37,6 +51,12 @@ module.exports =
     const qRun =
       db.qRun;
 
+    const withTx =
+      typeof db?.withTx ===
+        "function"
+        ? db.withTx
+        : fallbackWithTx;
+
     /*
      * =====================================================
      * AUTHORITATIVE TABLE OWNERSHIP
@@ -50,9 +70,10 @@ module.exports =
      */
     async function loadOwnedTable(
       rid,
-      tableId
+      tableId,
+      qGetFn = qGet
     ) {
-      return qGet(
+      return qGetFn(
         `
         SELECT
           id,
@@ -70,6 +91,27 @@ module.exports =
         ]
       );
     }
+
+    async function emitTableOperationalIfEdge(
+      tx,
+      restaurantId,
+      tableName
+    ) {
+      if (
+        !isTableEdgeProducerRuntime()
+      ) {
+        return null;
+      }
+
+      return emitTableOperationalSnapshotTx(
+        tx,
+        {
+          restaurantId,
+          tableName,
+        }
+      );
+    }
+
 
     function sanitizeAllergens(
       raw
@@ -295,19 +337,151 @@ module.exports =
             });
         }
 
+        const rawCovers =
+          req.body?.covers ??
+          2;
+
+        const covers =
+          Number(
+            rawCovers
+          );
+
+        if (
+          !Number.isInteger(
+            covers
+          ) ||
+          covers < 1 ||
+          covers > 1000
+        ) {
+          return res
+            .status(400)
+            .json({
+              error:
+                "Invalid covers",
+            });
+        }
+
+        const allergyCodes =
+          sanitizeAllergens(
+            req.body
+              ?.allergy_codes
+          );
+
+        const rawStrict =
+          req.body
+            ?.strict_cross_contamination;
+
+        const strictCrossContamination =
+          rawStrict === true ||
+          rawStrict ===
+            "true" ||
+          rawStrict === 1 ||
+          rawStrict === "1";
+
+        const allergyJson =
+          JSON.stringify(
+            allergyCodes
+          );
+
         try {
-          /*
-           * =================================================
-           * TENANT OWNERSHIP CHECK
-           * =================================================
-           */
-          const table =
-            await loadOwnedTable(
-              rid,
-              tableId
+          const operation =
+            await withTx(
+              async (tx) => {
+                const table =
+                  await loadOwnedTable(
+                    rid,
+                    tableId,
+                    (
+                      sql,
+                      params
+                    ) =>
+                      tx.qGet(
+                        sql,
+                        params
+                      )
+                  );
+
+                if (!table) {
+                  return {
+                    found:
+                      false,
+
+                    table:
+                      null,
+
+                    sync:
+                      null,
+                  };
+                }
+
+                await tx.qRun(
+                  `
+                  INSERT INTO public.pos_table_sessions
+                  (
+                    restaurant_id,
+                    table_id,
+                    covers,
+                    allergy_codes,
+                    strict_cross_contamination
+                  )
+
+                  VALUES (
+                    $1,
+                    $2,
+                    $3,
+                    $4::jsonb,
+                    $5
+                  )
+
+                  ON CONFLICT
+                    (
+                      restaurant_id,
+                      table_id
+                    )
+
+                  DO UPDATE SET
+                    covers =
+                      EXCLUDED.covers,
+
+                    allergy_codes =
+                      EXCLUDED.allergy_codes,
+
+                    strict_cross_contamination =
+                      EXCLUDED.strict_cross_contamination,
+
+                    updated_at =
+                      NOW()
+                  `,
+                  [
+                    rid,
+                    tableId,
+                    covers,
+                    allergyJson,
+                    strictCrossContamination,
+                  ]
+                );
+
+                const sync =
+                  await emitTableOperationalIfEdge(
+                    tx,
+                    rid,
+                    table.name
+                  );
+
+                return {
+                  found:
+                    true,
+
+                  table,
+
+                  sync,
+                };
+              }
             );
 
-          if (!table) {
+          if (
+            !operation.found
+          ) {
             return res
               .status(404)
               .json({
@@ -316,125 +490,6 @@ module.exports =
               });
           }
 
-          /*
-           * =================================================
-           * COVERS VALIDATION
-           * =================================================
-           *
-           * Covers must be a real positive integer.
-           *
-           * Do not silently convert Infinity, NaN, decimals,
-           * negatives or ridiculous values.
-           *
-           * We deliberately do NOT force covers <= seats here:
-           * restaurants may temporarily pull chairs together.
-           * Capacity enforcement belongs to booking/table
-           * allocation policy rather than corrupting session
-           * metadata.
-           */
-          const rawCovers =
-            req.body?.covers ??
-            2;
-
-          const covers =
-            Number(
-              rawCovers
-            );
-
-          if (
-            !Number.isInteger(
-              covers
-            ) ||
-            covers < 1 ||
-            covers > 1000
-          ) {
-            return res
-              .status(400)
-              .json({
-                error:
-                  "Invalid covers",
-              });
-          }
-
-          /*
-           * =================================================
-           * ALLERGEN AUTHORITY
-           * =================================================
-           */
-          const allergyCodes =
-            sanitizeAllergens(
-              req.body
-                ?.allergy_codes
-            );
-
-          const rawStrict =
-            req.body
-              ?.strict_cross_contamination;
-
-          const strictCrossContamination =
-            rawStrict === true ||
-            rawStrict ===
-              "true" ||
-            rawStrict === 1 ||
-            rawStrict === "1";
-
-          const allergyJson =
-            JSON.stringify(
-              allergyCodes
-            );
-
-          /*
-           * =================================================
-           * TENANT-SAFE UPSERT
-           * =================================================
-           */
-          await qRun(
-            `
-            INSERT INTO public.pos_table_sessions
-            (
-              restaurant_id,
-              table_id,
-              covers,
-              allergy_codes,
-              strict_cross_contamination
-            )
-
-            VALUES (
-              $1,
-              $2,
-              $3,
-              $4::jsonb,
-              $5
-            )
-
-            ON CONFLICT
-              (
-                restaurant_id,
-                table_id
-              )
-
-            DO UPDATE SET
-              covers =
-                EXCLUDED.covers,
-
-              allergy_codes =
-                EXCLUDED.allergy_codes,
-
-              strict_cross_contamination =
-                EXCLUDED.strict_cross_contamination,
-
-              updated_at =
-                NOW()
-            `,
-            [
-              rid,
-              tableId,
-              covers,
-              allergyJson,
-              strictCrossContamination,
-            ]
-          );
-
           return res.json({
             ok: true,
 
@@ -442,7 +497,9 @@ module.exports =
               tableId,
 
             table_name:
-              table.name,
+              operation
+                .table
+                .name,
 
             covers,
 
@@ -451,6 +508,12 @@ module.exports =
 
             strict_cross_contamination:
               strictCrossContamination,
+
+            edge_revision:
+              operation
+                .sync
+                ?.revision ??
+              null,
           });
         } catch (e) {
           console.error(

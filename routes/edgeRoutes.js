@@ -696,6 +696,15 @@ const {
   "../edge/contracts/kdsOperations"
 );
 
+const {
+  TableOperationalSyncError,
+  isTableOperationalEventType,
+  validateTableOperationalEvent,
+  applyTableOperationalCloud,
+} = require(
+  "../edge/contracts/tableOperations"
+);
+
 /*
  * =========================================================
  * EDGE → CLOUD PUSH TRANSPORT
@@ -937,6 +946,22 @@ router.post(
             );
           }
 
+          if (
+            isTableOperationalEventType(
+              rawEvent
+                ?.event_type
+            )
+          ) {
+            validateTableOperationalEvent(
+              rawEvent,
+              {
+                restaurantId,
+                sourceInstallationId:
+                  installationId,
+              }
+            );
+          }
+
           const received =
             await receiveInboxEvent({
               eventId,
@@ -1009,6 +1034,24 @@ router.post(
               });
           }
 
+          if (
+            isTableOperationalEventType(
+              rawEvent
+                ?.event_type
+            )
+          ) {
+            applied =
+              await applyTableOperationalCloud({
+                event:
+                  rawEvent,
+
+                restaurantId,
+
+                sourceInstallationId:
+                  installationId,
+              });
+          }
+
           acked.push({
             event_id:
               eventId,
@@ -1028,7 +1071,9 @@ router.post(
             error instanceof
               PosOperationalSyncError ||
             error instanceof
-              KdsOperationalSyncError
+              KdsOperationalSyncError ||
+            error instanceof
+              TableOperationalSyncError
           ) {
             rejected.push({
               event_id:

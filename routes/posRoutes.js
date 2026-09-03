@@ -26,6 +26,14 @@ const {
 } = require("../edge/contracts/menuCatalog");
 
 const {
+  emitTableOperationalSnapshotTx,
+  emitTableBatchAssignmentSnapshotTx,
+  isTableEdgeProducerRuntime,
+} = require(
+  "../edge/contracts/tableOperations"
+);
+
+const {
   MaksRuntimeRoleError,
   assertCloudRuntime,
 } = require("../utils/runtimeRole");
@@ -166,6 +174,86 @@ function tableNameVariants(input) {
   const tableNum = digits ? `Table ${Number(digits)}` : null;
 
   return Array.from(new Set([raw, canon, justNum, tableNum].filter(Boolean)));
+}
+
+async function emitTableOperationalIfEdge(
+  tx,
+  restaurantId,
+  tableName
+) {
+  if (
+    !isTableEdgeProducerRuntime()
+  ) {
+    return null;
+  }
+
+  /*
+   * Table operational snapshots represent a real physical
+   * restaurant table. POS payment routes also support virtual
+   * destinations such as Takeaway and Delivery, so those must
+   * not manufacture a physical-table revision/event.
+   */
+  const physicalTable =
+    await tx.qGet(
+      `
+      SELECT
+        1 AS ok
+      FROM
+        public.tables
+      WHERE
+        restaurant_id = $1
+        AND LOWER(
+              TRIM(name)
+            ) =
+            LOWER(
+              TRIM($2)
+            )
+      LIMIT 1
+      `,
+      [
+        Number(
+          restaurantId
+        ),
+        String(
+          tableName || ""
+        ).trim(),
+      ]
+    );
+
+  if (
+    !physicalTable?.ok
+  ) {
+    return null;
+  }
+
+  return emitTableOperationalSnapshotTx(
+    tx,
+    {
+      restaurantId,
+      tableName,
+    }
+  );
+}
+
+
+async function emitTableBatchAssignmentIfEdge(
+  tx,
+  restaurantId,
+  batchId
+) {
+  if (
+    !isTableEdgeProducerRuntime()
+  ) {
+    return null;
+  }
+
+  return emitTableBatchAssignmentSnapshotTx(
+    tx,
+    {
+      restaurantId,
+      batchId,
+    }
+  );
 }
 
 async function setTableStatus(qRunFn, rid, tableName, status) {
@@ -6622,10 +6710,18 @@ router.post(
               tableName
             );
 
+            const tableSync =
+              await emitTableOperationalIfEdge(
+                tx,
+                rid,
+                tableName
+              );
+
             return {
               unpaidTotal,
               unpaidCount,
               closeApprover,
+              tableSync,
             };
           }
         );
@@ -7692,6 +7788,12 @@ vat: {
             table
           );
         }
+
+        await emitTableOperationalIfEdge(
+          tx,
+          rid,
+          table
+        );
 
         return {
           settlement,
@@ -8845,6 +8947,12 @@ router.post(
                 table
               );
             }
+
+            await emitTableOperationalIfEdge(
+              tx,
+              restaurantId,
+              table
+            );
 
 
             // =============================================
@@ -10862,6 +10970,12 @@ await tx.qRun(
         pay.table_number
       );
 
+      await emitTableOperationalIfEdge(
+        tx,
+        rid,
+        pay.table_number
+      );
+
       await audit(
         req,
         "POS_REFUND",
@@ -11247,6 +11361,176 @@ router.put(
                     )
                 )
               );
+
+            /*
+             * Edge transfers must have a stable UUID identity for
+             * every moved operational row. Cloud keeps legacy behavior,
+             * but Edge refuses an unsyncable transfer before mutation.
+             */
+            if (
+              isTableEdgeProducerRuntime()
+            ) {
+              const missingBatchIdentity =
+                movedRows.filter(
+                  (row) =>
+                    !isUuid(
+                      String(
+                        row.batch_id ||
+                        ""
+                      ).trim()
+                    )
+                );
+
+              if (
+                missingBatchIdentity.length
+              ) {
+                const error =
+                  new Error(
+                    "This bill cannot be transferred offline because one or more rows do not have a stable batch identity."
+                  );
+
+                error.status =
+                  409;
+
+                error.code =
+                  "EDGE_TABLE_TRANSFER_BATCH_ID_REQUIRED";
+
+                throw error;
+              }
+            }
+
+            batchIds.sort();
+
+            /*
+             * Lock every physical table participating in the transfer
+             * in deterministic name order. This gives session/status
+             * movement one table-level PostgreSQL boundary and prevents
+             * opposite transfers from taking table locks in reverse order.
+             */
+            const physicalTableRows =
+              new Map();
+
+            const physicalTableNames =
+              Array.from(
+                new Set([
+                  ...(
+                    !movingFromTakeaway &&
+                    !movingFromDelivery
+                      ? [
+                          oldTable,
+                        ]
+                      : []
+                  ),
+
+                  ...(
+                    !movingToTakeaway &&
+                    !movingToDelivery
+                      ? [
+                          newTable,
+                        ]
+                      : []
+                  ),
+                ])
+              )
+                .sort(
+                  (
+                    a,
+                    b
+                  ) =>
+                    String(a)
+                      .trim()
+                      .toLowerCase()
+                      .localeCompare(
+                        String(b)
+                          .trim()
+                          .toLowerCase()
+                      )
+                );
+
+            for (
+              const tableName of
+              physicalTableNames
+            ) {
+              const tableRow =
+                await tx.qGet(
+                  tx.kind === "pg"
+                    ? `
+                      SELECT
+                        id,
+                        name,
+                        status
+                      FROM public.tables
+                      WHERE
+                        restaurant_id = $1
+                        AND LOWER(
+                              TRIM(name)
+                            ) =
+                            LOWER(
+                              TRIM($2)
+                            )
+                      LIMIT 1
+                      FOR UPDATE
+                    `
+                    : `
+                      SELECT
+                        id,
+                        name,
+                        status
+                      FROM tables
+                      WHERE
+                        restaurant_id = ?
+                        AND LOWER(
+                              TRIM(name)
+                            ) =
+                            LOWER(
+                              TRIM(?)
+                            )
+                      LIMIT 1
+                    `,
+                  [
+                    rid,
+                    tableName,
+                  ]
+                );
+
+              if (
+                !tableRow?.id
+              ) {
+                const isDestination =
+                  String(
+                    tableName
+                  )
+                    .trim()
+                    .toLowerCase() ===
+                  newNorm;
+
+                const error =
+                  new Error(
+                    isDestination
+                      ? "Destination table not found."
+                      : "Source table not found."
+                  );
+
+                error.status =
+                  404;
+
+                error.code =
+                  isDestination
+                    ? "DESTINATION_TABLE_NOT_FOUND"
+                    : "SOURCE_TABLE_NOT_FOUND";
+
+                throw error;
+              }
+
+              physicalTableRows.set(
+                String(
+                  tableName
+                )
+                  .trim()
+                  .toLowerCase(),
+                tableRow
+              );
+            }
 
             /*
              * =====================================================
@@ -11941,6 +12225,185 @@ router.put(
             }
 
             /*
+             * If the physical source became genuinely free, remove its
+             * stale session. When the destination is another physical
+             * table and has no session of its own, carry the customer
+             * covers/allergy metadata with the bill.
+             *
+             * Existing destination session metadata is preserved rather
+             * than silently overwritten.
+             */
+            if (
+              oldLeft === 0 &&
+              physicalTableRows.has(
+                oldNorm
+              )
+            ) {
+              const sourcePhysical =
+                physicalTableRows.get(
+                  oldNorm
+                );
+
+              const sourceSession =
+                await tx.qGet(
+                  tx.kind === "pg"
+                    ? `
+                      SELECT
+                        covers,
+                        allergy_codes,
+                        strict_cross_contamination
+                      FROM
+                        public.pos_table_sessions
+                      WHERE
+                        restaurant_id = $1
+                        AND table_id = $2
+                      LIMIT 1
+                      FOR UPDATE
+                    `
+                    : `
+                      SELECT
+                        covers,
+                        allergy_codes,
+                        strict_cross_contamination
+                      FROM
+                        pos_table_sessions
+                      WHERE
+                        restaurant_id = ?
+                        AND table_id = ?
+                      LIMIT 1
+                    `,
+                  [
+                    rid,
+                    Number(
+                      sourcePhysical.id
+                    ),
+                  ]
+                );
+
+              if (
+                sourceSession
+              ) {
+                if (
+                  physicalTableRows.has(
+                    newNorm
+                  )
+                ) {
+                  const destinationPhysical =
+                    physicalTableRows.get(
+                      newNorm
+                    );
+
+                  if (
+                    tx.kind === "pg"
+                  ) {
+                    await tx.qRun(
+                      `
+                      INSERT INTO public.pos_table_sessions (
+                        restaurant_id,
+                        table_id,
+                        covers,
+                        allergy_codes,
+                        strict_cross_contamination
+                      )
+                      VALUES (
+                        $1,
+                        $2,
+                        $3,
+                        $4::jsonb,
+                        $5
+                      )
+                      ON CONFLICT (
+                        restaurant_id,
+                        table_id
+                      )
+                      DO NOTHING
+                      `,
+                      [
+                        rid,
+                        Number(
+                          destinationPhysical.id
+                        ),
+                        Number(
+                          sourceSession.covers ||
+                          1
+                        ),
+                        JSON.stringify(
+                          sourceSession
+                            .allergy_codes ||
+                          []
+                        ),
+                        sourceSession
+                          .strict_cross_contamination ===
+                        true,
+                      ]
+                    );
+                  } else {
+                    await tx.qRun(
+                      `
+                      INSERT OR IGNORE INTO pos_table_sessions (
+                        restaurant_id,
+                        table_id,
+                        covers,
+                        allergy_codes,
+                        strict_cross_contamination
+                      )
+                      VALUES (?, ?, ?, ?, ?)
+                      `,
+                      [
+                        rid,
+                        Number(
+                          destinationPhysical.id
+                        ),
+                        Number(
+                          sourceSession.covers ||
+                          1
+                        ),
+                        typeof sourceSession
+                          .allergy_codes ===
+                          "string"
+                          ? sourceSession
+                              .allergy_codes
+                          : JSON.stringify(
+                              sourceSession
+                                .allergy_codes ||
+                              []
+                            ),
+                        sourceSession
+                          .strict_cross_contamination
+                          ? 1
+                          : 0,
+                      ]
+                    );
+                  }
+                }
+
+                await tx.qRun(
+                  tx.kind === "pg"
+                    ? `
+                      DELETE FROM
+                        public.pos_table_sessions
+                      WHERE
+                        restaurant_id = $1
+                        AND table_id = $2
+                    `
+                    : `
+                      DELETE FROM
+                        pos_table_sessions
+                      WHERE
+                        restaurant_id = ?
+                        AND table_id = ?
+                    `,
+                  [
+                    rid,
+                    Number(
+                      sourcePhysical.id
+                    ),
+                  ]
+                );
+              }
+            }
+
+            /*
              * =====================================================
              * 7. FINAL ROW INVARIANT
              * =====================================================
@@ -12054,6 +12517,92 @@ router.put(
               throw error;
             }
 
+            /*
+             * Emit physical table snapshots first, then one authoritative
+             * assignment event per moved batch. Every event shares this
+             * same transfer transaction, so an assignment outbox failure
+             * also rolls back already-written table revisions/events.
+             */
+            const tableSync =
+              [];
+
+            const eventTableNames =
+              Array.from(
+                physicalTableRows
+                  .values()
+              )
+                .map(
+                  (row) =>
+                    String(
+                      row.name || ""
+                    ).trim()
+                )
+                .filter(
+                  Boolean
+                )
+                .sort(
+                  (
+                    a,
+                    b
+                  ) =>
+                    a
+                      .toLowerCase()
+                      .localeCompare(
+                        b.toLowerCase()
+                      )
+                );
+
+            for (
+              const tableName of
+              eventTableNames
+            ) {
+              const sync =
+                await emitTableOperationalIfEdge(
+                  tx,
+                  rid,
+                  tableName
+                );
+
+              if (
+                sync
+              ) {
+                tableSync.push({
+                  table_name:
+                    tableName,
+
+                  revision:
+                    sync.revision,
+                });
+              }
+            }
+
+            const batchSync =
+              [];
+
+            for (
+              const batchId of
+              batchIds
+            ) {
+              const sync =
+                await emitTableBatchAssignmentIfEdge(
+                  tx,
+                  rid,
+                  batchId
+                );
+
+              if (
+                sync
+              ) {
+                batchSync.push({
+                  batch_id:
+                    batchId,
+
+                  revision:
+                    sync.revision,
+                });
+              }
+            }
+
             return {
               moved:
                 movedCount,
@@ -12064,6 +12613,10 @@ router.put(
 
               orderType:
                 nextOrderType,
+
+              tableSync,
+
+              batchSync,
             };
           }
         );
@@ -12717,6 +13270,12 @@ router.post(
                 tableNumber
               );
             }
+
+            await emitTableOperationalIfEdge(
+              tx,
+              restaurantId,
+              tableNumber
+            );
 
             return {
               ids,

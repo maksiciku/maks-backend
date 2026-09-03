@@ -24,8 +24,16 @@ const {
   qAll,
   qGet,
   qRun,
+  withTx,
   kind,
 } = require("../dbCompat");
+
+const {
+  emitTableOperationalSnapshotTx,
+  isTableEdgeProducerRuntime,
+} = require(
+  "../edge/contracts/tableOperations"
+);
 
 // =========================================================
 // HELPERS
@@ -48,6 +56,26 @@ function changedRows(result) {
     result?.rowCount ??
       result?.changes ??
       0
+  );
+}
+
+async function emitTableOperationalIfEdge(
+  tx,
+  restaurantId,
+  tableName
+) {
+  if (
+    !isTableEdgeProducerRuntime()
+  ) {
+    return null;
+  }
+
+  return emitTableOperationalSnapshotTx(
+    tx,
+    {
+      restaurantId,
+      tableName,
+    }
   );
 }
 
@@ -753,96 +781,158 @@ router.put(
         });
       }
 
-      const isPg =
-        kind === "pg";
+      const operation =
+        await withTx(
+          async (tx) => {
+            const table =
+              await tx.qGet(
+                tx.kind === "pg"
+                  ? `
+                    SELECT
+                      id,
+                      name,
+                      status
+                    FROM public.tables
+                    WHERE
+                      id = $1
+                      AND restaurant_id = $2
+                    FOR UPDATE
+                  `
+                  : `
+                    SELECT
+                      id,
+                      name,
+                      status
+                    FROM tables
+                    WHERE
+                      id = ?
+                      AND restaurant_id = ?
+                    LIMIT 1
+                  `,
+                [
+                  id,
+                  rid,
+                ]
+              );
 
-      const result =
-        await qRun(
-          isPg
-            ? `
-              UPDATE public.tables
+            if (
+              !table?.id
+            ) {
+              return {
+                found:
+                  false,
+                sync:
+                  null,
+              };
+            }
 
-              SET
-                status = $1
+            await tx.qRun(
+              tx.kind === "pg"
+                ? `
+                  UPDATE public.tables
 
-              WHERE
-                id = $2
-                AND restaurant_id = $3
-            `
-            : `
-              UPDATE tables
+                  SET
+                    status = $1
 
-              SET
-                status = ?
+                  WHERE
+                    id = $2
+                    AND restaurant_id = $3
+                `
+                : `
+                  UPDATE tables
 
-              WHERE
-                id = ?
-                AND restaurant_id = ?
-            `,
-          [
-            status,
-            id,
-            rid,
-          ]
+                  SET
+                    status = ?
+
+                  WHERE
+                    id = ?
+                    AND restaurant_id = ?
+                `,
+              [
+                status,
+                id,
+                rid,
+              ]
+            );
+
+            /*
+             * table_map is a presentation mirror.
+             * Match by tenant + canonical table name, never
+             * by an unrelated local bigint map id.
+             */
+            await tx.qRun(
+              tx.kind === "pg"
+                ? `
+                  UPDATE public.table_map
+
+                  SET
+                    status = $1
+
+                  WHERE
+                    restaurant_id = $2
+
+                    AND LOWER(
+                          TRIM(name)
+                        ) =
+                        LOWER(
+                          TRIM($3)
+                        )
+                `
+                : `
+                  UPDATE table_map
+
+                  SET
+                    status = ?
+
+                  WHERE
+                    restaurant_id = ?
+
+                    AND LOWER(
+                          TRIM(name)
+                        ) =
+                        LOWER(
+                          TRIM(?)
+                        )
+                `,
+              [
+                status,
+                rid,
+                table.name,
+              ]
+            );
+
+            const sync =
+              await emitTableOperationalIfEdge(
+                tx,
+                rid,
+                table.name
+              );
+
+            return {
+              found:
+                true,
+              sync,
+            };
+          }
         );
 
-      const changes =
-        changedRows(
-          result
-        );
-
-      if (!changes) {
+      if (
+        !operation.found
+      ) {
         return res.status(404).json({
           error:
             "Table not found",
         });
       }
 
-      /*
-       * Keep table_map aligned if a corresponding map row
-       * exists. Failure here must not falsely undo the
-       * successful canonical tables update.
-       */
-      await qRun(
-        isPg
-          ? `
-            UPDATE public.table_map
-
-            SET
-              status = $1
-
-            WHERE
-              id = $2
-              AND restaurant_id = $3
-          `
-          : `
-            UPDATE table_map
-
-            SET
-              status = ?
-
-            WHERE
-              id = ?
-              AND restaurant_id = ?
-          `,
-        [
-          status,
-          id,
-          rid,
-        ]
-      ).catch(
-        (err) => {
-          console.error(
-            "⚠️ table_map status sync failed:",
-            err?.message ||
-            err
-          );
-        }
-      );
-
       return res.json({
         success: true,
         status,
+        edge_revision:
+          operation
+            .sync
+            ?.revision ??
+          null,
       });
     } catch (err) {
       console.error(
