@@ -705,6 +705,15 @@ const {
   "../edge/contracts/tableOperations"
 );
 
+const {
+  FINANCIAL_SETTLEMENT_RECORDED_EVENT_TYPE,
+  FinancialOperationalSyncError,
+  validateFinancialSettlementRecordedEvent,
+  applyFinancialSettlementRecordedCloud,
+} = require(
+  "../edge/contracts/financialOperations"
+);
+
 /*
  * =========================================================
  * EDGE → CLOUD PUSH TRANSPORT
@@ -962,6 +971,24 @@ router.post(
             );
           }
 
+          if (
+            String(
+              rawEvent
+                ?.event_type ||
+              ""
+            ) ===
+            FINANCIAL_SETTLEMENT_RECORDED_EVENT_TYPE
+          ) {
+            validateFinancialSettlementRecordedEvent(
+              rawEvent,
+              {
+                restaurantId,
+                sourceInstallationId:
+                  installationId,
+              }
+            );
+          }
+
           const received =
             await receiveInboxEvent({
               eventId,
@@ -1052,6 +1079,26 @@ router.post(
               });
           }
 
+          if (
+            String(
+              rawEvent
+                ?.event_type ||
+              ""
+            ) ===
+            FINANCIAL_SETTLEMENT_RECORDED_EVENT_TYPE
+          ) {
+            applied =
+              await applyFinancialSettlementRecordedCloud({
+                event:
+                  rawEvent,
+
+                restaurantId,
+
+                sourceInstallationId:
+                  installationId,
+              });
+          }
+
           acked.push({
             event_id:
               eventId,
@@ -1073,7 +1120,9 @@ router.post(
             error instanceof
               KdsOperationalSyncError ||
             error instanceof
-              TableOperationalSyncError
+              TableOperationalSyncError ||
+            error instanceof
+              FinancialOperationalSyncError
           ) {
             rejected.push({
               event_id:

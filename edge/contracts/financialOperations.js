@@ -9,8 +9,15 @@ const {
 const {
   RUNTIME_ROLES,
   getRuntimeRole,
+  assertCloudRuntime,
 } = require(
   "../../utils/runtimeRole"
+);
+
+const {
+  withTx,
+} = require(
+  "../../dbCompat"
 );
 
 
@@ -1647,6 +1654,1212 @@ async function loadFinancialSettlementSnapshotTx(
 }
 
 
+
+/*
+ * =========================================================
+ * CLOUD FINANCIAL SETTLEMENT MATERIALIZATION
+ * =========================================================
+ *
+ * Immutable scope only:
+ *
+ *   payment_settlements
+ *   payments
+ *
+ * This phase intentionally does NOT mutate:
+ *
+ *   pos_orders.paid
+ *   pos_orders.amount_paid
+ *   pos_orders.remaining_price
+ *   cash-up ownership
+ *
+ * Edge-local BIGSERIAL/FK identities are never Cloud
+ * authority.
+ */
+
+
+function financialOrderRefKey(
+  ref
+) {
+  return [
+    ref.edge_submission_id,
+    ref.edge_row_ordinal,
+    ref.batch_id,
+  ].join(":");
+}
+
+
+function validateFinancialSettlementRecordedEvent(
+  event,
+  {
+    restaurantId,
+    sourceInstallationId,
+  }
+) {
+  if (
+    !event ||
+    typeof event !== "object" ||
+    Array.isArray(event)
+  ) {
+    fail(
+      "EDGE_FINANCIAL_EVENT_INVALID",
+      "Financial settlement event must be an object"
+    );
+  }
+
+  const bytes =
+    Buffer.byteLength(
+      JSON.stringify(
+        event
+      ),
+      "utf8"
+    );
+
+  /*
+   * Payload itself is capped at 768 KiB. Permit a small
+   * envelope allowance for event metadata.
+   */
+  if (
+    bytes >
+    MAX_EVENT_BYTES +
+      (16 * 1024)
+  ) {
+    fail(
+      "EDGE_FINANCIAL_EVENT_TOO_LARGE",
+      "Financial settlement event is too large"
+    );
+  }
+
+  const rid =
+    requireRestaurantId(
+      restaurantId
+    );
+
+  const installationId =
+    requireUuid(
+      sourceInstallationId,
+      "sourceInstallationId"
+    );
+
+  const eventId =
+    requireUuid(
+      event.event_id,
+      "event.event_id"
+    );
+
+  if (
+    String(
+      event.event_type ||
+      ""
+    ) !==
+    FINANCIAL_SETTLEMENT_RECORDED_EVENT_TYPE
+  ) {
+    fail(
+      "EDGE_FINANCIAL_EVENT_TYPE_INVALID",
+      "Unexpected financial settlement event type"
+    );
+  }
+
+  if (
+    String(
+      event.entity_type ||
+      ""
+    ) !==
+    "payment_settlement"
+  ) {
+    fail(
+      "EDGE_FINANCIAL_ENTITY_TYPE_INVALID",
+      "Financial settlement event entity_type must be payment_settlement"
+    );
+  }
+
+  const eventRid =
+    requireRestaurantId(
+      event.restaurant_id
+    );
+
+  if (
+    eventRid !==
+    rid
+  ) {
+    fail(
+      "EDGE_FINANCIAL_TENANT_MISMATCH",
+      "Financial settlement event restaurant does not match authenticated Edge"
+    );
+  }
+
+  const payload =
+    validateFinancialSettlementPayload(
+      event.payload
+    );
+
+  if (
+    Number(
+      payload.restaurant_id
+    ) !==
+    rid
+  ) {
+    fail(
+      "EDGE_FINANCIAL_TENANT_MISMATCH",
+      "Financial settlement payload crossed restaurant boundary"
+    );
+  }
+
+  const entityId =
+    requireUuid(
+      event.entity_id,
+      "event.entity_id"
+    );
+
+  if (
+    entityId !==
+    payload.settlement.id
+  ) {
+    fail(
+      "EDGE_FINANCIAL_SETTLEMENT_ID_MISMATCH",
+      "Financial event entity_id does not match settlement UUID"
+    );
+  }
+
+  const expectedIdempotencyKey =
+    `${FINANCIAL_SETTLEMENT_RECORDED_EVENT_TYPE}:${payload.settlement.id}`;
+
+  if (
+    String(
+      event.idempotency_key ||
+      ""
+    ) !==
+    expectedIdempotencyKey
+  ) {
+    fail(
+      "EDGE_FINANCIAL_IDEMPOTENCY_MISMATCH",
+      "Financial event idempotency key does not match settlement UUID"
+    );
+  }
+
+  return {
+    event_id:
+      eventId,
+
+    restaurant_id:
+      rid,
+
+    source_installation_id:
+      installationId,
+
+    event_type:
+      FINANCIAL_SETTLEMENT_RECORDED_EVENT_TYPE,
+
+    entity_type:
+      "payment_settlement",
+
+    entity_id:
+      payload.settlement.id,
+
+    idempotency_key:
+      expectedIdempotencyKey,
+
+    payload,
+  };
+}
+
+
+function collectFinancialOrderRefs(
+  payload
+) {
+  const refs =
+    new Map();
+
+  const add =
+    (
+      ref,
+      field
+    ) => {
+      const normalized =
+        normalizeOrderRef(
+          ref,
+          field
+        );
+
+      const key =
+        financialOrderRefKey(
+          normalized
+        );
+
+      refs.set(
+        key,
+        normalized
+      );
+    };
+
+  payload
+    .settlement
+    .order_refs
+    .forEach(
+      (ref, index) =>
+        add(
+          ref,
+          `settlement.order_refs[${index}]`
+        )
+    );
+
+  payload
+    .tenders
+    .forEach(
+      (tender, tenderIndex) => {
+        tender
+          .order_refs
+          .forEach(
+            (ref, refIndex) =>
+              add(
+                ref,
+                `tenders[${tenderIndex}].order_refs[${refIndex}]`
+              )
+          );
+      }
+    );
+
+  return Array.from(
+    refs.values()
+  );
+}
+
+
+async function resolveCloudFinancialOrderRefsTx(
+  tx,
+  restaurantId,
+  refs
+) {
+  requireTx(
+    tx
+  );
+
+  const rid =
+    requireRestaurantId(
+      restaurantId
+    );
+
+  const mapping =
+    new Map();
+
+  for (
+    const rawRef of refs
+  ) {
+    const ref =
+      normalizeOrderRef(
+        rawRef
+      );
+
+    const rows =
+      await tx.qAll(
+        `
+        SELECT
+          id,
+          restaurant_id,
+          batch_id,
+          edge_submission_id,
+          edge_row_ordinal
+        FROM
+          public.pos_orders
+        WHERE
+          restaurant_id = $1
+          AND edge_submission_id =
+            $2::uuid
+          AND edge_row_ordinal =
+            $3
+        ORDER BY
+          id ASC
+        FOR UPDATE
+        `,
+        [
+          rid,
+          ref.edge_submission_id,
+          ref.edge_row_ordinal,
+        ]
+      );
+
+    if (
+      rows.length ===
+      0
+    ) {
+      fail(
+        "EDGE_FINANCIAL_ORDER_DEPENDENCY_MISSING",
+        "Financial settlement references a POS row that is not materialized in Cloud yet",
+        {
+          edge_submission_id:
+            ref.edge_submission_id,
+
+          edge_row_ordinal:
+            ref.edge_row_ordinal,
+
+          batch_id:
+            ref.batch_id,
+        }
+      );
+    }
+
+    if (
+      rows.length !==
+      1
+    ) {
+      fail(
+        "EDGE_FINANCIAL_ORDER_IDENTITY_AMBIGUOUS",
+        "Portable POS identity resolves to multiple Cloud rows",
+        {
+          edge_submission_id:
+            ref.edge_submission_id,
+
+          edge_row_ordinal:
+            ref.edge_row_ordinal,
+        }
+      );
+    }
+
+    const row =
+      rows[0];
+
+    if (
+      String(
+        row.batch_id ||
+        ""
+      ).toLowerCase() !==
+      ref.batch_id
+    ) {
+      fail(
+        "EDGE_FINANCIAL_ORDER_BATCH_MISMATCH",
+        "Portable financial POS reference resolved to the wrong batch",
+        {
+          edge_submission_id:
+            ref.edge_submission_id,
+
+          edge_row_ordinal:
+            ref.edge_row_ordinal,
+
+          expected_batch_id:
+            ref.batch_id,
+
+          cloud_batch_id:
+            row.batch_id ||
+            null,
+        }
+      );
+    }
+
+    const cloudId =
+      Number(
+        row.id
+      );
+
+    if (
+      !Number.isSafeInteger(
+        cloudId
+      ) ||
+      cloudId <=
+        0
+    ) {
+      fail(
+        "EDGE_FINANCIAL_CLOUD_ORDER_ID_INVALID",
+        "Resolved Cloud POS row has an invalid local identity"
+      );
+    }
+
+    mapping.set(
+      financialOrderRefKey(
+        ref
+      ),
+      cloudId
+    );
+  }
+
+  return mapping;
+}
+
+
+function cloudOrderIdsForRefs(
+  refs,
+  mapping
+) {
+  return refs.map(
+    (rawRef) => {
+      const ref =
+        normalizeOrderRef(
+          rawRef
+        );
+
+      const id =
+        mapping.get(
+          financialOrderRefKey(
+            ref
+          )
+        );
+
+      if (
+        !Number.isSafeInteger(
+          id
+        ) ||
+        id <=
+          0
+      ) {
+        fail(
+          "EDGE_FINANCIAL_CLOUD_ORDER_MAPPING_MISSING",
+          "Financial POS reference has no Cloud-local mapping"
+        );
+      }
+
+      return id;
+    }
+  );
+}
+
+
+function localizeFinancialPricingSnapshot(
+  value,
+  mapping,
+  path = []
+) {
+  if (
+    Array.isArray(
+      value
+    )
+  ) {
+    return value.map(
+      (one, index) =>
+        localizeFinancialPricingSnapshot(
+          one,
+          mapping,
+          [
+            ...path,
+            index,
+          ]
+        )
+    );
+  }
+
+  if (
+    !value ||
+    typeof value !==
+      "object"
+  ) {
+    return value;
+  }
+
+  const out =
+    {};
+
+  for (
+    const [
+      key,
+      child,
+    ] of Object.entries(
+      value
+    )
+  ) {
+    /*
+     * Edge converted local pricing_snapshot.pos_order_id
+     * fields into portable order_ref objects.
+     *
+     * Cloud converts only that portable marker back into
+     * its own local POS BIGINT identity for existing receipt
+     * and settlement readers.
+     */
+    if (
+      key ===
+      "order_ref"
+    ) {
+      const ref =
+        normalizeOrderRef(
+          child,
+          [
+            "pricing_snapshot",
+            ...path,
+            key,
+          ].join(".")
+        );
+
+      const cloudId =
+        mapping.get(
+          financialOrderRefKey(
+            ref
+          )
+        );
+
+      if (
+        !Number.isSafeInteger(
+          cloudId
+        ) ||
+        cloudId <=
+          0
+      ) {
+        fail(
+          "EDGE_FINANCIAL_PRICING_CLOUD_ORDER_REF_MISSING",
+          "Pricing snapshot order_ref has no Cloud-local POS mapping"
+        );
+      }
+
+      out.pos_order_id =
+        cloudId;
+
+      continue;
+    }
+
+    out[key] =
+      localizeFinancialPricingSnapshot(
+        child,
+        mapping,
+        [
+          ...path,
+          key,
+        ]
+      );
+  }
+
+  return out;
+}
+
+
+async function applyFinancialSettlementRecordedCloud({
+  event,
+  restaurantId,
+  sourceInstallationId,
+}) {
+  assertCloudRuntime();
+
+  const normalized =
+    validateFinancialSettlementRecordedEvent(
+      event,
+      {
+        restaurantId,
+        sourceInstallationId,
+      }
+    );
+
+  const payload =
+    normalized.payload;
+
+  const settlement =
+    payload.settlement;
+
+  return withTx(
+    async (tx) => {
+      await tx.qGet(
+        `
+        SELECT
+          pg_advisory_xact_lock(
+            hashtextextended(
+              $1,
+              0
+            )
+          ) AS locked
+        `,
+        [
+          `maks:cloud-financial:${normalized.restaurant_id}:${settlement.id}`,
+        ]
+      );
+
+      const inbox =
+        await tx.qGet(
+          `
+          SELECT
+            event_id,
+            restaurant_id,
+            source,
+            source_installation_id,
+            event_type,
+            entity_type,
+            entity_id,
+            status,
+            applied_at
+          FROM
+            public.edge_inbox
+          WHERE
+            event_id =
+              $1::uuid
+          FOR UPDATE
+          `,
+          [
+            normalized.event_id,
+          ]
+        );
+
+      if (
+        !inbox
+      ) {
+        fail(
+          "EDGE_FINANCIAL_INBOX_REQUIRED",
+          "Financial event must be durably received before Cloud apply"
+        );
+      }
+
+      if (
+        Number(
+          inbox.restaurant_id
+        ) !==
+          normalized.restaurant_id ||
+
+        String(
+          inbox.source ||
+          ""
+        ) !==
+          "edge" ||
+
+        String(
+          inbox.source_installation_id ||
+          ""
+        ) !==
+          normalized.source_installation_id ||
+
+        String(
+          inbox.event_type ||
+          ""
+        ) !==
+          FINANCIAL_SETTLEMENT_RECORDED_EVENT_TYPE ||
+
+        String(
+          inbox.entity_type ||
+          ""
+        ) !==
+          "payment_settlement" ||
+
+        String(
+          inbox.entity_id ||
+          ""
+        ).toLowerCase() !==
+          settlement.id
+      ) {
+        fail(
+          "EDGE_FINANCIAL_INBOX_IDENTITY_MISMATCH",
+          "Durable inbox identity does not match financial settlement event"
+        );
+      }
+
+      if (
+        String(
+          inbox.status ||
+          ""
+        ) ===
+        "applied"
+      ) {
+        return {
+          duplicate:
+            true,
+
+          settlement_id:
+            settlement.id,
+
+          tenders:
+            0,
+
+          order_refs:
+            0,
+        };
+      }
+
+      if (
+        ![
+          "received",
+          "failed",
+        ].includes(
+          String(
+            inbox.status ||
+            ""
+          )
+        )
+      ) {
+        fail(
+          "EDGE_FINANCIAL_INBOX_STATE_INVALID",
+          "Financial inbox event is not in an applicable state"
+        );
+      }
+
+      const workerId =
+        `cloud-financial-inline:${normalized.source_installation_id}`;
+
+      const claimed =
+        await tx.qGet(
+          `
+          UPDATE
+            public.edge_inbox
+          SET
+            status =
+              'applying',
+
+            apply_attempts =
+              apply_attempts + 1,
+
+            locked_at =
+              NOW(),
+
+            locked_by =
+              $3,
+
+            last_attempt_at =
+              NOW(),
+
+            last_error =
+              NULL,
+
+            updated_at =
+              NOW()
+
+          WHERE
+            event_id =
+              $1::uuid
+
+            AND restaurant_id =
+              $2
+
+            AND status IN (
+              'received',
+              'failed'
+            )
+
+          RETURNING
+            event_id,
+            status,
+            apply_attempts,
+            locked_by
+          `,
+          [
+            normalized.event_id,
+            normalized.restaurant_id,
+            workerId,
+          ]
+        );
+
+      if (
+        !claimed
+          ?.event_id ||
+
+        String(
+          claimed.status ||
+          ""
+        ) !==
+          "applying" ||
+
+        String(
+          claimed.locked_by ||
+          ""
+        ) !==
+          workerId
+      ) {
+        fail(
+          "EDGE_FINANCIAL_INBOX_CLAIM_FAILED",
+          "Financial inbox event could not enter applying state"
+        );
+      }
+
+      const refs =
+        collectFinancialOrderRefs(
+          payload
+        );
+
+      const orderMapping =
+        await resolveCloudFinancialOrderRefsTx(
+          tx,
+          normalized.restaurant_id,
+          refs
+        );
+
+      const settlementOrderIds =
+        cloudOrderIdsForRefs(
+          settlement.order_refs,
+          orderMapping
+        );
+
+      const cloudPricingSnapshot =
+        localizeFinancialPricingSnapshot(
+          settlement.pricing_snapshot,
+          orderMapping
+        );
+
+      /*
+       * A replay of the SAME event would have returned above
+       * from inbox.status='applied'.
+       *
+       * Therefore a pre-existing settlement UUID here is a
+       * conflicting identity, not a legitimate replay.
+       */
+      const existingSettlement =
+        await tx.qGet(
+          `
+          SELECT
+            id,
+            restaurant_id
+          FROM
+            public.payment_settlements
+          WHERE
+            id =
+              $1::uuid
+          FOR UPDATE
+          `,
+          [
+            settlement.id,
+          ]
+        );
+
+      if (
+        existingSettlement
+      ) {
+        fail(
+          "EDGE_FINANCIAL_SETTLEMENT_UUID_CONFLICT",
+          "Settlement UUID already exists in Cloud outside this applied event",
+          {
+            settlement_id:
+              settlement.id,
+
+            existing_restaurant_id:
+              Number(
+                existingSettlement
+                  .restaurant_id
+              ),
+          }
+        );
+      }
+
+      const tenderUuids =
+        payload.tenders.map(
+          (tender) =>
+            tender.payment_uuid
+        );
+
+      if (
+        tenderUuids.length
+      ) {
+        const existingTenders =
+          await tx.qAll(
+            `
+            SELECT
+              id,
+              restaurant_id,
+              settlement_id,
+              payment_uuid
+            FROM
+              public.payments
+            WHERE
+              payment_uuid =
+                ANY(
+                  $1::uuid[]
+                )
+            ORDER BY
+              id ASC
+            FOR UPDATE
+            `,
+            [
+              tenderUuids,
+            ]
+          );
+
+        if (
+          existingTenders.length
+        ) {
+          fail(
+            "EDGE_FINANCIAL_PAYMENT_UUID_CONFLICT",
+            "Tender payment UUID already exists in Cloud outside this applied event",
+            {
+              payment_uuids:
+                existingTenders.map(
+                  (row) =>
+                    row.payment_uuid
+                ),
+            }
+          );
+        }
+      }
+
+      await tx.qRun(
+        `
+        INSERT INTO
+          public.payment_settlements
+        (
+          id,
+          restaurant_id,
+          table_number,
+          batch_id,
+          invoice_number,
+
+          gross_amount,
+          pricing_discount_amount,
+          happy_hour_discount_amount,
+          deal_adjusted_amount,
+
+          voucher_id,
+          voucher_code,
+          voucher_discount_amount,
+
+          manual_discount_amount,
+          service_charge_amount,
+          final_amount,
+
+          applied_rule_ids,
+          pos_order_ids,
+          pricing_snapshot,
+
+          source,
+          created_by_user_id,
+          created_at
+        )
+        VALUES
+        (
+          $1::uuid,
+          $2,
+          $3,
+          $4::uuid,
+          $5,
+
+          $6,
+          $7,
+          $8,
+          $9,
+
+          NULL,
+          $10,
+          $11,
+
+          $12,
+          $13,
+          $14,
+
+          $15::jsonb,
+          $16::jsonb,
+          $17::jsonb,
+
+          $18,
+          NULL,
+          COALESCE(
+            $19::timestamptz,
+            NOW()
+          )
+        )
+        `,
+        [
+          settlement.id,
+          normalized.restaurant_id,
+          settlement.table_number,
+          settlement.batch_id,
+          settlement.invoice_number,
+
+          settlement.gross_amount,
+          settlement.pricing_discount_amount,
+          settlement.happy_hour_discount_amount,
+          settlement.deal_adjusted_amount,
+
+          settlement.voucher_code,
+          settlement.voucher_discount_amount,
+
+          settlement.manual_discount_amount,
+          settlement.service_charge_amount,
+          settlement.final_amount,
+
+          JSON.stringify(
+            settlement.applied_rule_ids ||
+            []
+          ),
+
+          JSON.stringify(
+            settlementOrderIds
+          ),
+
+          JSON.stringify(
+            cloudPricingSnapshot ||
+            {}
+          ),
+
+          settlement.source ||
+            "pos",
+
+          settlement.created_at,
+        ]
+      );
+
+      for (
+        const tender of
+          payload.tenders
+      ) {
+        const tenderOrderIds =
+          cloudOrderIdsForRefs(
+            tender.order_refs,
+            orderMapping
+          );
+
+        await tx.qRun(
+          `
+          INSERT INTO
+            public.payments
+          (
+            table_number,
+            amount,
+            method,
+            discount_value,
+            discount_type,
+            service_rate,
+            created_at,
+
+            restaurant_id,
+            batch_id,
+            staff_user_id,
+            terminal_ref,
+            pos_order_ids,
+            source,
+            status,
+
+            void_reason,
+            voided_at,
+            voided_by_user_id,
+            refund_of_payment_id,
+            cashup_session_id,
+            ref_payment_id,
+
+            settlement_id,
+            payment_uuid,
+            ref_payment_uuid
+          )
+          VALUES
+          (
+            $1,
+            $2,
+            $3,
+            $4,
+            $5,
+            $6,
+            COALESCE(
+              $7::timestamptz,
+              NOW()
+            ),
+
+            $8,
+            $9::uuid,
+            NULL,
+            $10,
+            $11::jsonb,
+            $12,
+            $13,
+
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+
+            $14::uuid,
+            $15::uuid,
+            NULL
+          )
+          `,
+          [
+            settlement.table_number,
+            tender.amount,
+            tender.method,
+            tender.discount_value,
+            tender.discount_type,
+            tender.service_rate,
+            tender.created_at,
+
+            normalized.restaurant_id,
+            tender.batch_id,
+            tender.terminal_ref,
+
+            JSON.stringify(
+              tenderOrderIds
+            ),
+
+            tender.source ||
+              "pos",
+
+            tender.status ||
+              "completed",
+
+            settlement.id,
+            tender.payment_uuid,
+          ]
+        );
+      }
+
+      const applied =
+        await tx.qGet(
+          `
+          UPDATE
+            public.edge_inbox
+          SET
+            status =
+              'applied',
+
+            applied_at =
+              NOW(),
+
+            last_error =
+              NULL,
+
+            locked_at =
+              NULL,
+
+            locked_by =
+              NULL,
+
+            updated_at =
+              NOW()
+
+          WHERE
+            event_id =
+              $1::uuid
+
+            AND restaurant_id =
+              $2
+
+            AND status =
+              'applying'
+
+            AND locked_by =
+              $3
+
+          RETURNING
+            event_id,
+            status,
+            applied_at
+          `,
+          [
+            normalized.event_id,
+            normalized.restaurant_id,
+            workerId,
+          ]
+        );
+
+      if (
+        !applied
+          ?.event_id ||
+
+        String(
+          applied.status ||
+          ""
+        ) !==
+          "applied" ||
+
+        !applied
+          .applied_at
+      ) {
+        fail(
+          "EDGE_FINANCIAL_INBOX_FINALIZE_FAILED",
+          "Financial inbox event could not enter applied state"
+        );
+      }
+
+      return {
+        duplicate:
+          false,
+
+        settlement_id:
+          settlement.id,
+
+        tenders:
+          payload.tenders.length,
+
+        order_refs:
+          refs.length,
+      };
+    }
+  );
+}
+
+
 async function emitFinancialSettlementRecordedTx(
   tx,
   {
@@ -1721,6 +2934,8 @@ module.exports = {
   FinancialOperationalSyncError,
   isFinancialEdgeProducerRuntime,
   validateFinancialSettlementPayload,
+  validateFinancialSettlementRecordedEvent,
+  applyFinancialSettlementRecordedCloud,
   loadFinancialSettlementSnapshotTx,
   emitFinancialSettlementRecordedTx,
 };
