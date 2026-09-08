@@ -1354,6 +1354,518 @@ test(
 
 /*
  * =====================================================
+ * 8A. REAL CASH REFUND COUNTS EXACTLY ONCE
+ * =====================================================
+ */
+
+test(
+  "LEDGER: real partial cash refund reduces expected cash exactly once",
+  async () => {
+    /*
+     * Everything created before this DB timestamp is
+     * excluded from this test's financial window.
+     */
+    const clock =
+      await one(
+        `
+        SELECT
+          NOW() AS from_ts,
+          NOW() +
+            INTERVAL '2 minutes'
+            AS to_ts
+        `
+      );
+
+    assert.ok(
+      clock?.from_ts
+    );
+
+    assert.ok(
+      clock?.to_ts
+    );
+
+    const range = {
+      from:
+        new Date(
+          clock.from_ts
+        ).toISOString(),
+
+      to:
+        new Date(
+          clock.to_ts
+        ).toISOString(),
+    };
+
+    /*
+     * Create a real POS order and pay it entirely
+     * using cash.
+     */
+    const sale =
+      await createPaidSaleA(
+        "Table CASH-REFUND-1"
+      );
+
+    const saleAmount =
+      money(
+        sale.payment.amount
+      );
+
+    assert.ok(
+      saleAmount > 0
+    );
+
+    /*
+     * Before refund, expected cash must equal the
+     * isolated positive cash tender.
+     */
+    const beforeSummary =
+      await request(app)
+        .get(
+          "/cashup/summary"
+        )
+        .set(
+          "Authorization",
+          bearer(tokenA)
+        )
+        .query({
+          from:
+            range.from,
+
+          to:
+            range.to,
+        });
+
+    assert.equal(
+      beforeSummary.status,
+      200,
+      JSON.stringify(
+        beforeSummary.body
+      )
+    );
+
+    const beforeCash =
+      (
+        beforeSummary.body
+          ?.by_method ||
+        []
+      ).find(
+        (row) =>
+          row.method ===
+          "cash"
+      );
+
+    assert.ok(
+      beforeCash
+    );
+
+    assert.equal(
+      money(
+        beforeCash.total
+      ),
+      saleAmount
+    );
+
+    assert.equal(
+      money(
+        beforeSummary.body
+          ?.expected_cash
+      ),
+      saleAmount
+    );
+
+    /*
+     * Deliberately make this a partial refund.
+     */
+    const refundAmount =
+      money(
+        Math.min(
+          5,
+          saleAmount / 2
+        )
+      );
+
+    assert.ok(
+      refundAmount > 0
+    );
+
+    assert.ok(
+      refundAmount <
+        saleAmount
+    );
+
+    /*
+     * Use the real production refund route.
+     */
+    const refundResponse =
+      await request(app)
+        .post(
+          `/orders/payments/${sale.payment.id}/refund`
+        )
+        .set(
+          "Authorization",
+          bearer(tokenA)
+        )
+        .send({
+          amount:
+            refundAmount,
+
+          reason:
+            "CASHUP EXACTLY ONCE REGRESSION",
+        });
+
+    assert.ok(
+      is2xx(
+        refundResponse.status
+      ),
+      `Refund failed: ${
+        refundResponse.status
+      } ${JSON.stringify(
+        refundResponse.body
+      )}`
+    );
+
+    /*
+     * Refund B must exist as negative cash money.
+     */
+    const refund =
+      await one(
+        `
+        SELECT
+          id,
+          restaurant_id,
+          amount,
+          method,
+          status,
+          source,
+          ref_payment_id,
+          cashup_session_id,
+          created_at
+
+        FROM public.payments
+
+        WHERE restaurant_id =
+              $1
+
+          AND ref_payment_id =
+              $2
+
+          AND amount < 0
+
+          AND LOWER(
+            COALESCE(
+              status,
+              'completed'
+            )
+          ) <> 'voided'
+
+        ORDER BY id DESC
+
+        LIMIT 1
+        `,
+        [
+          fixtures.restaurantA,
+
+          Number(
+            sale.payment.id
+          ),
+        ]
+      );
+
+    assert.ok(
+      refund
+    );
+
+    assert.equal(
+      money(
+        refund.amount
+      ),
+      -refundAmount
+    );
+
+    assert.equal(
+      String(
+        refund.method
+      ).toLowerCase(),
+      "cash"
+    );
+
+    assert.equal(
+      String(
+        refund.source
+      ).toLowerCase(),
+      "refund"
+    );
+
+    assert.equal(
+      Number(
+        refund.ref_payment_id
+      ),
+      Number(
+        sale.payment.id
+      )
+    );
+
+    assert.equal(
+      refund.cashup_session_id,
+      null
+    );
+
+    /*
+     * Critical exactly-once boundary:
+     *
+     * the negative payment ledger row must NOT also
+     * create a cash_drawer_moves refund row.
+     */
+    const drawerRefund =
+      await one(
+        `
+        SELECT
+          COUNT(*)::int AS count,
+
+          COALESCE(
+            SUM(amount),
+            0
+          )::numeric AS total
+
+        FROM public.cash_drawer_moves
+
+        WHERE restaurant_id =
+              $1
+
+          AND LOWER(kind) =
+              'refund'
+
+          AND created_at
+              BETWEEN $2 AND $3
+        `,
+        [
+          fixtures.restaurantA,
+          range.from,
+          range.to,
+        ]
+      );
+
+    assert.equal(
+      Number(
+        drawerRefund?.count ||
+        0
+      ),
+      0,
+      "POS refund created a duplicate cash drawer refund"
+    );
+
+    assert.equal(
+      money(
+        drawerRefund?.total
+      ),
+      0
+    );
+
+    const expectedAfterRefund =
+      money(
+        saleAmount -
+        refundAmount
+      );
+
+    /*
+     * +A and -B must now net to exactly the amount
+     * physically expected in the till.
+     */
+    const afterSummary =
+      await request(app)
+        .get(
+          "/cashup/summary"
+        )
+        .set(
+          "Authorization",
+          bearer(tokenA)
+        )
+        .query({
+          from:
+            range.from,
+
+          to:
+            range.to,
+        });
+
+    assert.equal(
+      afterSummary.status,
+      200,
+      JSON.stringify(
+        afterSummary.body
+      )
+    );
+
+    const afterCash =
+      (
+        afterSummary.body
+          ?.by_method ||
+        []
+      ).find(
+        (row) =>
+          row.method ===
+          "cash"
+      );
+
+    assert.ok(
+      afterCash
+    );
+
+    assert.equal(
+      money(
+        afterCash.total
+      ),
+      expectedAfterRefund
+    );
+
+    assert.equal(
+      money(
+        afterSummary.body
+          ?.expected_cash
+      ),
+      expectedAfterRefund
+    );
+
+    /*
+     * Close with exactly the amount expected to remain
+     * physically in the drawer.
+     */
+    const close =
+      await closeCashup({
+        from:
+          range.from,
+
+        to:
+          range.to,
+
+        actualCash:
+          expectedAfterRefund,
+
+        note:
+          "cash refund exactly-once regression",
+      });
+
+    assert.ok(
+      is2xx(
+        close.status
+      ),
+      JSON.stringify(
+        close.body
+      )
+    );
+
+    assert.equal(
+      money(
+        close.body
+          ?.expected_cash
+      ),
+      expectedAfterRefund
+    );
+
+    assert.equal(
+      money(
+        close.body
+          ?.actual_cash
+      ),
+      expectedAfterRefund
+    );
+
+    assert.equal(
+      money(
+        close.body
+          ?.discrepancy
+      ),
+      0
+    );
+
+    /*
+     * Both immutable money rows must be captured by the
+     * same closed cash-up:
+     *
+     * A = positive cash tender
+     * B = negative cash refund
+     */
+    assert.equal(
+      Number(
+        close.body
+          ?.payments_linked ||
+        0
+      ),
+      2
+    );
+
+    const session =
+      await sessionRow(
+        close.body
+          .cashup_session_id
+      );
+
+    assert.ok(
+      session
+    );
+
+    assert.equal(
+      money(
+        session.expected_cash
+      ),
+      expectedAfterRefund
+    );
+
+    assert.equal(
+      money(
+        session.actual_cash
+      ),
+      expectedAfterRefund
+    );
+
+    assert.equal(
+      money(
+        session.discrepancy
+      ),
+      0
+    );
+
+    const originalAfter =
+      await paymentRow(
+        sale.payment.id
+      );
+
+    const refundAfter =
+      await paymentRow(
+        refund.id
+      );
+
+    assert.equal(
+      String(
+        originalAfter
+          .cashup_session_id
+      ),
+      String(
+        close.body
+          .cashup_session_id
+      )
+    );
+
+    assert.equal(
+      String(
+        refundAfter
+          .cashup_session_id
+      ),
+      String(
+        close.body
+          .cashup_session_id
+      )
+    );
+
+    console.log(
+      "✅ CASH-R refund reduced expected cash exactly once"
+    );
+  }
+);
+
+
+/*
+ * =====================================================
  * 9. ATTACH MUST NOT STEAL CLOSED PAYMENT
  *
  * This is the key expected red.
@@ -1684,6 +2196,129 @@ test(
     assert.equal(
       invalidKind.status,
       400
+    );
+
+    /*
+     * Sales and refunds belong to the immutable payment
+     * ledger. They must never be accepted as parallel
+     * manual drawer movements.
+     */
+    const ledgerOwnedBefore =
+      await one(
+        `
+        SELECT
+          COUNT(*)::int
+            AS count
+
+        FROM public.cash_drawer_moves
+
+        WHERE restaurant_id =
+              $1
+
+          AND LOWER(kind)
+              IN (
+                'sale',
+                'refund'
+              )
+        `,
+        [
+          fixtures.restaurantA,
+        ]
+      );
+
+    const manualSale =
+      await request(app)
+        .post(
+          "/cashup/move"
+        )
+        .set(
+          "Authorization",
+          bearer(tokenA)
+        )
+        .send({
+          kind:
+            "sale",
+
+          amount:
+            10,
+
+          note:
+            "must not duplicate payment ledger sale",
+        });
+
+    assert.equal(
+      manualSale.status,
+      400
+    );
+
+    assert.equal(
+      manualSale.body?.code,
+      "CASHUP_LEDGER_OWNED_MOVEMENT"
+    );
+
+    const manualRefund =
+      await request(app)
+        .post(
+          "/cashup/move"
+        )
+        .set(
+          "Authorization",
+          bearer(tokenA)
+        )
+        .send({
+          kind:
+            "refund",
+
+          amount:
+            10,
+
+          note:
+            "must not duplicate payment ledger refund",
+        });
+
+    assert.equal(
+      manualRefund.status,
+      400
+    );
+
+    assert.equal(
+      manualRefund.body?.code,
+      "CASHUP_LEDGER_OWNED_MOVEMENT"
+    );
+
+    const ledgerOwnedAfter =
+      await one(
+        `
+        SELECT
+          COUNT(*)::int
+            AS count
+
+        FROM public.cash_drawer_moves
+
+        WHERE restaurant_id =
+              $1
+
+          AND LOWER(kind)
+              IN (
+                'sale',
+                'refund'
+              )
+        `,
+        [
+          fixtures.restaurantA,
+        ]
+      );
+
+    assert.equal(
+      Number(
+        ledgerOwnedAfter?.count ||
+        0
+      ),
+      Number(
+        ledgerOwnedBefore?.count ||
+        0
+      ),
+      "Rejected ledger-owned movement changed cash_drawer_moves"
     );
 
     const zero =

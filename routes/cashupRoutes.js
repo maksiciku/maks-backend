@@ -1379,8 +1379,13 @@ router.post(
 // float
 //   → CASHUP_OPEN
 //
-// refund / payout / drop / correction / legacy sale
+// payout / drop / correction
 //   → CASHUP_ADJUST
+//
+// sale / refund
+//   → historical compatibility only.
+//     New sales and refunds belong exclusively to the
+//     authoritative immutable payments ledger.
 // =========================================================
 
 router.post(
@@ -1411,11 +1416,40 @@ router.post(
           req.body?.amount
         );
 
+      /*
+       * Sales and POS refunds are authoritative financial
+       * ledger entries in public.payments.
+       *
+       * Allowing them to also be entered manually here
+       * would represent the same money twice.
+       *
+       * Historical sale/refund rows remain readable in
+       * cash_drawer_moves for backward compatibility.
+       */
+      const ledgerOwnedKinds =
+        new Set([
+          "sale",
+          "refund",
+        ]);
+
+      if (
+        ledgerOwnedKinds.has(
+          moveKind
+        )
+      ) {
+        return res
+          .status(400)
+          .json({
+            error:
+              "Manual sale/refund drawer movements are disabled. Sales and refunds are recorded from the payment ledger.",
+            code:
+              "CASHUP_LEDGER_OWNED_MOVEMENT",
+          });
+      }
+
       const allowed =
         new Set([
           "float",
-          "sale",
-          "refund",
           "payout",
           "drop",
           "correction",
