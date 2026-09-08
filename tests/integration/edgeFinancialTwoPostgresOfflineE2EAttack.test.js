@@ -1834,6 +1834,15 @@ test(
     let paymentUuid =
       null;
 
+    let refundEventId =
+      null;
+
+    let refundPayload =
+      null;
+
+    let refundUuid =
+      null;
+
     try {
       await t.test(
         "starts a genuinely separate Edge PostgreSQL named maks_test",
@@ -3024,6 +3033,576 @@ test(
 
 
       await t.test(
+        "real partial refund commits on Edge while Cloud remains physically unreachable",
+        async () => {
+          assert.match(
+            paymentUuid,
+            /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+          );
+
+          assert.equal(
+            await isPortOpen(
+              cloudPort
+            ),
+            false,
+            "Cloud HTTP must still be unreachable before refund"
+          );
+
+          const edgeOriginalResult =
+            await edge.pool.query(
+              `
+              SELECT
+                id,
+                amount,
+                batch_id,
+                pos_order_ids,
+                payment_uuid,
+                status
+              FROM
+                public.payments
+              WHERE
+                restaurant_id = $1
+                AND payment_uuid =
+                  $2::uuid
+              `,
+              [
+                restaurantId,
+                paymentUuid,
+              ]
+            );
+
+          assert.equal(
+            edgeOriginalResult.rows.length,
+            1
+          );
+
+          const edgeOriginal =
+            edgeOriginalResult.rows[0];
+
+          const edgeOriginalPaymentId =
+            Number(
+              edgeOriginal.id
+            );
+
+          const originalAmount =
+            Number(
+              edgeOriginal.amount
+            );
+
+          assert.ok(
+            Number.isSafeInteger(
+              edgeOriginalPaymentId
+            ) &&
+            edgeOriginalPaymentId >
+              0
+          );
+
+          assert.ok(
+            Number.isFinite(
+              originalAmount
+            ) &&
+            originalAmount >
+              0.02,
+            "Original offline tender is too small for partial refund proof"
+          );
+
+          const refundAmount =
+            Math.min(
+              5,
+              Math.floor(
+                (
+                  originalAmount /
+                  2
+                ) *
+                100
+              ) /
+              100
+            );
+
+          assert.ok(
+            refundAmount >
+              0 &&
+            refundAmount <
+              originalAmount,
+            "Refund fixture must remain a partial refund"
+          );
+
+          /*
+           * Force Cloud's next payment BIGINT far away from
+           * Edge's original local payment BIGINT.
+           *
+           * This touches only isolated maks_test.
+           * It ensures the test cannot accidentally pass by
+           * receiving matching local payment IDs.
+           */
+          const forcedCloudPaymentId =
+            edgeOriginalPaymentId +
+            500000000;
+
+          await cloudPool.query(
+            `
+            SELECT
+              setval(
+                pg_get_serial_sequence(
+                  'public.payments',
+                  'id'
+                ),
+                $1::bigint,
+                false
+              )
+            `,
+            [
+              forcedCloudPaymentId,
+            ]
+          );
+
+          const refundResponse =
+            await jsonFetch(
+              `http://127.0.0.1:${edgeHttpPort}/orders/payments/${edgeOriginalPaymentId}/refund`,
+              {
+                method:
+                  "POST",
+
+                headers: {
+                  authorization:
+                    `Bearer ${edgeFixtures.token}`,
+                },
+
+                body: {
+                  amount:
+                    refundAmount,
+
+                  reason:
+                    "REAL WAN-OFF REFUND E2E",
+                },
+              }
+            );
+
+          assert.equal(
+            refundResponse.status,
+            200,
+            `Real WAN-off refund failed: ${refundResponse.status} ${JSON.stringify(
+              refundResponse.data
+            )}\n${edgeServer.output()}`
+          );
+
+          assert.equal(
+            await isPortOpen(
+              cloudPort
+            ),
+            false,
+            "Cloud HTTP became reachable during refund blackout"
+          );
+
+          refundUuid =
+            String(
+              refundResponse.data
+                ?.payment_uuid ||
+              ""
+            );
+
+          const returnedOriginalUuid =
+            String(
+              refundResponse.data
+                ?.ref_payment_uuid ||
+              ""
+            );
+
+          const refundBatchId =
+            String(
+              refundResponse.data
+                ?.payment_batch_id ||
+              ""
+            );
+
+          assert.match(
+            refundUuid,
+            /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+          );
+
+          assert.match(
+            refundBatchId,
+            /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+          );
+
+          assert.equal(
+            returnedOriginalUuid,
+            paymentUuid
+          );
+
+          assert.notEqual(
+            refundUuid,
+            paymentUuid
+          );
+
+          assert.notEqual(
+            refundBatchId,
+            String(
+              edgeOriginal.batch_id
+            ),
+            "Real refund incorrectly reused original tender batch UUID"
+          );
+
+          const refundOutboxResult =
+            await edge.pool.query(
+              `
+              SELECT
+                event_id,
+                entity_id,
+                idempotency_key,
+                payload,
+                status,
+                acked_at
+              FROM
+                public.edge_outbox
+              WHERE
+                restaurant_id = $1
+                AND event_type =
+                  'financial.refund.recorded.v1'
+                AND entity_id =
+                  $2
+              ORDER BY
+                id ASC
+              `,
+              [
+                restaurantId,
+                refundUuid,
+              ]
+            );
+
+          assert.equal(
+            refundOutboxResult.rows.length,
+            1,
+            "Offline refund did not create exactly one durable refund event"
+          );
+
+          const refundOutbox =
+            refundOutboxResult.rows[0];
+
+          refundEventId =
+            String(
+              refundOutbox.event_id ||
+              ""
+            );
+
+          refundPayload =
+            refundOutbox.payload;
+
+          assert.match(
+            refundEventId,
+            /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+          );
+
+          assert.equal(
+            String(
+              refundOutbox.entity_id
+            ),
+            refundUuid
+          );
+
+          assert.equal(
+            refundOutbox.idempotency_key,
+            `financial.refund.recorded.v1:${refundUuid}`
+          );
+
+          assert.equal(
+            Number(
+              refundPayload
+                ?.restaurant_id
+            ),
+            restaurantId
+          );
+
+          assert.equal(
+            String(
+              refundPayload
+                ?.refund
+                ?.payment_uuid
+            ),
+            refundUuid
+          );
+
+          assert.equal(
+            String(
+              refundPayload
+                ?.refund
+                ?.ref_payment_uuid
+            ),
+            paymentUuid
+          );
+
+          assert.equal(
+            Number(
+              refundPayload
+                ?.refund
+                ?.amount
+            ),
+            -refundAmount
+          );
+
+          assert.equal(
+            String(
+              refundPayload
+                ?.refund
+                ?.batch_id
+            ),
+            refundBatchId
+          );
+
+          assert.notEqual(
+            String(
+              refundPayload
+                ?.refund
+                ?.batch_id
+            ),
+            String(
+              edgeOriginal.batch_id
+            )
+          );
+
+          assert.ok(
+            Array.isArray(
+              refundPayload
+                ?.refund
+                ?.order_refs
+            ) &&
+            refundPayload
+              .refund
+              .order_refs
+              .length >
+              0
+          );
+
+          assert.ok(
+            refundPayload
+              .refund
+              .order_refs
+              .every(
+                (ref) =>
+                  String(
+                    ref.batch_id
+                  ) ===
+                    batchId &&
+                  String(
+                    ref.edge_submission_id
+                  ) ===
+                    submissionId
+              ),
+            "Refund portable refs do not point to original offline POS batch"
+          );
+
+          const wireText =
+            JSON.stringify(
+              refundPayload
+            );
+
+          assert.equal(
+            wireText.includes(
+              '"ref_payment_id"'
+            ),
+            false,
+            "Refund wire leaked Edge-local ref_payment_id"
+          );
+
+          assert.equal(
+            wireText.includes(
+              '"pos_order_id"'
+            ),
+            false,
+            "Refund wire leaked Edge-local pos_order_id"
+          );
+
+          const edgeRefundResult =
+            await edge.pool.query(
+              `
+              SELECT
+                id,
+                amount,
+                batch_id,
+                pos_order_ids,
+                source,
+                status,
+                ref_payment_id,
+                payment_uuid,
+                ref_payment_uuid
+              FROM
+                public.payments
+              WHERE
+                restaurant_id = $1
+                AND payment_uuid =
+                  $2::uuid
+              `,
+              [
+                restaurantId,
+                refundUuid,
+              ]
+            );
+
+          assert.equal(
+            edgeRefundResult.rows.length,
+            1
+          );
+
+          const edgeRefund =
+            edgeRefundResult.rows[0];
+
+          assert.equal(
+            Number(
+              edgeRefund.amount
+            ),
+            -refundAmount
+          );
+
+          assert.equal(
+            edgeRefund.source,
+            "refund"
+          );
+
+          assert.equal(
+            edgeRefund.status,
+            "completed"
+          );
+
+          assert.equal(
+            Number(
+              edgeRefund.ref_payment_id
+            ),
+            edgeOriginalPaymentId
+          );
+
+          assert.equal(
+            String(
+              edgeRefund.ref_payment_uuid
+            ),
+            paymentUuid
+          );
+
+          assert.equal(
+            String(
+              edgeRefund.payment_uuid
+            ),
+            refundUuid
+          );
+
+          assert.equal(
+            String(
+              edgeRefund.batch_id
+            ),
+            refundBatchId
+          );
+
+          const originalPosIds =
+            new Set(
+              (
+                Array.isArray(
+                  edgeOriginal.pos_order_ids
+                )
+                  ? edgeOriginal.pos_order_ids
+                  : JSON.parse(
+                      edgeOriginal
+                        .pos_order_ids ||
+                      "[]"
+                    )
+              ).map(Number)
+            );
+
+          const refundPosIds =
+            (
+              Array.isArray(
+                edgeRefund.pos_order_ids
+              )
+                ? edgeRefund.pos_order_ids
+                : JSON.parse(
+                    edgeRefund
+                      .pos_order_ids ||
+                    "[]"
+                  )
+            ).map(Number);
+
+          assert.ok(
+            refundPosIds.length >
+              0
+          );
+
+          assert.ok(
+            refundPosIds.every(
+              (id) =>
+                originalPosIds.has(
+                  id
+                )
+            ),
+            "Edge refund escaped original tender POS lineage"
+          );
+
+          assert.notEqual(
+            refundOutbox.status,
+            "acked",
+            "Refund somehow ACKed while Cloud HTTP was dead"
+          );
+
+          assert.equal(
+            refundOutbox.acked_at,
+            null
+          );
+
+          const cloudBefore =
+            await cloudPool.query(
+              `
+              SELECT
+                (
+                  SELECT
+                    COUNT(*)::int
+                  FROM
+                    public.payments
+                  WHERE
+                    restaurant_id = $1
+                    AND payment_uuid =
+                      $2::uuid
+                ) AS refund_rows,
+
+                (
+                  SELECT
+                    COUNT(*)::int
+                  FROM
+                    public.edge_inbox
+                  WHERE
+                    event_id =
+                      $3::uuid
+                ) AS inbox_rows
+              `,
+              [
+                restaurantId,
+                refundUuid,
+                refundEventId,
+              ]
+            );
+
+          assert.equal(
+            Number(
+              cloudBefore.rows[0]
+                .refund_rows
+            ),
+            0,
+            "Cloud refund ledger changed during HTTP blackout"
+          );
+
+          assert.equal(
+            Number(
+              cloudBefore.rows[0]
+                .inbox_rows
+            ),
+            0,
+            "Cloud received refund event during HTTP blackout"
+          );
+
+          console.log(
+            "✅ FIN-R-A Real WAN-off partial refund committed negative ledger + durable refund outbox only on Edge"
+          );
+        }
+      );
+
+
+      await t.test(
         "Cloud return lets the real agent reconstruct the offline sale exactly once",
         async () => {
           await listenCloud(
@@ -3837,6 +4416,542 @@ test(
 
 
       await t.test(
+        "real agent reconstructs WAN-off refund with Cloud-local payment identity",
+        async () => {
+          assert.match(
+            refundUuid,
+            /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+          );
+
+          assert.match(
+            refundEventId,
+            /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+          );
+
+          await waitFor(
+            async () => {
+              const inbox =
+                await cloudPool.query(
+                  `
+                  SELECT
+                    status,
+                    applied_at
+                  FROM
+                    public.edge_inbox
+                  WHERE
+                    event_id =
+                      $1::uuid
+                  `,
+                  [
+                    refundEventId,
+                  ]
+                );
+
+              const outbox =
+                await edge.pool.query(
+                  `
+                  SELECT
+                    status,
+                    acked_at
+                  FROM
+                    public.edge_outbox
+                  WHERE
+                    event_id =
+                      $1::uuid
+                  `,
+                  [
+                    refundEventId,
+                  ]
+                );
+
+              return (
+                inbox.rows[0]
+                  ?.status ===
+                  "applied" &&
+                Boolean(
+                  inbox.rows[0]
+                    ?.applied_at
+                ) &&
+                outbox.rows[0]
+                  ?.status ===
+                  "acked" &&
+                Boolean(
+                  outbox.rows[0]
+                    ?.acked_at
+                )
+              );
+            },
+            {
+              timeoutMs:
+                30000,
+
+              message:
+                `WAN-off refund did not converge after Cloud return.\nAGENT:\n${agent.output()}`,
+            }
+          );
+
+          const edgeOriginalResult =
+            await edge.pool.query(
+              `
+              SELECT
+                id,
+                payment_uuid,
+                batch_id,
+                pos_order_ids
+              FROM
+                public.payments
+              WHERE
+                restaurant_id = $1
+                AND payment_uuid =
+                  $2::uuid
+              `,
+              [
+                restaurantId,
+                paymentUuid,
+              ]
+            );
+
+          const edgeRefundResult =
+            await edge.pool.query(
+              `
+              SELECT
+                id,
+                amount,
+                batch_id,
+                pos_order_ids,
+                source,
+                status,
+                ref_payment_id,
+                payment_uuid,
+                ref_payment_uuid
+              FROM
+                public.payments
+              WHERE
+                restaurant_id = $1
+                AND payment_uuid =
+                  $2::uuid
+              `,
+              [
+                restaurantId,
+                refundUuid,
+              ]
+            );
+
+          const cloudOriginalResult =
+            await cloudPool.query(
+              `
+              SELECT
+                id,
+                payment_uuid,
+                batch_id,
+                pos_order_ids
+              FROM
+                public.payments
+              WHERE
+                restaurant_id = $1
+                AND payment_uuid =
+                  $2::uuid
+              `,
+              [
+                restaurantId,
+                paymentUuid,
+              ]
+            );
+
+          const cloudRefundResult =
+            await cloudPool.query(
+              `
+              SELECT
+                id,
+                amount,
+                batch_id,
+                pos_order_ids,
+                source,
+                status,
+                ref_payment_id,
+                payment_uuid,
+                ref_payment_uuid
+              FROM
+                public.payments
+              WHERE
+                restaurant_id = $1
+                AND payment_uuid =
+                  $2::uuid
+              `,
+              [
+                restaurantId,
+                refundUuid,
+              ]
+            );
+
+          assert.equal(
+            edgeOriginalResult.rows.length,
+            1
+          );
+
+          assert.equal(
+            edgeRefundResult.rows.length,
+            1
+          );
+
+          assert.equal(
+            cloudOriginalResult.rows.length,
+            1
+          );
+
+          assert.equal(
+            cloudRefundResult.rows.length,
+            1
+          );
+
+          const edgeA =
+            edgeOriginalResult.rows[0];
+
+          const edgeB =
+            edgeRefundResult.rows[0];
+
+          const cloudA =
+            cloudOriginalResult.rows[0];
+
+          const cloudB =
+            cloudRefundResult.rows[0];
+
+          assert.notEqual(
+            Number(
+              edgeA.id
+            ),
+            Number(
+              cloudA.id
+            ),
+            "Cloud reused Edge-local original payment BIGINT"
+          );
+
+          assert.equal(
+            String(
+              cloudA.payment_uuid
+            ),
+            paymentUuid
+          );
+
+          assert.equal(
+            String(
+              cloudB.payment_uuid
+            ),
+            refundUuid
+          );
+
+          assert.equal(
+            String(
+              cloudB.ref_payment_uuid
+            ),
+            paymentUuid
+          );
+
+          assert.equal(
+            Number(
+              cloudB.ref_payment_id
+            ),
+            Number(
+              cloudA.id
+            ),
+            "Cloud refund did not resolve ref_payment_id to Cloud-local A"
+          );
+
+          assert.equal(
+            Number(
+              edgeB.ref_payment_id
+            ),
+            Number(
+              edgeA.id
+            )
+          );
+
+          assert.notEqual(
+            Number(
+              cloudB.ref_payment_id
+            ),
+            Number(
+              edgeB.ref_payment_id
+            ),
+            "Refund lineage still depends on Edge-local payment BIGINT"
+          );
+
+          assert.equal(
+            Number(
+              cloudB.amount
+            ),
+            Number(
+              refundPayload
+                .refund
+                .amount
+            )
+          );
+
+          assert.equal(
+            cloudB.source,
+            "refund"
+          );
+
+          assert.equal(
+            cloudB.status,
+            "completed"
+          );
+
+          assert.equal(
+            String(
+              cloudB.batch_id
+            ),
+            String(
+              refundPayload
+                .refund
+                .batch_id
+            )
+          );
+
+          assert.notEqual(
+            String(
+              cloudB.batch_id
+            ),
+            String(
+              cloudA.batch_id
+            ),
+            "Cloud forced refund batch back to original tender batch"
+          );
+
+          const cloudPos =
+            await cloudPool.query(
+              `
+              SELECT
+                id,
+                batch_id,
+                edge_submission_id,
+                edge_row_ordinal,
+                paid,
+                amount_paid,
+                remaining_price
+              FROM
+                public.pos_orders
+              WHERE
+                restaurant_id = $1
+                AND batch_id =
+                  $2::uuid
+              ORDER BY
+                edge_row_ordinal,
+                id
+              `,
+              [
+                restaurantId,
+                batchId,
+              ]
+            );
+
+          assert.equal(
+            cloudPos.rows.length,
+            2
+          );
+
+          const expectedCloudRefundIds =
+            refundPayload
+              .refund
+              .order_refs
+              .map(
+                (ref) => {
+                  const row =
+                    cloudPos.rows.find(
+                      (candidate) =>
+                        String(
+                          candidate
+                            .edge_submission_id
+                        ) ===
+                          String(
+                            ref
+                              .edge_submission_id
+                          ) &&
+                        Number(
+                          candidate
+                            .edge_row_ordinal
+                        ) ===
+                          Number(
+                            ref
+                              .edge_row_ordinal
+                          ) &&
+                        String(
+                          candidate
+                            .batch_id
+                        ) ===
+                          String(
+                            ref
+                              .batch_id
+                          )
+                    );
+
+                  assert.ok(
+                    row,
+                    "Cloud refund portable POS reference did not resolve"
+                  );
+
+                  return Number(
+                    row.id
+                  );
+                }
+              )
+              .sort(
+                (
+                  left,
+                  right
+                ) =>
+                  left -
+                  right
+              );
+
+          const cloudRefundIds =
+            (
+              Array.isArray(
+                cloudB.pos_order_ids
+              )
+                ? cloudB.pos_order_ids
+                : JSON.parse(
+                    cloudB
+                      .pos_order_ids ||
+                    "[]"
+                  )
+            )
+              .map(Number)
+              .sort(
+                (
+                  left,
+                  right
+                ) =>
+                  left -
+                  right
+              );
+
+          assert.deepEqual(
+            cloudRefundIds,
+            expectedCloudRefundIds,
+            "Cloud refund did not remap portable refs to Cloud-local POS ids"
+          );
+
+          const edgeRefundIds =
+            (
+              Array.isArray(
+                edgeB.pos_order_ids
+              )
+                ? edgeB.pos_order_ids
+                : JSON.parse(
+                    edgeB
+                      .pos_order_ids ||
+                    "[]"
+                  )
+            ).map(Number);
+
+          assert.equal(
+            cloudRefundIds.some(
+              (id) =>
+                edgeRefundIds.includes(
+                  id
+                )
+            ),
+            false,
+            "Cloud refund retained Edge-local POS BIGINT"
+          );
+
+          /*
+           * Refund Cloud materialization is still
+           * immutable-ledger only.
+           */
+          assert.ok(
+            cloudPos.rows.every(
+              (row) =>
+                Number(
+                  row.amount_paid
+                ) ===
+                0
+            ),
+            "Cloud refund materializer mutated POS amount_paid"
+          );
+
+          const refundInbox =
+            await cloudPool.query(
+              `
+              SELECT
+                COUNT(*)::int
+                  AS count,
+                MAX(status)
+                  AS status
+              FROM
+                public.edge_inbox
+              WHERE
+                event_id =
+                  $1::uuid
+              `,
+              [
+                refundEventId,
+              ]
+            );
+
+          assert.equal(
+            Number(
+              refundInbox.rows[0]
+                .count
+            ),
+            1
+          );
+
+          assert.equal(
+            refundInbox.rows[0]
+              .status,
+            "applied"
+          );
+
+          const refundOutbox =
+            await edge.pool.query(
+              `
+              SELECT
+                COUNT(*)::int
+                  AS count,
+                MAX(status)
+                  AS status,
+                MAX(acked_at)
+                  AS acked_at
+              FROM
+                public.edge_outbox
+              WHERE
+                event_id =
+                  $1::uuid
+              `,
+              [
+                refundEventId,
+              ]
+            );
+
+          assert.equal(
+            Number(
+              refundOutbox.rows[0]
+                .count
+            ),
+            1
+          );
+
+          assert.equal(
+            refundOutbox.rows[0]
+              .status,
+            "acked"
+          );
+
+          assert.ok(
+            refundOutbox.rows[0]
+              .acked_at
+          );
+
+          console.log(
+            "✅ FIN-R-B Cloud reconstructed refund B -> original A using Cloud-local payment/POS identities"
+          );
+        }
+      );
+
+
+      await t.test(
         "continued agent cycles cannot duplicate the recovered sale",
         async () => {
           const before =
@@ -4094,6 +5209,183 @@ test(
 
           console.log(
             "✅ FIN-C Post-recovery financial exactly-once stability proven"
+          );
+        }
+      );
+
+
+      await t.test(
+        "continued real agent cycles cannot duplicate recovered refund ledger",
+        async () => {
+          const before =
+            await cloudPool.query(
+              `
+              SELECT
+                (
+                  SELECT
+                    COUNT(*)::int
+                  FROM
+                    public.payments
+                  WHERE
+                    restaurant_id = $1
+                    AND payment_uuid =
+                      $2::uuid
+                ) AS refund_rows,
+
+                (
+                  SELECT
+                    COUNT(*)::int
+                  FROM
+                    public.payments
+                  WHERE
+                    restaurant_id = $1
+                    AND payment_uuid =
+                      $3::uuid
+                ) AS original_rows,
+
+                (
+                  SELECT
+                    COUNT(*)::int
+                  FROM
+                    public.edge_inbox
+                  WHERE
+                    event_id =
+                      $4::uuid
+                ) AS refund_inbox_rows
+              `,
+              [
+                restaurantId,
+                refundUuid,
+                paymentUuid,
+                refundEventId,
+              ]
+            );
+
+          assert.equal(
+            Number(
+              before.rows[0]
+                .refund_rows
+            ),
+            1
+          );
+
+          assert.equal(
+            Number(
+              before.rows[0]
+                .original_rows
+            ),
+            1
+          );
+
+          assert.equal(
+            Number(
+              before.rows[0]
+                .refund_inbox_rows
+            ),
+            1
+          );
+
+          await sleep(
+            2400
+          );
+
+          const after =
+            await cloudPool.query(
+              `
+              SELECT
+                (
+                  SELECT
+                    COUNT(*)::int
+                  FROM
+                    public.payments
+                  WHERE
+                    restaurant_id = $1
+                    AND payment_uuid =
+                      $2::uuid
+                ) AS refund_rows,
+
+                (
+                  SELECT
+                    COUNT(*)::int
+                  FROM
+                    public.payments
+                  WHERE
+                    restaurant_id = $1
+                    AND payment_uuid =
+                      $3::uuid
+                ) AS original_rows,
+
+                (
+                  SELECT
+                    COUNT(*)::int
+                  FROM
+                    public.edge_inbox
+                  WHERE
+                    event_id =
+                      $4::uuid
+                ) AS refund_inbox_rows
+              `,
+              [
+                restaurantId,
+                refundUuid,
+                paymentUuid,
+                refundEventId,
+              ]
+            );
+
+          assert.deepEqual(
+            after.rows[0],
+            before.rows[0],
+            "Repeated real agent cycles duplicated Cloud refund ledger"
+          );
+
+          const edgeRefundOutbox =
+            await edge.pool.query(
+              `
+              SELECT
+                COUNT(*)::int
+                  AS count,
+                MAX(status)
+                  AS status
+              FROM
+                public.edge_outbox
+              WHERE
+                event_id =
+                  $1::uuid
+              `,
+              [
+                refundEventId,
+              ]
+            );
+
+          assert.equal(
+            Number(
+              edgeRefundOutbox.rows[0]
+                .count
+            ),
+            1
+          );
+
+          assert.equal(
+            edgeRefundOutbox.rows[0]
+              .status,
+            "acked"
+          );
+
+          assert.equal(
+            agent.child
+              .exitCode,
+            null
+          );
+
+          assert.equal(
+            edgeServer.child
+              .exitCode,
+            null
+          );
+
+          console.log(
+            "✅ FIN-R-C Post-recovery refund exactly-once stability proven"
           );
         }
       );

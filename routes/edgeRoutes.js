@@ -707,9 +707,12 @@ const {
 
 const {
   FINANCIAL_SETTLEMENT_RECORDED_EVENT_TYPE,
+  FINANCIAL_REFUND_RECORDED_EVENT_TYPE,
   FinancialOperationalSyncError,
   validateFinancialSettlementRecordedEvent,
+  validateFinancialRefundRecordedEvent,
   applyFinancialSettlementRecordedCloud,
+  applyFinancialRefundRecordedCloud,
 } = require(
   "../edge/contracts/financialOperations"
 );
@@ -989,6 +992,24 @@ router.post(
             );
           }
 
+          if (
+            String(
+              rawEvent
+                ?.event_type ||
+              ""
+            ) ===
+            FINANCIAL_REFUND_RECORDED_EVENT_TYPE
+          ) {
+            validateFinancialRefundRecordedEvent(
+              rawEvent,
+              {
+                restaurantId,
+                sourceInstallationId:
+                  installationId,
+              }
+            );
+          }
+
           const received =
             await receiveInboxEvent({
               eventId,
@@ -1089,6 +1110,26 @@ router.post(
           ) {
             applied =
               await applyFinancialSettlementRecordedCloud({
+                event:
+                  rawEvent,
+
+                restaurantId,
+
+                sourceInstallationId:
+                  installationId,
+              });
+          }
+
+          if (
+            String(
+              rawEvent
+                ?.event_type ||
+              ""
+            ) ===
+            FINANCIAL_REFUND_RECORDED_EVENT_TYPE
+          ) {
+            applied =
+              await applyFinancialRefundRecordedCloud({
                 event:
                   rawEvent,
 

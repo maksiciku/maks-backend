@@ -2967,6 +2967,360 @@ test(
           )
         );
 
+        const refundPaymentUuid =
+          String(
+            refund.body
+              ?.payment_uuid ||
+            ""
+          ).trim();
+
+        const refundRefPaymentUuid =
+          String(
+            refund.body
+              ?.ref_payment_uuid ||
+            ""
+          ).trim();
+
+        assert.match(
+          refundPaymentUuid,
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+        );
+
+        assert.match(
+          refundRefPaymentUuid,
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+        );
+
+        assert.notEqual(
+          refundPaymentUuid,
+          refundRefPaymentUuid,
+          "Refund reused original payment UUID"
+        );
+
+        const originalPayment =
+          await one(
+            `
+            SELECT
+              payment_uuid,
+              status
+            FROM
+              public.payments
+            WHERE
+              restaurant_id = $1
+              AND id = $2
+            `,
+            [
+              fixtures
+                .restaurantA,
+              paymentId,
+            ]
+          );
+
+        assert.equal(
+          refundRefPaymentUuid,
+          String(
+            originalPayment
+              .payment_uuid
+          ),
+          "Refund portable lineage does not point to original tender"
+        );
+
+        const refundLedger =
+          await one(
+            `
+            SELECT
+              id,
+              amount,
+              method,
+              batch_id,
+              pos_order_ids,
+              source,
+              status,
+              ref_payment_id,
+              payment_uuid,
+              ref_payment_uuid
+            FROM
+              public.payments
+            WHERE
+              restaurant_id = $1
+              AND payment_uuid =
+                $2::uuid
+            `,
+            [
+              fixtures
+                .restaurantA,
+              refundPaymentUuid,
+            ]
+          );
+
+        assert.ok(
+          refundLedger
+        );
+
+        assert.equal(
+          Number(
+            refundLedger.amount
+          ),
+          -11
+        );
+
+        assert.equal(
+          refundLedger.source,
+          "refund"
+        );
+
+        assert.equal(
+          refundLedger.status,
+          "completed"
+        );
+
+        assert.equal(
+          Number(
+            refundLedger
+              .ref_payment_id
+          ),
+          paymentId
+        );
+
+        assert.equal(
+          String(
+            refundLedger
+              .ref_payment_uuid
+          ),
+          refundRefPaymentUuid
+        );
+
+        const portablePos =
+          await one(
+            `
+            SELECT
+              batch_id,
+              edge_submission_id,
+              edge_row_ordinal
+            FROM
+              public.pos_orders
+            WHERE
+              restaurant_id = $1
+              AND id = $2
+            `,
+            [
+              fixtures
+                .restaurantA,
+              Number(
+                row.id
+              ),
+            ]
+          );
+
+        const refundEventCount =
+          await one(
+            `
+            SELECT
+              COUNT(*)::int
+                AS count
+            FROM
+              public.edge_outbox
+            WHERE
+              restaurant_id = $1
+              AND event_type = $2
+              AND entity_id = $3
+            `,
+            [
+              fixtures
+                .restaurantA,
+              "financial.refund.recorded.v1",
+              refundPaymentUuid,
+            ]
+          );
+
+        assert.equal(
+          Number(
+            refundEventCount
+              .count
+          ),
+          1,
+          "Refund did not create exactly one durable financial refund event"
+        );
+
+        const refundEvent =
+          await one(
+            `
+            SELECT
+              event_type,
+              entity_type,
+              entity_id,
+              idempotency_key,
+              payload
+            FROM
+              public.edge_outbox
+            WHERE
+              restaurant_id = $1
+              AND event_type = $2
+              AND entity_id = $3
+            LIMIT 1
+            `,
+            [
+              fixtures
+                .restaurantA,
+              "financial.refund.recorded.v1",
+              refundPaymentUuid,
+            ]
+          );
+
+        assert.ok(
+          refundEvent
+        );
+
+        assert.equal(
+          refundEvent
+            .event_type,
+          "financial.refund.recorded.v1"
+        );
+
+        assert.equal(
+          refundEvent
+            .entity_type,
+          "payment_refund"
+        );
+
+        assert.equal(
+          refundEvent
+            .entity_id,
+          refundPaymentUuid
+        );
+
+        assert.equal(
+          refundEvent
+            .idempotency_key,
+          `financial.refund.recorded.v1:${refundPaymentUuid}`
+        );
+
+        const refundPayload =
+          refundEvent
+            .payload;
+
+        assert.equal(
+          refundPayload
+            ?.schema_version,
+          1
+        );
+
+        assert.equal(
+          Number(
+            refundPayload
+              ?.restaurant_id
+          ),
+          fixtures
+            .restaurantA
+        );
+
+        assert.equal(
+          refundPayload
+            ?.refund
+            ?.payment_uuid,
+          refundPaymentUuid
+        );
+
+        assert.equal(
+          refundPayload
+            ?.refund
+            ?.ref_payment_uuid,
+          refundRefPaymentUuid
+        );
+
+        assert.equal(
+          Number(
+            refundPayload
+              ?.refund
+              ?.amount
+          ),
+          -11
+        );
+
+        assert.equal(
+          refundPayload
+            ?.refund
+            ?.source,
+          "refund"
+        );
+
+        assert.equal(
+          refundPayload
+            ?.refund
+            ?.status,
+          "completed"
+        );
+
+        assert.equal(
+          refundPayload
+            ?.refund
+            ?.batch_id,
+          refund.body
+            ?.payment_batch_id
+        );
+
+        assert.equal(
+          refundPayload
+            ?.refund
+            ?.order_refs
+            ?.length,
+          1
+        );
+
+        assert.equal(
+          refundPayload
+            .refund
+            .order_refs[0]
+            .edge_submission_id,
+          portablePos
+            .edge_submission_id
+        );
+
+        assert.equal(
+          Number(
+            refundPayload
+              .refund
+              .order_refs[0]
+              .edge_row_ordinal
+          ),
+          Number(
+            portablePos
+              .edge_row_ordinal
+          )
+        );
+
+        assert.equal(
+          refundPayload
+            .refund
+            .order_refs[0]
+            .batch_id,
+          String(
+            portablePos
+              .batch_id
+          )
+        );
+
+        const refundWire =
+          JSON.stringify(
+            refundPayload
+          );
+
+        assert.equal(
+          refundWire.includes(
+            `"pos_order_id":${Number(row.id)}`
+          ),
+          false,
+          "Refund event leaked Edge-local POS BIGINT identity"
+        );
+
+        assert.equal(
+          refundWire.includes(
+            `"ref_payment_id":${paymentId}`
+          ),
+          false,
+          "Refund event leaked Edge-local original payment BIGINT identity"
+        );
+
         const pos =
           await one(
             `
@@ -3068,6 +3422,623 @@ test(
         console.log(
           "✅ 06 Refund reopens bill and emits newer occupied snapshot"
         );
+      }
+    );
+
+
+
+
+    await t.test(
+      "partial refunds emit distinct portable refund UUIDs with one original lineage",
+      async () => {
+        const tableName =
+          "Table 961";
+
+        await ensurePhysicalTable(
+          tableName,
+          {
+            covers:
+              2,
+          }
+        );
+
+        const row =
+          await seedPosOrder(
+            tableName,
+            12
+          );
+
+        const payment =
+          await markPaid(
+            row
+          );
+
+        assert.equal(
+          payment.status,
+          200,
+          JSON.stringify(
+            payment.body
+          )
+        );
+
+        const paymentId =
+          Number(
+            payment.body
+              ?.payment_ids
+              ?.[0]
+          );
+
+        assert.ok(
+          paymentId >
+          0
+        );
+
+        const original =
+          await one(
+            `
+            SELECT
+              payment_uuid
+            FROM
+              public.payments
+            WHERE
+              restaurant_id = $1
+              AND id = $2
+            `,
+            [
+              fixtures
+                .restaurantA,
+              paymentId,
+            ]
+          );
+
+        const originalUuid =
+          String(
+            original
+              .payment_uuid
+          );
+
+        const first =
+          await request(
+            app
+          )
+            .post(
+              `/orders/payments/${paymentId}/refund`
+            )
+            .set(
+              "Authorization",
+              bearer(
+                tokenA
+              )
+            )
+            .send({
+              amount:
+                5,
+
+              reason:
+                "EDGE REFUND PARTIAL ONE",
+            });
+
+        assert.equal(
+          first.status,
+          200,
+          JSON.stringify(
+            first.body
+          )
+        );
+
+        const second =
+          await request(
+            app
+          )
+            .post(
+              `/orders/payments/${paymentId}/refund`
+            )
+            .set(
+              "Authorization",
+              bearer(
+                tokenA
+              )
+            )
+            .send({
+              amount:
+                7,
+
+              reason:
+                "EDGE REFUND PARTIAL TWO",
+            });
+
+        assert.equal(
+          second.status,
+          200,
+          JSON.stringify(
+            second.body
+          )
+        );
+
+        const firstUuid =
+          String(
+            first.body
+              ?.payment_uuid ||
+            ""
+          );
+
+        const secondUuid =
+          String(
+            second.body
+              ?.payment_uuid ||
+            ""
+          );
+
+        assert.notEqual(
+          firstUuid,
+          secondUuid,
+          "Two partial refunds reused one refund payment_uuid"
+        );
+
+        assert.equal(
+          String(
+            first.body
+              ?.ref_payment_uuid
+          ),
+          originalUuid
+        );
+
+        assert.equal(
+          String(
+            second.body
+              ?.ref_payment_uuid
+          ),
+          originalUuid
+        );
+
+        const eventsResult =
+          await pool.query(
+            `
+            SELECT
+              entity_id,
+              idempotency_key,
+              payload
+            FROM
+              public.edge_outbox
+            WHERE
+              restaurant_id = $1
+              AND event_type =
+                'financial.refund.recorded.v1'
+              AND payload
+                    -> 'refund'
+                    ->> 'table_number' =
+                  $2
+            ORDER BY
+              created_at ASC,
+              event_id ASC
+            `,
+            [
+              fixtures
+                .restaurantA,
+              tableName,
+            ]
+          );
+
+        assert.equal(
+          eventsResult
+            .rows
+            .length,
+          2,
+          "Two partial refunds did not create two immutable refund events"
+        );
+
+        const eventUuids =
+          new Set(
+            eventsResult
+              .rows
+              .map(
+                (event) =>
+                  event.entity_id
+              )
+          );
+
+        assert.equal(
+          eventUuids.size,
+          2
+        );
+
+        assert.ok(
+          eventUuids.has(
+            firstUuid
+          )
+        );
+
+        assert.ok(
+          eventUuids.has(
+            secondUuid
+          )
+        );
+
+        for (
+          const event of
+          eventsResult.rows
+        ) {
+          assert.equal(
+            event
+              .payload
+              ?.refund
+              ?.ref_payment_uuid,
+            originalUuid
+          );
+
+          assert.equal(
+            event
+              .idempotency_key,
+            `financial.refund.recorded.v1:${event.entity_id}`
+          );
+        }
+
+        const refundAmounts =
+          eventsResult
+            .rows
+            .map(
+              (event) =>
+                Number(
+                  event
+                    .payload
+                    ?.refund
+                    ?.amount
+                )
+            )
+            .sort(
+              (a, b) =>
+                a - b
+            );
+
+        assert.deepEqual(
+          refundAmounts,
+          [
+            -7,
+            -5,
+          ]
+        );
+
+        const originalAfter =
+          await one(
+            `
+            SELECT
+              status
+            FROM
+              public.payments
+            WHERE
+              restaurant_id = $1
+              AND id = $2
+            `,
+            [
+              fixtures
+                .restaurantA,
+              paymentId,
+            ]
+          );
+
+        assert.equal(
+          originalAfter
+            .status,
+          "refunded"
+        );
+
+        const posAfter =
+          await one(
+            `
+            SELECT
+              paid,
+              amount_paid,
+              remaining_price
+            FROM
+              public.pos_orders
+            WHERE
+              restaurant_id = $1
+              AND id = $2
+            `,
+            [
+              fixtures
+                .restaurantA,
+              Number(
+                row.id
+              ),
+            ]
+          );
+
+        assert.equal(
+          Number(
+            posAfter.paid
+          ),
+          0
+        );
+
+        assert.equal(
+          Number(
+            posAfter.amount_paid
+          ),
+          0
+        );
+
+        assert.equal(
+          Number(
+            posAfter.remaining_price
+          ),
+          12
+        );
+
+        console.log(
+          "✅ Refund partial lineage B1/B2 -> original A proven"
+        );
+      }
+    );
+
+
+    await t.test(
+      "forced refund outbox failure rolls refund ledger + POS reopen + original status back together",
+      async () => {
+        const tableName =
+          "Table 962";
+
+        await ensurePhysicalTable(
+          tableName,
+          {
+            covers:
+              2,
+          }
+        );
+
+        const row =
+          await seedPosOrder(
+            tableName,
+            9
+          );
+
+        const payment =
+          await markPaid(
+            row
+          );
+
+        assert.equal(
+          payment.status,
+          200,
+          JSON.stringify(
+            payment.body
+          )
+        );
+
+        const paymentId =
+          Number(
+            payment.body
+              ?.payment_ids
+              ?.[0]
+          );
+
+        assert.ok(
+          paymentId >
+          0
+        );
+
+        await pool.query(`
+          DROP TRIGGER IF EXISTS
+            trg_maks_test_reject_financial_refund_edge
+          ON public.edge_outbox
+        `);
+
+        await pool.query(`
+          DROP FUNCTION IF EXISTS
+            public.maks_test_reject_financial_refund_edge()
+        `);
+
+        await pool.query(`
+          CREATE OR REPLACE FUNCTION
+            public.maks_test_reject_financial_refund_edge()
+          RETURNS trigger
+          LANGUAGE plpgsql
+          AS $$
+          BEGIN
+            IF NEW.event_type =
+              'financial.refund.recorded.v1'
+            THEN
+              RAISE EXCEPTION
+                'MAKS_TEST_FORCED_FINANCIAL_REFUND_OUTBOX_FAILURE';
+            END IF;
+
+            RETURN NEW;
+          END;
+          $$
+        `);
+
+        await pool.query(`
+          CREATE TRIGGER
+            trg_maks_test_reject_financial_refund_edge
+          BEFORE INSERT
+          ON public.edge_outbox
+          FOR EACH ROW
+          EXECUTE FUNCTION
+            public.maks_test_reject_financial_refund_edge()
+        `);
+
+        try {
+          const refund =
+            await request(
+              app
+            )
+              .post(
+                `/orders/payments/${paymentId}/refund`
+              )
+              .set(
+                "Authorization",
+                bearer(
+                  tokenA
+                )
+              )
+              .send({
+                amount:
+                  9,
+
+                reason:
+                  "FORCED REFUND OUTBOX ROLLBACK",
+              });
+
+          assert.ok(
+            refund.status >=
+            400,
+            "Forced refund outbox failure unexpectedly succeeded"
+          );
+
+          const posAfter =
+            await one(
+              `
+              SELECT
+                paid,
+                amount_paid,
+                remaining_price
+              FROM
+                public.pos_orders
+              WHERE
+                restaurant_id = $1
+                AND id = $2
+              `,
+              [
+                fixtures
+                  .restaurantA,
+                Number(
+                  row.id
+                ),
+              ]
+            );
+
+          assert.equal(
+            Number(
+              posAfter.paid
+            ),
+            1
+          );
+
+          assert.equal(
+            Number(
+              posAfter.amount_paid
+            ),
+            9
+          );
+
+          assert.equal(
+            Number(
+              posAfter.remaining_price
+            ),
+            0
+          );
+
+          const originalAfter =
+            await one(
+              `
+              SELECT
+                status
+              FROM
+                public.payments
+              WHERE
+                restaurant_id = $1
+                AND id = $2
+              `,
+              [
+                fixtures
+                  .restaurantA,
+                paymentId,
+              ]
+            );
+
+          assert.equal(
+            originalAfter
+              .status,
+            "completed"
+          );
+
+          const refundCount =
+            await one(
+              `
+              SELECT
+                COUNT(*)::int
+                  AS count
+              FROM
+                public.payments
+              WHERE
+                restaurant_id = $1
+                AND ref_payment_id = $2
+                AND source =
+                  'refund'
+              `,
+              [
+                fixtures
+                  .restaurantA,
+                paymentId,
+              ]
+            );
+
+          assert.equal(
+            Number(
+              refundCount.count
+            ),
+            0,
+            "Failed refund left a negative ledger row behind"
+          );
+
+          const refundOutbox =
+            await one(
+              `
+              SELECT
+                COUNT(*)::int
+                  AS count
+              FROM
+                public.edge_outbox
+              WHERE
+                restaurant_id = $1
+                AND event_type =
+                  'financial.refund.recorded.v1'
+                AND payload
+                      -> 'refund'
+                      ->> 'table_number' =
+                    $2
+              `,
+              [
+                fixtures
+                  .restaurantA,
+                tableName,
+              ]
+            );
+
+          assert.equal(
+            Number(
+              refundOutbox.count
+            ),
+            0,
+            "Failed refund left an outbox event behind"
+          );
+
+          const tableEvents =
+            await tableEventRows(
+              tableName
+            );
+
+          assert.equal(
+            tableEvents.length,
+            1,
+            "Failed refund unexpectedly emitted a second table state"
+          );
+
+          console.log(
+            "✅ Refund financial outbox rollback is atomic"
+          );
+        } finally {
+          await pool.query(`
+            DROP TRIGGER IF EXISTS
+              trg_maks_test_reject_financial_refund_edge
+            ON public.edge_outbox
+          `);
+
+          await pool.query(`
+            DROP FUNCTION IF EXISTS
+              public.maks_test_reject_financial_refund_edge()
+          `);
+        }
       }
     );
 

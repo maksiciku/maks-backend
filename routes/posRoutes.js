@@ -35,6 +35,7 @@ const {
 
 const {
   emitFinancialSettlementRecordedTx,
+  emitFinancialRefundRecordedTx,
 } = require(
   "../edge/contracts/financialOperations"
 );
@@ -11102,6 +11103,18 @@ await tx.qRun(
     id,
   ]
 );
+
+      await emitFinancialRefundRecordedTx(
+        tx,
+        {
+          restaurantId:
+            rid,
+
+          refundPaymentUuid:
+            recordedRefund
+              .paymentUuid,
+        }
+      );
 
       const unpaidLeft = await updateTableAfterPayment(
         tx.qRun,
