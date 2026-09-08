@@ -21,6 +21,10 @@ const {
   withTx,
 } = require("../dbCompat");
 
+const {
+  emitCashupSessionClosedTx,
+} = require("../edge/contracts/cashupOperations");
+
 // =========================================================
 // AUTHORITY
 // =========================================================
@@ -1225,7 +1229,8 @@ router.post(
                   actual_cash,
                   expected_cash,
                   discrepancy,
-                  note
+                  note,
+                  closed_by_name
                 )
 
                 VALUES
@@ -1237,7 +1242,8 @@ router.post(
                   $5,
                   $6,
                   $7,
-                  $8
+                  $8,
+                  $9
                 )
 
                 RETURNING id
@@ -1252,6 +1258,13 @@ router.post(
                   expectedCash,
                   diff,
                   note,
+                  String(
+                    req.user?.full_name ||
+                    req.user?.name ||
+                    req.user?.username ||
+                    ""
+                  ).trim() ||
+                    null,
                 ]
               );
 
@@ -1309,6 +1322,27 @@ router.post(
                 rid,
                 toISO
               );
+
+            /*
+             * Durable Edge cash-up event.
+             *
+             * Same PostgreSQL transaction as
+             * session creation, payment linking
+             * and KDS archive.
+             *
+             * Outbox failure rolls back the
+             * whole cash-up close.
+             */
+            await emitCashupSessionClosedTx(
+              tx,
+              {
+                restaurantId:
+                  rid,
+
+                cashupSessionId:
+                  sessionId,
+              }
+            );
 
             return {
               success: true,

@@ -1795,6 +1795,12 @@ test(
     let edgeServer =
       null;
 
+    let preRestartEdgeServerOutput =
+      "";
+
+    let coldRestartBatchId =
+      null;
+
     let cloudPort =
       null;
 
@@ -1832,6 +1838,15 @@ test(
       null;
 
     let paymentUuid =
+      null;
+
+    let cashupSessionId =
+      null;
+
+    let cashupEventId =
+      null;
+
+    let cashupPayload =
       null;
 
     let refundEventId =
@@ -3602,6 +3617,965 @@ test(
       );
 
 
+        await t.test(
+          "real /cashup/close commits cash-up on Edge only while Cloud is unreachable",
+          async () => {
+            assert.equal(
+              await isPortOpen(
+                cloudPort
+              ),
+              false,
+              "Cloud became reachable before WAN-off cash-up"
+            );
+
+            const cashupRefundUuid =
+              String(
+                refundPayload
+                  ?.refund
+                  ?.payment_uuid ||
+                ""
+              );
+
+            assert.match(
+              cashupRefundUuid,
+              /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+            );
+
+            const portablePaymentUuids = [
+              paymentUuid,
+              cashupRefundUuid,
+            ];
+
+            const windowResult =
+              await edge.pool.query(
+                `
+                SELECT
+                  MIN(created_at)
+                    AS min_created_at,
+
+                  MAX(created_at)
+                    AS max_created_at,
+
+                  COALESCE(
+                    SUM(
+                      CASE
+                        WHEN method = 'cash'
+                         AND status = 'completed'
+                        THEN amount
+                        ELSE 0
+                      END
+                    ),
+                    0
+                  )::numeric
+                    AS net_cash
+                FROM public.payments
+                WHERE restaurant_id = $1
+                  AND payment_uuid =
+                    ANY($2::uuid[])
+                `,
+                [
+                  restaurantId,
+                  portablePaymentUuids,
+                ]
+              );
+
+            assert.ok(
+              windowResult.rows[0]
+                ?.min_created_at
+            );
+
+            assert.ok(
+              windowResult.rows[0]
+                ?.max_created_at
+            );
+
+            const from =
+              new Date(
+                new Date(
+                  windowResult.rows[0]
+                    .min_created_at
+                ).getTime() -
+                1000
+              ).toISOString();
+
+            const to =
+              new Date(
+                new Date(
+                  windowResult.rows[0]
+                    .max_created_at
+                ).getTime() +
+                1000
+              ).toISOString();
+
+            const actualCash =
+              Number(
+                windowResult.rows[0]
+                  .net_cash ||
+                0
+              );
+
+            const response =
+              await jsonFetch(
+                `http://127.0.0.1:${edgeHttpPort}/cashup/close`,
+                {
+                  method:
+                    "POST",
+
+                  headers: {
+                    authorization:
+                      `Bearer ${edgeFixtures.token}`,
+                  },
+
+                  body: {
+                    from,
+                    to,
+
+                    actual_cash:
+                      actualCash,
+
+                    note:
+                      "REAL WAN-OFF CASH-UP TWO-PG E2E",
+                  },
+                }
+              );
+
+            assert.equal(
+              response.status,
+              200,
+              `Real WAN-off cash-up failed: ${response.status} ${JSON.stringify(
+                response.data
+              )}\n${edgeServer.output()}`
+            );
+
+            cashupSessionId =
+              String(
+                response.data
+                  ?.cashup_session_id ||
+                ""
+              );
+
+            assert.match(
+              cashupSessionId,
+              /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+            );
+
+            const edgeSession =
+              await edge.pool.query(
+                `
+                SELECT
+                  id,
+                  closed_by_user_id,
+                  closed_by_name
+                FROM public.cashup_sessions
+                WHERE restaurant_id = $1
+                  AND id = $2::uuid
+                `,
+                [
+                  restaurantId,
+                  cashupSessionId,
+                ]
+              );
+
+            assert.equal(
+              edgeSession.rows.length,
+              1
+            );
+
+            assert.ok(
+              edgeSession.rows[0]
+                .closed_by_user_id
+            );
+
+            assert.ok(
+              String(
+                edgeSession.rows[0]
+                  .closed_by_name ||
+                ""
+              ).length > 0
+            );
+
+            const linked =
+              await edge.pool.query(
+                `
+                SELECT
+                  payment_uuid,
+                  cashup_session_id
+                FROM public.payments
+                WHERE restaurant_id = $1
+                  AND payment_uuid =
+                    ANY($2::uuid[])
+                `,
+                [
+                  restaurantId,
+                  portablePaymentUuids,
+                ]
+              );
+
+            assert.equal(
+              linked.rows.length,
+              portablePaymentUuids.length
+            );
+
+            assert.ok(
+              linked.rows.every(
+                (row) =>
+                  String(
+                    row.cashup_session_id
+                  ) ===
+                  cashupSessionId
+              )
+            );
+
+            const outbox =
+              await edge.pool.query(
+                `
+                SELECT
+                  event_id,
+                  entity_type,
+                  entity_id,
+                  idempotency_key,
+                  payload,
+                  status,
+                  acked_at
+                FROM public.edge_outbox
+                WHERE restaurant_id = $1
+                  AND event_type =
+                    'cashup.session.closed.v1'
+                  AND entity_id = $2
+                `,
+                [
+                  restaurantId,
+                  cashupSessionId,
+                ]
+              );
+
+            assert.equal(
+              outbox.rows.length,
+              1,
+              "Expected exactly one WAN-off cash-up event"
+            );
+
+            cashupEventId =
+              String(
+                outbox.rows[0]
+                  .event_id
+              );
+
+            cashupPayload =
+              outbox.rows[0]
+                .payload;
+
+            assert.equal(
+              outbox.rows[0]
+                .entity_type,
+              "cashup_session"
+            );
+
+            assert.equal(
+              String(
+                outbox.rows[0]
+                  .entity_id
+              ),
+              cashupSessionId
+            );
+
+            assert.equal(
+              outbox.rows[0]
+                .idempotency_key,
+              `cashup.session.closed.v1:${cashupSessionId}`
+            );
+
+            assert.equal(
+              String(
+                cashupPayload
+                  ?.session
+                  ?.id
+              ),
+              cashupSessionId
+            );
+
+            assert.equal(
+              Object.prototype
+                .hasOwnProperty.call(
+                  cashupPayload
+                    .session,
+                  "closed_by_user_id"
+                ),
+              false,
+              "Cash-up event leaked Edge-local user BIGINT"
+            );
+
+            const payloadUuids =
+              cashupPayload
+                .payment_uuids
+                .map(String);
+
+            assert.ok(
+              payloadUuids.includes(
+                paymentUuid
+              )
+            );
+
+            assert.ok(
+              payloadUuids.includes(
+                cashupRefundUuid
+              )
+            );
+
+            assert.notEqual(
+              outbox.rows[0]
+                .status,
+              "acked",
+              "Cash-up ACKed while Cloud was unreachable"
+            );
+
+            assert.equal(
+              outbox.rows[0]
+                .acked_at,
+              null
+            );
+
+            const cloudBefore =
+              await cloudPool.query(
+                `
+                SELECT
+                  (
+                    SELECT
+                      COUNT(*)::int
+                    FROM public.cashup_sessions
+                    WHERE restaurant_id = $1
+                      AND id = $2::uuid
+                  ) AS sessions,
+
+                  (
+                    SELECT
+                      COUNT(*)::int
+                    FROM public.edge_inbox
+                    WHERE event_id =
+                      $3::uuid
+                  ) AS inbox_rows
+                `,
+                [
+                  restaurantId,
+                  cashupSessionId,
+                  cashupEventId,
+                ]
+              );
+
+            assert.equal(
+              Number(
+                cloudBefore.rows[0]
+                  .sessions
+              ),
+              0
+            );
+
+            assert.equal(
+              Number(
+                cloudBefore.rows[0]
+                  .inbox_rows
+              ),
+              0
+            );
+
+            console.log(
+              "✅ CASH-A Real WAN-off cash-up committed session + payment UUID links + durable outbox only on Edge"
+            );
+          }
+        );
+
+        await t.test(
+          "cold restart preserves local restaurant operations while Cloud remains unreachable",
+          async () => {
+            assert.equal(
+              await isPortOpen(
+                cloudPort
+              ),
+              false,
+              "Cloud became reachable before cold restart"
+            );
+
+            /*
+             * Snapshot durable Edge state before killing
+             * the HTTP process.
+             */
+            const beforeRestart =
+              await edge.pool.query(
+                `
+                SELECT
+                  (
+                    SELECT
+                      COUNT(*)::int
+                    FROM public.cashup_sessions
+                    WHERE restaurant_id = $1
+                      AND id =
+                        $2::uuid
+                  ) AS cashup_sessions,
+
+                  (
+                    SELECT
+                      COUNT(*)::int
+                    FROM public.payments
+                    WHERE restaurant_id = $1
+                      AND cashup_session_id =
+                        $2::uuid
+                  ) AS linked_payments,
+
+                  (
+                    SELECT
+                      COUNT(*)::int
+                    FROM public.edge_outbox
+                    WHERE restaurant_id = $1
+                      AND event_id =
+                        $3::uuid
+                  ) AS cashup_outbox
+                `,
+                [
+                  restaurantId,
+                  cashupSessionId,
+                  cashupEventId,
+                ]
+              );
+
+            assert.equal(
+              Number(
+                beforeRestart.rows[0]
+                  .cashup_sessions
+              ),
+              1
+            );
+
+            assert.equal(
+              Number(
+                beforeRestart.rows[0]
+                  .linked_payments
+              ),
+              cashupPayload
+                .payment_uuids
+                .length
+            );
+
+            assert.equal(
+              Number(
+                beforeRestart.rows[0]
+                  .cashup_outbox
+              ),
+              1
+            );
+
+            /*
+             * Preserve logs from the original process so
+             * later secret/DB-URL hygiene still checks
+             * BOTH server lifetimes.
+             */
+            preRestartEdgeServerOutput =
+              edgeServer.output();
+
+            const oldEdgeChild =
+              edgeServer.child;
+
+            await stopChild(
+              edgeServer
+            );
+
+            await waitFor(
+              async () =>
+                !(
+                  await isPortOpen(
+                    edgeHttpPort
+                  )
+                ),
+              {
+                timeoutMs:
+                  10000,
+
+                message:
+                  "Original Edge HTTP port did not close during cold restart",
+              }
+            );
+
+            /*
+             * A ChildProcess terminated by SIGTERM may
+             * legitimately keep exitCode === null.
+             * signalCode is the authoritative termination
+             * field in that case.
+             *
+             * The closed HTTP-port assertion above proves
+             * the old server is no longer serving.
+             */
+            await waitFor(
+              async () =>
+                oldEdgeChild
+                  .exitCode !==
+                  null ||
+                oldEdgeChild
+                  .signalCode !==
+                  null,
+              {
+                timeoutMs:
+                  5000,
+
+                message:
+                  "Original Edge child never reported exit or termination signal",
+              }
+            );
+
+            assert.ok(
+              oldEdgeChild
+                .exitCode !==
+                null ||
+              oldEdgeChild
+                .signalCode !==
+                null,
+              "Original Edge process did not actually terminate"
+            );
+
+            assert.equal(
+              await isPortOpen(
+                cloudPort
+              ),
+              false,
+              "Cloud became reachable while Edge was stopped"
+            );
+
+            /*
+             * Cold boot:
+             *
+             * same Edge PostgreSQL
+             * same HTTP port
+             * Cloud still dead
+             */
+            edgeServer =
+              spawnEdgeServer({
+                edgeDatabaseUrl:
+                  edge.databaseUrl,
+
+                port:
+                  edgeHttpPort,
+              });
+
+            await waitFor(
+              async () => {
+                if (
+                  edgeServer
+                    .child
+                    .exitCode !==
+                  null
+                ) {
+                  throw new Error(
+                    `Cold-start Edge server exited during boot:\n${edgeServer.output()}`
+                  );
+                }
+
+                return isPortOpen(
+                  edgeHttpPort
+                );
+              },
+              {
+                timeoutMs:
+                  25000,
+
+                message:
+                  `Cold-start Edge HTTP failed to reopen:\n${edgeServer.output()}`,
+              }
+            );
+
+            assert.equal(
+              await isPortOpen(
+                cloudPort
+              ),
+              false,
+              "Cloud became reachable during Edge cold boot"
+            );
+
+            /*
+             * Old JWT is deliberately not trusted as
+             * proof of cold-start identity.
+             *
+             * Authenticate again from the persisted
+             * Edge-local user database.
+             */
+            const freshLogin =
+              await jsonFetch(
+                `http://127.0.0.1:${edgeHttpPort}/auth/login`,
+                {
+                  method:
+                    "POST",
+
+                  body: {
+                    username:
+                      edgeFixtures
+                        .username,
+
+                    password:
+                      TEST_PASSWORD,
+
+                    restaurant_id:
+                      restaurantId,
+                  },
+                }
+              );
+
+            assert.equal(
+              freshLogin.status,
+              200,
+              `Cold-start local login failed: ${freshLogin.status} ${JSON.stringify(
+                freshLogin.data
+              )}\n${edgeServer.output()}`
+            );
+
+            assert.ok(
+              freshLogin.data
+                ?.token,
+              "Cold-start local login returned no JWT"
+            );
+
+            /*
+             * Replace the old JWT with a JWT issued by
+             * the freshly restarted Edge process.
+             */
+            edgeFixtures.token =
+              freshLogin.data
+                .token;
+
+            /*
+             * Cash-Up HTTP must reopen from local Edge
+             * data while Cloud remains dead.
+             */
+            const cashupRead =
+              await jsonFetch(
+                `http://127.0.0.1:${edgeHttpPort}/cashup/sessions/${cashupSessionId}`,
+                {
+                  headers: {
+                    authorization:
+                      `Bearer ${edgeFixtures.token}`,
+                  },
+                }
+              );
+
+            assert.equal(
+              cashupRead.status,
+              200,
+              `Cold-start cash-up read failed: ${cashupRead.status} ${JSON.stringify(
+                cashupRead.data
+              )}`
+            );
+
+            /*
+             * KDS HTTP must also boot and answer locally.
+             *
+             * We deliberately assert only the HTTP
+             * contract here; the real post-restart POS
+             * operation below proves new KDS persistence.
+             */
+            const kdsRead =
+              await jsonFetch(
+                `http://127.0.0.1:${edgeHttpPort}/kds/live`,
+                {
+                  headers: {
+                    authorization:
+                      `Bearer ${edgeFixtures.token}`,
+
+                      "x-kds-device":
+                        "cold-restart-kds-device",
+
+                      "x-station-key":
+                        "meals",
+                  },
+                }
+              );
+
+            assert.equal(
+              kdsRead.status,
+              200,
+              `Cold-start KDS read failed: ${kdsRead.status} ${JSON.stringify(
+                kdsRead.data
+              )}`
+            );
+
+            /*
+             * Durable state must be unchanged by killing
+             * and reopening server.js.
+             */
+            const afterRestart =
+              await edge.pool.query(
+                `
+                SELECT
+                  (
+                    SELECT
+                      COUNT(*)::int
+                    FROM public.cashup_sessions
+                    WHERE restaurant_id = $1
+                      AND id =
+                        $2::uuid
+                  ) AS cashup_sessions,
+
+                  (
+                    SELECT
+                      COUNT(*)::int
+                    FROM public.payments
+                    WHERE restaurant_id = $1
+                      AND cashup_session_id =
+                        $2::uuid
+                  ) AS linked_payments,
+
+                  (
+                    SELECT
+                      COUNT(*)::int
+                    FROM public.edge_outbox
+                    WHERE restaurant_id = $1
+                      AND event_id =
+                        $3::uuid
+                  ) AS cashup_outbox
+                `,
+                [
+                  restaurantId,
+                  cashupSessionId,
+                  cashupEventId,
+                ]
+              );
+
+            assert.deepEqual(
+              afterRestart.rows[0],
+              beforeRestart.rows[0],
+              "Cold restart changed durable cash-up/payment/outbox state"
+            );
+
+            /*
+             * Critical operational proof:
+             *
+             * create a NEW real POS sale through the
+             * freshly restarted Edge server with Cloud
+             * still physically unreachable.
+             */
+            const postRestartOrder =
+              await jsonFetch(
+                `http://127.0.0.1:${edgeHttpPort}/orders/grouped`,
+                {
+                  method:
+                    "POST",
+
+                  headers: {
+                    authorization:
+                      `Bearer ${edgeFixtures.token}`,
+                  },
+
+                  body: {
+                    order_type:
+                      "takeaway",
+
+                    table_number:
+                      "Takeaway",
+
+                    source:
+                      "pos",
+
+                    items: [
+                      {
+                        meal_id:
+                          edgeFixtures
+                            .mealId,
+
+                        item_source:
+                          "meals",
+
+                        source:
+                          "meals",
+
+                        item_type:
+                          "meals",
+
+                        category:
+                          "meals",
+
+                        meal_name:
+                          "FAKE COLD-RESTART BROWSER BURGER",
+
+                        name:
+                          "FAKE COLD-RESTART BROWSER BURGER",
+
+                        quantity:
+                          1,
+
+                        price_per_unit:
+                          0.01,
+
+                        total_price:
+                          0.01,
+
+                        options: {
+                          test_side:
+                            "test_chips",
+                        },
+                      },
+                    ],
+                  },
+                }
+              );
+
+            assert.equal(
+              postRestartOrder.status,
+              201,
+              `Cold-start POS order failed: ${postRestartOrder.status} ${JSON.stringify(
+                postRestartOrder.data
+              )}\n${edgeServer.output()}`
+            );
+
+            coldRestartBatchId =
+              String(
+                postRestartOrder.data
+                  ?.batch_id ||
+                ""
+              );
+
+            assert.match(
+              coldRestartBatchId,
+              /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+            );
+
+            assert.notEqual(
+              coldRestartBatchId,
+              batchId,
+              "Cold restart reused the original sale batch UUID"
+            );
+
+            /*
+             * The freshly restarted HTTP process must
+             * have persisted BOTH POS and KDS state.
+             */
+            const localColdRows =
+              await edge.pool.query(
+                `
+                SELECT
+                  (
+                    SELECT
+                      COUNT(*)::int
+                    FROM public.pos_orders
+                    WHERE restaurant_id = $1
+                      AND batch_id =
+                        $2::uuid
+                  ) AS pos_rows,
+
+                  (
+                    SELECT
+                      COUNT(*)::int
+                    FROM public.orders
+                    WHERE restaurant_id = $1
+                      AND batch_id =
+                        $2::uuid
+                  ) AS kds_rows,
+
+                  (
+                    SELECT
+                      COUNT(*)::int
+                    FROM public.edge_outbox
+                    WHERE restaurant_id = $1
+                      AND entity_id =
+                        $2::text
+                  ) AS outbox_rows
+                `,
+                [
+                  restaurantId,
+                  coldRestartBatchId,
+                ]
+              );
+
+            assert.ok(
+              Number(
+                localColdRows.rows[0]
+                  .pos_rows
+              ) > 0,
+              "Cold-start POS created no local POS rows"
+            );
+
+            assert.ok(
+              Number(
+                localColdRows.rows[0]
+                  .kds_rows
+              ) > 0,
+              "Cold-start POS created no local KDS rows"
+            );
+
+            assert.ok(
+              Number(
+                localColdRows.rows[0]
+                  .outbox_rows
+              ) > 0,
+              "Cold-start POS created no durable Edge outbox event"
+            );
+
+            /*
+             * Most important isolation check:
+             * Cloud is STILL offline and knows nothing
+             * about the new post-restart batch.
+             */
+            assert.equal(
+              await isPortOpen(
+                cloudPort
+              ),
+              false
+            );
+
+            const cloudColdRows =
+              await cloudPool.query(
+                `
+                SELECT
+                  (
+                    SELECT
+                      COUNT(*)::int
+                    FROM public.pos_orders
+                    WHERE restaurant_id = $1
+                      AND batch_id =
+                        $2::uuid
+                  ) AS pos_rows,
+
+                  (
+                    SELECT
+                      COUNT(*)::int
+                    FROM public.orders
+                    WHERE restaurant_id = $1
+                      AND batch_id =
+                        $2::uuid
+                  ) AS kds_rows
+                `,
+                [
+                  restaurantId,
+                  coldRestartBatchId,
+                ]
+              );
+
+            assert.equal(
+              Number(
+                cloudColdRows.rows[0]
+                  .pos_rows
+              ),
+              0,
+              "Cloud received cold-start POS rows during WAN blackout"
+            );
+
+            assert.equal(
+              Number(
+                cloudColdRows.rows[0]
+                  .kds_rows
+              ),
+              0,
+              "Cloud received cold-start KDS rows during WAN blackout"
+            );
+
+            assert.equal(
+              edgeServer
+                .child
+                .exitCode,
+              null,
+              "Cold-start Edge process died after local operation"
+            );
+
+            console.log(
+              "✅ COLD-A Edge server restarted with Cloud dead, re-authenticated locally, reopened KDS/Cash-Up, and accepted a new POS+KDS order"
+            );
+          }
+        );
+
       await t.test(
         "Cloud return lets the real agent reconstruct the offline sale exactly once",
         async () => {
@@ -4301,10 +5275,30 @@ test(
             null
           );
 
-          assert.equal(
+          /*
+           * Cash-up convergence is asynchronous.
+           *
+           * FIN-B may observe the tender before
+           * cash-up apply, or after the agent has
+           * already attached the exact WAN-off
+           * cash-up session.
+           *
+           * No other cash-up UUID is legal here.
+           * CASH-B below proves final convergence.
+           */
+          assert.ok(
             tender
-              .cashup_session_id,
-            null
+              .cashup_session_id ==
+              null ||
+            String(
+              tender
+                .cashup_session_id
+            ) ===
+              cashupSessionId,
+            `Cloud tender linked to unexpected cash-up session: ${
+              tender
+                .cashup_session_id
+            }`
           );
 
           assert.equal(
@@ -4951,6 +5945,201 @@ test(
       );
 
 
+        await t.test(
+          "real agent reconstructs WAN-off cash-up using Cloud-local payment identities",
+          async () => {
+            assert.ok(
+              cashupSessionId
+            );
+
+            assert.ok(
+              cashupEventId
+            );
+
+            assert.ok(
+              cashupPayload
+            );
+
+            await waitFor(
+              async () => {
+                const inbox =
+                  await cloudPool.query(
+                    `
+                    SELECT
+                      status,
+                      applied_at
+                    FROM public.edge_inbox
+                    WHERE event_id =
+                      $1::uuid
+                    `,
+                    [
+                      cashupEventId,
+                    ]
+                  );
+
+                const outbox =
+                  await edge.pool.query(
+                    `
+                    SELECT
+                      status,
+                      acked_at
+                    FROM public.edge_outbox
+                    WHERE event_id =
+                      $1::uuid
+                    `,
+                    [
+                      cashupEventId,
+                    ]
+                  );
+
+                return (
+                  inbox.rows[0]
+                    ?.status ===
+                    "applied" &&
+                  Boolean(
+                    inbox.rows[0]
+                      ?.applied_at
+                  ) &&
+                  outbox.rows[0]
+                    ?.status ===
+                    "acked" &&
+                  Boolean(
+                    outbox.rows[0]
+                      ?.acked_at
+                  )
+                );
+              },
+              {
+                timeoutMs:
+                  30000,
+
+                message:
+                  `WAN-off cash-up failed to converge.\nAGENT:\n${agent.output()}`,
+              }
+            );
+
+            const sessionResult =
+              await cloudPool.query(
+                `
+                SELECT
+                  id,
+                  restaurant_id,
+                  expected_cash,
+                  actual_cash,
+                  discrepancy,
+                  closed_by_user_id,
+                  closed_by_name
+                FROM public.cashup_sessions
+                WHERE restaurant_id = $1
+                  AND id = $2::uuid
+                `,
+                [
+                  restaurantId,
+                  cashupSessionId,
+                ]
+              );
+
+            assert.equal(
+              sessionResult.rows.length,
+              1
+            );
+
+            const session =
+              sessionResult.rows[0];
+
+            assert.equal(
+              String(
+                session.id
+              ),
+              cashupSessionId
+            );
+
+            assert.equal(
+              session
+                .closed_by_user_id,
+              null,
+              "Cloud stored Edge-local closer BIGINT"
+            );
+
+            assert.equal(
+              String(
+                session
+                  .closed_by_name ||
+                ""
+              ),
+              String(
+                cashupPayload
+                  .session
+                  .closed_by_name ||
+                ""
+              )
+            );
+
+            assert.equal(
+              Number(
+                session
+                  .expected_cash
+              ),
+              Number(
+                cashupPayload
+                  .session
+                  .expected_cash
+              )
+            );
+
+            assert.equal(
+              Number(
+                session
+                  .actual_cash
+              ),
+              Number(
+                cashupPayload
+                  .session
+                  .actual_cash
+              )
+            );
+
+            const cloudPayments =
+              await cloudPool.query(
+                `
+                SELECT
+                  payment_uuid,
+                  cashup_session_id
+                FROM public.payments
+                WHERE restaurant_id = $1
+                  AND payment_uuid =
+                    ANY($2::uuid[])
+                `,
+                [
+                  restaurantId,
+                  cashupPayload
+                    .payment_uuids,
+                ]
+              );
+
+            assert.equal(
+              cloudPayments.rows.length,
+              cashupPayload
+                .payment_uuids
+                .length
+            );
+
+            assert.ok(
+              cloudPayments.rows.every(
+                (row) =>
+                  String(
+                    row.cashup_session_id
+                  ) ===
+                  cashupSessionId
+              )
+            );
+
+            console.log(
+              "✅ CASH-B Cloud reconstructed same cash-up UUID using Cloud-local payment identities"
+            );
+          }
+        );
+
       await t.test(
         "continued agent cycles cannot duplicate the recovered sale",
         async () => {
@@ -5391,6 +6580,164 @@ test(
       );
 
 
+        await t.test(
+          "continued real agent cycles cannot duplicate recovered cash-up",
+          async () => {
+            const before =
+              await cloudPool.query(
+                `
+                SELECT
+                  (
+                    SELECT
+                      COUNT(*)::int
+                    FROM public.cashup_sessions
+                    WHERE restaurant_id = $1
+                      AND id = $2::uuid
+                  ) AS sessions,
+
+                  (
+                    SELECT
+                      COUNT(*)::int
+                    FROM public.payments
+                    WHERE restaurant_id = $1
+                      AND cashup_session_id =
+                        $2::uuid
+                  ) AS linked_payments,
+
+                  (
+                    SELECT
+                      COUNT(*)::int
+                    FROM public.edge_inbox
+                    WHERE event_id =
+                      $3::uuid
+                  ) AS inbox_rows
+                `,
+                [
+                  restaurantId,
+                  cashupSessionId,
+                  cashupEventId,
+                ]
+              );
+
+            assert.equal(
+              Number(
+                before.rows[0]
+                  .sessions
+              ),
+              1
+            );
+
+            assert.equal(
+              Number(
+                before.rows[0]
+                  .linked_payments
+              ),
+              cashupPayload
+                .payment_uuids
+                .length
+            );
+
+            assert.equal(
+              Number(
+                before.rows[0]
+                  .inbox_rows
+              ),
+              1
+            );
+
+            await sleep(
+              2400
+            );
+
+            const after =
+              await cloudPool.query(
+                `
+                SELECT
+                  (
+                    SELECT
+                      COUNT(*)::int
+                    FROM public.cashup_sessions
+                    WHERE restaurant_id = $1
+                      AND id = $2::uuid
+                  ) AS sessions,
+
+                  (
+                    SELECT
+                      COUNT(*)::int
+                    FROM public.payments
+                    WHERE restaurant_id = $1
+                      AND cashup_session_id =
+                        $2::uuid
+                  ) AS linked_payments,
+
+                  (
+                    SELECT
+                      COUNT(*)::int
+                    FROM public.edge_inbox
+                    WHERE event_id =
+                      $3::uuid
+                  ) AS inbox_rows
+                `,
+                [
+                  restaurantId,
+                  cashupSessionId,
+                  cashupEventId,
+                ]
+              );
+
+            assert.deepEqual(
+              after.rows[0],
+              before.rows[0],
+              "Repeated Edge cycles duplicated Cloud cash-up state"
+            );
+
+            const edgeOutbox =
+              await edge.pool.query(
+                `
+                SELECT
+                  COUNT(*)::int AS count,
+                  MAX(status) AS status
+                FROM public.edge_outbox
+                WHERE event_id =
+                  $1::uuid
+                `,
+                [
+                  cashupEventId,
+                ]
+              );
+
+            assert.equal(
+              Number(
+                edgeOutbox.rows[0]
+                  .count
+              ),
+              1
+            );
+
+            assert.equal(
+              edgeOutbox.rows[0]
+                .status,
+              "acked"
+            );
+
+            assert.equal(
+              agent.child
+                .exitCode,
+              null
+            );
+
+            assert.equal(
+              edgeServer.child
+                .exitCode,
+              null
+            );
+
+            console.log(
+              "✅ CASH-C Post-recovery cash-up exactly-once stability proven"
+            );
+          }
+        );
+
       await t.test(
         "Edge process logs do not expose secrets or database URLs",
         async () => {
@@ -5398,8 +6745,14 @@ test(
             agent.output();
 
           const serverOutput =
-            edgeServer
-              .output();
+            [
+              preRestartEdgeServerOutput,
+
+              edgeServer
+                .output(),
+            ]
+              .filter(Boolean)
+              .join("\n");
 
           assert.equal(
             agentOutput.includes(

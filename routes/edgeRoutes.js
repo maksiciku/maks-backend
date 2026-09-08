@@ -717,6 +717,15 @@ const {
   "../edge/contracts/financialOperations"
 );
 
+const {
+  CASHUP_SESSION_CLOSED_EVENT_TYPE,
+  CashupOperationalSyncError,
+  validateCashupSessionClosedEvent,
+  applyCashupSessionClosedCloud,
+} = require(
+  "../edge/contracts/cashupOperations"
+);
+
 /*
  * =========================================================
  * EDGE → CLOUD PUSH TRANSPORT
@@ -1010,6 +1019,24 @@ router.post(
             );
           }
 
+          if (
+            String(
+              rawEvent
+                ?.event_type ||
+              ""
+            ) ===
+            CASHUP_SESSION_CLOSED_EVENT_TYPE
+          ) {
+            validateCashupSessionClosedEvent(
+              rawEvent,
+              {
+                restaurantId,
+                sourceInstallationId:
+                  installationId,
+              }
+            );
+          }
+
           const received =
             await receiveInboxEvent({
               eventId,
@@ -1140,6 +1167,26 @@ router.post(
               });
           }
 
+          if (
+            String(
+              rawEvent
+                ?.event_type ||
+              ""
+            ) ===
+            CASHUP_SESSION_CLOSED_EVENT_TYPE
+          ) {
+            applied =
+              await applyCashupSessionClosedCloud({
+                event:
+                  rawEvent,
+
+                restaurantId,
+
+                sourceInstallationId:
+                  installationId,
+              });
+          }
+
           acked.push({
             event_id:
               eventId,
@@ -1163,7 +1210,9 @@ router.post(
             error instanceof
               TableOperationalSyncError ||
             error instanceof
-              FinancialOperationalSyncError
+              FinancialOperationalSyncError ||
+            error instanceof
+              CashupOperationalSyncError
           ) {
             rejected.push({
               event_id:
