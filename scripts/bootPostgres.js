@@ -28,6 +28,10 @@ const {
 } = require('../migrations/canonicalInventoryMenu.pg');
 
 const {
+  runCanonicalManualPortionsPg,
+} = require('../migrations/canonicalManualPortions.pg');
+
+const {
   runCanonicalMenuSchedulingPg,
 } = require('../migrations/canonicalMenuScheduling.pg');
 
@@ -108,6 +112,10 @@ async function main() {
     });
 
     await runCanonicalInventoryMenuPg({
+      pool,
+    });
+
+    await runCanonicalManualPortionsPg({
       pool,
     });
 
