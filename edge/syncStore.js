@@ -597,6 +597,8 @@ async function claimOutboxEvents({
 
   leaseSeconds = 30,
 
+  eventTypes = null,
+
   pool = null,
 }) {
   const rid =
@@ -629,6 +631,52 @@ async function claimOutboxEvents({
       }
     );
 
+  let safeEventTypes =
+    null;
+
+  if (
+    eventTypes !== null &&
+    eventTypes !== undefined
+  ) {
+    if (
+      !Array.isArray(
+        eventTypes
+      ) ||
+      eventTypes.length < 1 ||
+      eventTypes.length > 100
+    ) {
+      throw new EdgeSyncError(
+        "EDGE_OUTBOX_EVENT_TYPES_INVALID",
+        "Outbox eventTypes must be a non-empty array of at most 100 event types"
+      );
+    }
+
+    safeEventTypes =
+      [
+        ...new Set(
+          eventTypes.map(
+            (value) =>
+              String(
+                value || ""
+              ).trim()
+          )
+        ),
+      ];
+
+    if (
+      safeEventTypes.some(
+        (value) =>
+          !value ||
+          value.length > 255
+      )
+    ) {
+      throw new EdgeSyncError(
+        "EDGE_OUTBOX_EVENT_TYPES_INVALID",
+        "Outbox eventTypes contains an invalid event type"
+      );
+    }
+  }
+
   return runSyncTx(
     pool,
     async (tx) =>
@@ -641,6 +689,16 @@ async function claimOutboxEvents({
             public.edge_outbox
           WHERE
             restaurant_id = $1
+            AND
+            (
+              $5::text[]
+                IS NULL
+              OR
+              event_type =
+                ANY(
+                  $5::text[]
+                )
+            )
             AND
             (
               (
@@ -711,6 +769,7 @@ async function claimOutboxEvents({
           worker,
           safeLimit,
           safeLease,
+          safeEventTypes,
         ]
       )
   );

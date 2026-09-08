@@ -28,6 +28,32 @@ const {
   "../edge/syncStore"
 );
 
+const {
+  MENU_CATALOG_EVENT_TYPE,
+} = require(
+  "../edge/contracts/menuCatalog"
+);
+
+const {
+  PRICING_RULES_EVENT_TYPE,
+} = require(
+  "../edge/contracts/pricingRules"
+);
+
+const {
+  PROMOTIONS_EVENT_TYPE,
+} = require(
+  "../edge/contracts/promotions"
+);
+
+const CLOUD_TO_EDGE_EVENT_TYPES =
+  Object.freeze([
+    MENU_CATALOG_EVENT_TYPE,
+    PRICING_RULES_EVENT_TYPE,
+    PROMOTIONS_EVENT_TYPE,
+  ]);
+
+
 const router =
   express.Router();
 
@@ -1418,6 +1444,9 @@ router.post(
 
           leaseSeconds:
             30,
+
+          eventTypes:
+            CLOUD_TO_EDGE_EVENT_TYPES,
         });
 
       return res.json({

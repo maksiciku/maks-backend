@@ -52,6 +52,12 @@ const {
   "../../edge/pullTransport"
 );
 
+const {
+  MENU_CATALOG_EVENT_TYPE,
+} = require(
+  "../../edge/contracts/menuCatalog"
+);
+
 
 const DATABASE_URL =
   String(
@@ -86,7 +92,7 @@ async function enqueueCloudEvent({
   payload,
 
   eventType =
-    "cloud.settings.updated",
+    MENU_CATALOG_EVENT_TYPE,
 
   entityType =
     "restaurant_settings",
@@ -908,7 +914,7 @@ test(
               restaurantA,
 
             eventType:
-              "cloud.settings.updated",
+              MENU_CATALOG_EVENT_TYPE,
 
             entityType:
               "restaurant_settings",
@@ -1746,6 +1752,215 @@ test(
 
           console.log(
             "✅ 10 Pull success cannot hide push failure"
+          );
+        }
+      );
+
+
+      // ===================================================
+      // 10B CLOUD → EDGE DIRECTIONALITY
+      // ===================================================
+
+      await t.test(
+        "Cloud pull excludes Edge→Cloud operational events",
+        async () => {
+          const operationalEvent =
+            await enqueueCloudEvent({
+              restaurantId:
+                restaurantA,
+
+              eventType:
+                "pos.order.submitted",
+
+              entityType:
+                "order_batch",
+
+              entityId:
+                uuid(),
+
+              payload: {
+                schema_version:
+                  1,
+
+                restaurant_id:
+                  restaurantA,
+
+                direction_probe:
+                  "must-not-pull",
+              },
+            });
+
+          const contentEvent =
+            await enqueueCloudEvent({
+              restaurantId:
+                restaurantA,
+
+              eventType:
+                MENU_CATALOG_EVENT_TYPE,
+
+              entityType:
+                "menu_catalog",
+
+              entityId:
+                String(
+                  restaurantA
+                ),
+
+              payload: {
+                schema_version:
+                  1,
+
+                restaurant_id:
+                  restaurantA,
+
+                direction_probe:
+                  "must-pull",
+              },
+            });
+
+          const res =
+            await http
+              .post(
+                "/edge/sync/pull"
+              )
+              .set(
+                headers(
+                  edgeA.installationId,
+                  edgeA.secret
+                )
+              )
+              .send({
+                limit:
+                  25,
+              });
+
+          assert.equal(
+            res.status,
+            200
+          );
+
+          assert.equal(
+            res.body?.success,
+            true
+          );
+
+          const pulledIds =
+            new Set(
+              (
+                res.body?.events ||
+                []
+              ).map(
+                (event) =>
+                  String(
+                    event.event_id
+                  )
+              )
+            );
+
+          assert.equal(
+            pulledIds.has(
+              String(
+                operationalEvent.event_id
+              )
+            ),
+            false,
+            "Edge→Cloud POS operation leaked into Cloud→Edge pull"
+          );
+
+          assert.equal(
+            pulledIds.has(
+              String(
+                contentEvent.event_id
+              )
+            ),
+            true,
+            "Cloud→Edge content event was not pulled"
+          );
+
+          const operationalState =
+            await qGet(
+              `
+              SELECT
+                status,
+                retry_count,
+                locked_at,
+                locked_by,
+                last_attempt_at
+              FROM
+                public.edge_outbox
+              WHERE
+                event_id =
+                  $1::uuid
+              `,
+              [
+                operationalEvent.event_id,
+              ]
+            );
+
+          assert.equal(
+            operationalState?.status,
+            "pending"
+          );
+
+          assert.equal(
+            Number(
+              operationalState
+                ?.retry_count ||
+              0
+            ),
+            0
+          );
+
+          assert.equal(
+            operationalState
+              ?.locked_at,
+            null
+          );
+
+          assert.equal(
+            operationalState
+              ?.locked_by,
+            null
+          );
+
+          assert.equal(
+            operationalState
+              ?.last_attempt_at,
+            null
+          );
+
+          const ack =
+            await http
+              .post(
+                "/edge/sync/pull/ack"
+              )
+              .set(
+                headers(
+                  edgeA.installationId,
+                  edgeA.secret
+                )
+              )
+              .send({
+                event_ids: [
+                  String(
+                    contentEvent
+                      .event_id
+                  ),
+                ],
+              });
+
+          assert.equal(
+            ack.status,
+            200
+          );
+
+          assert.equal(
+            ack.body?.success,
+            true
+          );
+
+          console.log(
+            "✅ 10B Cloud pull directionality proven"
           );
         }
       );
