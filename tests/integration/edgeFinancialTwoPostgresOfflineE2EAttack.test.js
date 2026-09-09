@@ -2327,6 +2327,20 @@ test(
             "Offline Edge created no KDS row"
           );
 
+          assert.ok(
+            edgeKds.rows.every(
+              (row) =>
+                String(
+                  row.order_type ||
+                  ""
+                )
+                  .trim()
+                  .toLowerCase() ===
+                "takeaway"
+            ),
+            "Offline Edge KDS rows lost authoritative takeaway order_type"
+          );
+
           const outbox =
             await edgeOutboxForBatch({
               pool:
@@ -4882,7 +4896,7 @@ test(
 
 
       await t.test(
-        "real agent reconstructs the immutable settlement + tender on Cloud using Cloud-local POS ids",
+        "real agent reconstructs settlement + tender + POS financial state on Cloud using Cloud-local POS ids",
         async () => {
           await waitFor(
             async () => {
@@ -4950,7 +4964,10 @@ test(
             await edge.pool.query(
               `
               SELECT
-                id
+                id,
+                paid,
+                amount_paid,
+                remaining_price
               FROM
                 public.pos_orders
               WHERE
@@ -4995,6 +5012,90 @@ test(
             cloudPos.rows.length,
             2
           );
+
+          const financialState =
+            (row) => ({
+              paid:
+                Number(
+                  row.paid ||
+                  0
+                ),
+
+              amount_paid:
+                Number(
+                  row.amount_paid ??
+                  0
+                ),
+
+              remaining_price:
+                Number(
+                  row.remaining_price ??
+                  0
+                ),
+            });
+
+          const settlementExpectedFinancialState =
+            (
+              financialPayload
+                ?.pos_row_states ||
+              []
+            )
+              .slice()
+              .sort(
+                (
+                  left,
+                  right
+                ) =>
+                  Number(
+                    left
+                      .edge_row_ordinal
+                  ) -
+                  Number(
+                    right
+                      .edge_row_ordinal
+                  )
+              )
+              .map(
+                financialState
+              );
+
+          assert.deepEqual(
+            settlementExpectedFinancialState,
+            [
+              {
+                paid:
+                  1,
+
+                amount_paid:
+                  12.5,
+
+                remaining_price:
+                  0,
+              },
+              {
+                paid:
+                  1,
+
+                amount_paid:
+                  12.5,
+
+                remaining_price:
+                  0,
+              },
+            ],
+            "Settlement event did not capture exact payment-time POS financial state"
+          );
+
+          /*
+           * Do not compare current Cloud balances with this
+           * older settlement snapshot here.
+           *
+           * The later refund event may already have applied
+           * by the time this subtest reads Cloud. Final
+           * Edge/Cloud financial parity is asserted in the
+           * refund subtest below.
+           */
+
 
           const edgeIds =
             edgePos.rows
@@ -5313,33 +5414,7 @@ test(
             null
           );
 
-          /*
-           * Initial financial materializer is intentionally
-           * immutable-ledger only.
-           *
-           * It MUST NOT mutate Cloud POS balances yet.
-           */
-          assert.ok(
-            cloudPos.rows.every(
-              (row) =>
-                Number(
-                  row.paid
-                ) ===
-                0
-            ),
-            "Immutable financial materializer mutated Cloud POS paid state"
-          );
 
-          assert.ok(
-            cloudPos.rows.every(
-              (row) =>
-                Number(
-                  row.amount_paid
-                ) ===
-                0
-            ),
-            "Immutable financial materializer mutated Cloud POS amount_paid"
-          );
 
           const financeInbox =
             await cloudPool.query(
@@ -5850,19 +5925,87 @@ test(
             "Cloud refund retained Edge-local POS BIGINT"
           );
 
-          /*
-           * Refund Cloud materialization is still
-           * immutable-ledger only.
-           */
-          assert.ok(
-            cloudPos.rows.every(
-              (row) =>
+          const refundFinancialState =
+            (row) => ({
+              paid:
                 Number(
-                  row.amount_paid
-                ) ===
-                0
+                  row.paid ||
+                  0
+                ),
+
+              amount_paid:
+                Number(
+                  row.amount_paid ??
+                  0
+                ),
+
+              remaining_price:
+                Number(
+                  row.remaining_price ??
+                  0
+                ),
+            });
+
+          const refundExpectedStates =
+            refundPayload
+              ?.pos_row_states ||
+            [];
+
+          assert.ok(
+            refundExpectedStates.length >
+              0,
+            "Refund event carried no post-refund POS financial state"
+          );
+
+          const refundCloudStateRows =
+            refundExpectedStates.map(
+              (state) => {
+                const row =
+                  cloudPos.rows.find(
+                    (candidate) =>
+                      String(
+                        candidate
+                          .edge_submission_id
+                      ) ===
+                        String(
+                          state
+                            .edge_submission_id
+                        ) &&
+                      Number(
+                        candidate
+                          .edge_row_ordinal
+                      ) ===
+                        Number(
+                          state
+                            .edge_row_ordinal
+                        ) &&
+                      String(
+                        candidate
+                          .batch_id
+                      ) ===
+                        String(
+                          state
+                            .batch_id
+                        )
+                  );
+
+                assert.ok(
+                  row,
+                  "Cloud post-refund POS financial state reference did not resolve"
+                );
+
+                return row;
+              }
+            );
+
+          assert.deepEqual(
+            refundCloudStateRows.map(
+              refundFinancialState
             ),
-            "Cloud refund materializer mutated POS amount_paid"
+            refundExpectedStates.map(
+              refundFinancialState
+            ),
+            "Cloud POS financial state did not converge after refund"
           );
 
           const refundInbox =

@@ -854,6 +854,174 @@ function validateFinancialSettlementPayload(
       ),
   };
 
+  const hasPosRowStates =
+    value.pos_row_states !==
+    undefined;
+
+  const rawPosRowStates =
+    hasPosRowStates
+      ? value.pos_row_states
+      : [];
+
+  if (
+    !Array.isArray(
+      rawPosRowStates
+    )
+  ) {
+    fail(
+      "EDGE_FINANCIAL_POS_ROW_STATES_INVALID",
+      "Financial settlement POS row states must be an array"
+    );
+  }
+
+  const posRowStates =
+    rawPosRowStates.map(
+      (state, index) => {
+        if (
+          !state ||
+          typeof state !==
+            "object" ||
+          Array.isArray(
+            state
+          )
+        ) {
+          fail(
+            "EDGE_FINANCIAL_POS_ROW_STATE_INVALID",
+            `pos_row_states[${index}] is invalid`
+          );
+        }
+
+        const ref =
+          normalizeOrderRef(
+            state,
+            `pos_row_states[${index}]`
+          );
+
+        const paid =
+          Number(
+            state.paid
+          );
+
+        if (
+          paid !== 0 &&
+          paid !== 1
+        ) {
+          fail(
+            "EDGE_FINANCIAL_POS_ROW_PAID_INVALID",
+            `pos_row_states[${index}].paid must be 0 or 1`
+          );
+        }
+
+        return {
+          ...ref,
+
+          paid,
+
+          amount_paid:
+            money(
+              state.amount_paid,
+              `pos_row_states[${index}].amount_paid`,
+              {
+                min:
+                  0,
+              }
+            ),
+
+          remaining_price:
+            money(
+              state.remaining_price,
+              `pos_row_states[${index}].remaining_price`,
+              {
+                min:
+                  0,
+              }
+            ),
+        };
+      }
+    );
+
+  const seenPosRowStates =
+    new Set();
+
+  for (
+    const state of
+    posRowStates
+  ) {
+    const key = [
+      state.edge_submission_id,
+      state.edge_row_ordinal,
+      state.batch_id,
+    ].join(":");
+
+    if (
+      seenPosRowStates.has(
+        key
+      )
+    ) {
+      fail(
+        "EDGE_FINANCIAL_POS_ROW_STATE_DUPLICATE",
+        "Financial settlement contains duplicate POS row state"
+      );
+    }
+
+    seenPosRowStates.add(
+      key
+    );
+  }
+
+
+  if (
+    hasPosRowStates
+  ) {
+    if (
+      posRowStates.length !==
+      normalizedSettlement
+        .order_refs
+        .length
+    ) {
+      fail(
+        "EDGE_FINANCIAL_POS_ROW_STATE_COUNT_MISMATCH",
+        "Settlement POS row state count does not match settlement order references"
+      );
+    }
+
+    const settlementOrderRefKeys =
+      new Set(
+        normalizedSettlement
+          .order_refs
+          .map(
+            (ref) => [
+              ref.edge_submission_id,
+              ref.edge_row_ordinal,
+              ref.batch_id,
+            ].join(":")
+          )
+      );
+
+    for (
+      const state of
+      posRowStates
+    ) {
+      const key = [
+        state.edge_submission_id,
+        state.edge_row_ordinal,
+        state.batch_id,
+      ].join(":");
+
+      if (
+        !settlementOrderRefKeys.has(
+          key
+        )
+      ) {
+        fail(
+          "EDGE_FINANCIAL_POS_ROW_STATE_REF_MISMATCH",
+          "Settlement POS row state does not match settlement order references"
+        );
+      }
+    }
+  }
+
+
   if (
     !Array.isArray(
       value.tenders
@@ -1079,6 +1247,10 @@ function validateFinancialSettlementPayload(
 
     restaurant_id:
       rid,
+
+
+    pos_row_states:
+      posRowStates,
 
     settlement:
       normalizedSettlement,
@@ -1375,7 +1547,10 @@ async function loadFinancialSettlementSnapshotTx(
             id,
             batch_id,
             edge_submission_id,
-            edge_row_ordinal
+            edge_row_ordinal,
+            paid,
+            amount_paid,
+            remaining_price
 
           FROM
             public.pos_orders
@@ -1485,6 +1660,73 @@ async function loadFinancialSettlementSnapshotTx(
     );
   }
 
+  const posRowByLocalId =
+    new Map(
+      identityRows.map(
+        (row) => [
+          Number(row.id),
+          row,
+        ]
+      )
+    );
+
+  const posRowStates =
+    allLocalIds.map(
+      (id) => {
+        const localId =
+          Number(id);
+
+        const row =
+          posRowByLocalId.get(
+            localId
+          );
+
+        const ref =
+          orderRefByLocalId.get(
+            localId
+          );
+
+        if (
+          !row ||
+          !ref
+        ) {
+          fail(
+            "EDGE_FINANCIAL_ORDER_STATE_MISSING",
+            "A financial POS row state could not be made portable",
+            {
+              local_pos_order_id:
+                localId,
+            }
+          );
+        }
+
+        return {
+          ...ref,
+
+          paid:
+            Number(
+              row.paid ||
+              0
+            )
+              ? 1
+              : 0,
+
+          amount_paid:
+            Number(
+              row.amount_paid ??
+              0
+            ),
+
+          remaining_price:
+            Number(
+              row.remaining_price ??
+              0
+            ),
+        };
+      }
+    );
+
+
   const orderRefsForIds =
     (
       ids
@@ -1533,6 +1775,9 @@ async function loadFinancialSettlementSnapshotTx(
 
       restaurant_id:
         rid,
+
+      pos_row_states:
+        posRowStates,
 
       settlement: {
         id:
@@ -1666,17 +1911,21 @@ async function loadFinancialSettlementSnapshotTx(
  * CLOUD FINANCIAL SETTLEMENT MATERIALIZATION
  * =========================================================
  *
- * Immutable scope only:
+ * Materialized Cloud scope:
  *
  *   payment_settlements
  *   payments
+ *   portable POS financial state
  *
- * This phase intentionally does NOT mutate:
+ * POS financial state is copied only from the exact
+ * Edge snapshot carried by this settlement event:
  *
  *   pos_orders.paid
  *   pos_orders.amount_paid
  *   pos_orders.remaining_price
- *   cash-up ownership
+ *
+ * Cloud never derives those values from final_amount.
+ * This preserves partial and split-payment state.
  *
  * Edge-local BIGSERIAL/FK identities are never Cloud
  * authority.
@@ -2644,6 +2893,66 @@ async function applyFinancialSettlementRecordedCloud({
           refs
         );
 
+      for (
+        const state of
+        payload.pos_row_states ||
+        []
+      ) {
+        const cloudId =
+          orderMapping.get(
+            financialOrderRefKey(
+              state
+            )
+          );
+
+        if (
+          !Number.isSafeInteger(
+            cloudId
+          ) ||
+          cloudId <=
+            0
+        ) {
+          fail(
+            "EDGE_FINANCIAL_CLOUD_ORDER_STATE_MAPPING_MISSING",
+            "Financial POS row state has no Cloud-local mapping"
+          );
+        }
+
+        const updated =
+          await tx.qGet(
+            `
+            UPDATE
+              public.pos_orders
+            SET
+              paid = $1,
+              amount_paid = $2,
+              remaining_price = $3
+            WHERE
+              restaurant_id = $4
+              AND id = $5
+            RETURNING
+              id
+            `,
+            [
+              state.paid,
+              state.amount_paid,
+              state.remaining_price,
+              normalized.restaurant_id,
+              cloudId,
+            ]
+          );
+
+        if (
+          !updated?.id
+        ) {
+          fail(
+            "EDGE_FINANCIAL_CLOUD_ORDER_STATE_UPDATE_FAILED",
+            "Cloud POS financial state could not be materialized"
+          );
+        }
+      }
+
+
       const settlementOrderIds =
         cloudOrderIdsForRefs(
           settlement.order_refs,
@@ -3512,6 +3821,88 @@ async function applyFinancialRefundRecordedCloud({
         }
       }
 
+      if (
+        Array.isArray(
+          payload.pos_row_states
+        ) &&
+        payload.pos_row_states.length
+      ) {
+        const cloudOrderIdByRef =
+          new Map(
+            refund.order_refs.map(
+              (ref, index) => [
+                financialOrderRefKey(
+                  ref
+                ),
+                Number(
+                  refundOrderIds[
+                    index
+                  ]
+                ),
+              ]
+            )
+          );
+
+        for (
+          const state of
+          payload.pos_row_states
+        ) {
+          const cloudId =
+            cloudOrderIdByRef.get(
+              financialOrderRefKey(
+                state
+              )
+            );
+
+          if (
+            !Number.isSafeInteger(
+              cloudId
+            ) ||
+            cloudId <=
+              0
+          ) {
+            fail(
+              "EDGE_FINANCIAL_REFUND_CLOUD_ORDER_STATE_MAPPING_MISSING",
+              "Refund POS row state has no Cloud-local mapping"
+            );
+          }
+
+          const updated =
+            await tx.qGet(
+              `
+              UPDATE
+                public.pos_orders
+              SET
+                paid = $1,
+                amount_paid = $2,
+                remaining_price = $3
+              WHERE
+                restaurant_id = $4
+                AND id = $5
+              RETURNING
+                id
+              `,
+              [
+                state.paid,
+                state.amount_paid,
+                state.remaining_price,
+                normalized.restaurant_id,
+                cloudId,
+              ]
+            );
+
+          if (
+            !updated?.id
+          ) {
+            fail(
+              "EDGE_FINANCIAL_REFUND_CLOUD_ORDER_STATE_UPDATE_FAILED",
+              "Cloud POS post-refund state could not be materialized"
+            );
+          }
+        }
+      }
+
+
       /*
        * SAME event replay would already have returned from
        * inbox.status='applied'.
@@ -3797,15 +4188,13 @@ async function applyFinancialRefundRecordedCloud({
       }
 
       /*
-       * Intentionally DO NOT mutate:
+       * POS financial balances above are copied from the
+       * exact post-refund Edge snapshot when that snapshot
+       * is present.
        *
-       *   pos_orders.paid
-       *   pos_orders.amount_paid
-       *   pos_orders.remaining_price
-       *
-       * Table operational replication remains responsible for
-       * table/session state, and mutable financial state remains
-       * a separate milestone.
+       * Cloud never derives those balances from refund.amount.
+       * Table/session state remains a separate operational
+       * replication concern.
        */
       const applied =
         await tx.qGet(
@@ -4115,6 +4504,153 @@ function validateFinancialRefundPayload(
     );
   }
 
+  const rawPosRowStates =
+    value.pos_row_states ===
+    undefined
+      ? []
+      : value.pos_row_states;
+
+  if (
+    !Array.isArray(
+      rawPosRowStates
+    )
+  ) {
+    fail(
+      "EDGE_FINANCIAL_REFUND_POS_ROW_STATES_INVALID",
+      "Financial refund POS row states must be an array"
+    );
+  }
+
+  const posRowStates =
+    rawPosRowStates.map(
+      (state, index) => {
+        if (
+          !state ||
+          typeof state !==
+            "object" ||
+          Array.isArray(
+            state
+          )
+        ) {
+          fail(
+            "EDGE_FINANCIAL_REFUND_POS_ROW_STATE_INVALID",
+            `pos_row_states[${index}] is invalid`
+          );
+        }
+
+        const ref =
+          normalizeOrderRef(
+            state,
+            `pos_row_states[${index}]`
+          );
+
+        const paid =
+          Number(
+            state.paid
+          );
+
+        if (
+          paid !== 0 &&
+          paid !== 1
+        ) {
+          fail(
+            "EDGE_FINANCIAL_REFUND_POS_ROW_PAID_INVALID",
+            `pos_row_states[${index}].paid must be 0 or 1`
+          );
+        }
+
+        return {
+          ...ref,
+
+          paid,
+
+          amount_paid:
+            money(
+              state.amount_paid,
+              `pos_row_states[${index}].amount_paid`,
+              {
+                min:
+                  0,
+              }
+            ),
+
+          remaining_price:
+            money(
+              state.remaining_price,
+              `pos_row_states[${index}].remaining_price`,
+              {
+                min:
+                  0,
+              }
+            ),
+        };
+      }
+    );
+
+  if (
+    posRowStates.length
+  ) {
+    if (
+      posRowStates.length !==
+      orderRefs.length
+    ) {
+      fail(
+        "EDGE_FINANCIAL_REFUND_POS_ROW_STATE_COUNT_MISMATCH",
+        "Refund POS row state count does not match portable order references"
+      );
+    }
+
+    const orderRefKeys =
+      new Set(
+        orderRefs.map(
+          (ref) =>
+            financialOrderRefKey(
+              ref
+            )
+        )
+      );
+
+    const stateKeys =
+      new Set();
+
+    for (
+      const state of
+      posRowStates
+    ) {
+      const key =
+        financialOrderRefKey(
+          state
+        );
+
+      if (
+        stateKeys.has(
+          key
+        )
+      ) {
+        fail(
+          "EDGE_FINANCIAL_REFUND_POS_ROW_STATE_DUPLICATE",
+          "Refund contains duplicate POS row financial state"
+        );
+      }
+
+      if (
+        !orderRefKeys.has(
+          key
+        )
+      ) {
+        fail(
+          "EDGE_FINANCIAL_REFUND_POS_ROW_STATE_REF_MISMATCH",
+          "Refund POS row financial state does not match refund order references"
+        );
+      }
+
+      stateKeys.add(
+        key
+      );
+    }
+  }
+
+
   const createdAtRaw =
     rawRefund.created_at;
 
@@ -4141,6 +4677,9 @@ function validateFinancialRefundPayload(
 
     restaurant_id:
       rid,
+
+    pos_row_states:
+      posRowStates,
 
     refund: {
       payment_uuid:
@@ -4358,7 +4897,10 @@ async function loadFinancialRefundSnapshotTx(
         id,
         batch_id,
         edge_submission_id,
-        edge_row_ordinal
+        edge_row_ordinal,
+        paid,
+        amount_paid,
+        remaining_price
       FROM
         public.pos_orders
       WHERE
@@ -4495,12 +5037,82 @@ async function loadFinancialRefundSnapshotTx(
       }
     );
 
+  const posRowByLocalId =
+    new Map(
+      identityRows.map(
+        (row) => [
+          Number(row.id),
+          row,
+        ]
+      )
+    );
+
+  const posRowStates =
+    localOrderIds.map(
+      (id) => {
+        const localId =
+          Number(id);
+
+        const row =
+          posRowByLocalId.get(
+            localId
+          );
+
+        const ref =
+          orderRefByLocalId.get(
+            localId
+          );
+
+        if (
+          !row ||
+          !ref
+        ) {
+          fail(
+            "EDGE_FINANCIAL_REFUND_ORDER_STATE_MISSING",
+            "A refunded POS row state could not be made portable",
+            {
+              local_pos_order_id:
+                localId,
+            }
+          );
+        }
+
+        return {
+          ...ref,
+
+          paid:
+            Number(
+              row.paid ||
+              0
+            )
+              ? 1
+              : 0,
+
+          amount_paid:
+            Number(
+              row.amount_paid ??
+              0
+            ),
+
+          remaining_price:
+            Number(
+              row.remaining_price ??
+              0
+            ),
+        };
+      }
+    );
+
+
   return validateFinancialRefundPayload({
     schema_version:
       FINANCIAL_REFUND_SCHEMA_VERSION,
 
     restaurant_id:
       rid,
+
+    pos_row_states:
+      posRowStates,
 
     refund: {
       payment_uuid:

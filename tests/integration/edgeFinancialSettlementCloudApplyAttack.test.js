@@ -115,6 +115,7 @@ function makePayload({
   tableNumber,
   tenderAmounts = [12.5],
   tenderUuids = null,
+  posRowStates = null,
   createdAt = new Date().toISOString(),
 }) {
   const orderRef =
@@ -152,6 +153,13 @@ function makePayload({
 
     restaurant_id:
       restaurantId,
+
+    ...(posRowStates
+      ? {
+          pos_row_states:
+            posRowStates,
+        }
+      : {}),
 
     settlement: {
       id:
@@ -922,6 +930,30 @@ test(
           tenderA,
           tenderB,
         ],
+
+        posRowStates: [
+          {
+            ...makeOrderRef({
+              submissionId:
+                submissionMain,
+
+              ordinal:
+                1,
+
+              batchId:
+                batchMain,
+            }),
+
+            paid:
+              1,
+
+            amount_paid:
+              12.5,
+
+            remaining_price:
+              0,
+          },
+        ],
       });
 
     const event =
@@ -941,7 +973,7 @@ test(
 
 
     await t.test(
-      "materializes immutable settlement + multi-tender ledger using Cloud-local POS ids",
+      "materializes settlement + multi-tender ledger + POS financial state using Cloud-local POS ids",
       async () => {
         const outboxBefore =
           await countRows(
@@ -1279,7 +1311,8 @@ test(
           Number(
             posAfter.paid
           ),
-          0
+          1,
+          "Cloud settlement materializer did not copy paid state"
         );
 
         assert.equal(
@@ -1287,7 +1320,8 @@ test(
             posAfter
               .amount_paid
           ),
-          0
+          12.5,
+          "Cloud settlement materializer did not copy amount_paid"
         );
 
         assert.equal(
@@ -1295,7 +1329,8 @@ test(
             posAfter
               .remaining_price
           ),
-          12.5
+          0,
+          "Cloud settlement materializer did not copy remaining_price"
         );
 
         const outboxAfter =
@@ -1815,6 +1850,312 @@ test(
 
         console.log(
           "✅ 04 Portable financial batch mismatch blocked"
+        );
+      }
+    );
+
+
+    /*
+     * =====================================================
+     * 04B — SETTLEMENT POS STATE COVERAGE
+     * =====================================================
+     */
+
+    await t.test(
+      "settlement POS financial state must exactly cover settlement order refs",
+      async () => {
+        const tableNumber =
+          "Table FIN 903B";
+
+        const batchId =
+          crypto.randomUUID();
+
+        const submissionId =
+          crypto.randomUUID();
+
+        await createPortablePosRow({
+          restaurantId:
+            ridA,
+
+          batchId,
+
+          submissionId,
+
+          tableNumber,
+
+          total:
+            12.5,
+        });
+
+
+        /*
+         * Explicit new-format field with zero states.
+         *
+         * Legacy omission remains allowed, but an explicitly
+         * supplied snapshot must cover every settlement row.
+         */
+        const incompleteSettlementId =
+          crypto.randomUUID();
+
+        const incompleteEventId =
+          crypto.randomUUID();
+
+        const incompletePayload =
+          makePayload({
+            restaurantId:
+              ridA,
+
+            settlementId:
+              incompleteSettlementId,
+
+            batchId,
+
+            submissionId,
+
+            tableNumber,
+
+            posRowStates:
+              [],
+          });
+
+        assert.equal(
+          Object.prototype
+            .hasOwnProperty
+            .call(
+              incompletePayload,
+              "pos_row_states"
+            ),
+          true
+        );
+
+        const incompleteEvent =
+          makeEvent({
+            eventId:
+              incompleteEventId,
+
+            restaurantId:
+              ridA,
+
+            settlementId:
+              incompleteSettlementId,
+
+            payload:
+              incompletePayload,
+          });
+
+        const incompleteRes =
+          await pushEvent({
+            api,
+
+            edge:
+              edgeA,
+
+            event:
+              incompleteEvent,
+          });
+
+        assert.equal(
+          incompleteRes.status,
+          200,
+          JSON.stringify(
+            incompleteRes.body
+          )
+        );
+
+        assert.equal(
+          incompleteRes.body
+            ?.acked
+            ?.length,
+          0
+        );
+
+        assert.equal(
+          incompleteRes.body
+            ?.rejected
+            ?.[0]
+            ?.code,
+          "EDGE_FINANCIAL_POS_ROW_STATE_COUNT_MISMATCH"
+        );
+
+        assert.equal(
+          await countRows(
+            `
+            SELECT
+              COUNT(*)::int
+                AS count
+            FROM
+              public.edge_inbox
+            WHERE
+              event_id =
+                $1::uuid
+            `,
+            [
+              incompleteEventId,
+            ]
+          ),
+          0,
+          "Incomplete POS state reached durable Cloud inbox"
+        );
+
+        assert.equal(
+          await countRows(
+            `
+            SELECT
+              COUNT(*)::int
+                AS count
+            FROM
+              public.payment_settlements
+            WHERE
+              id =
+                $1::uuid
+            `,
+            [
+              incompleteSettlementId,
+            ]
+          ),
+          0,
+          "Incomplete POS state created a settlement"
+        );
+
+
+        /*
+         * Same number of rows, but portable identity differs.
+         */
+        const wrongRefSettlementId =
+          crypto.randomUUID();
+
+        const wrongRefEventId =
+          crypto.randomUUID();
+
+        const wrongRefPayload =
+          makePayload({
+            restaurantId:
+              ridA,
+
+            settlementId:
+              wrongRefSettlementId,
+
+            batchId,
+
+            submissionId,
+
+            tableNumber,
+
+            posRowStates: [
+              {
+                ...makeOrderRef({
+                  submissionId:
+                    crypto.randomUUID(),
+
+                  ordinal:
+                    1,
+
+                  batchId,
+                }),
+
+                paid:
+                  1,
+
+                amount_paid:
+                  12.5,
+
+                remaining_price:
+                  0,
+              },
+            ],
+          });
+
+        const wrongRefEvent =
+          makeEvent({
+            eventId:
+              wrongRefEventId,
+
+            restaurantId:
+              ridA,
+
+            settlementId:
+              wrongRefSettlementId,
+
+            payload:
+              wrongRefPayload,
+          });
+
+        const wrongRefRes =
+          await pushEvent({
+            api,
+
+            edge:
+              edgeA,
+
+            event:
+              wrongRefEvent,
+          });
+
+        assert.equal(
+          wrongRefRes.status,
+          200,
+          JSON.stringify(
+            wrongRefRes.body
+          )
+        );
+
+        assert.equal(
+          wrongRefRes.body
+            ?.acked
+            ?.length,
+          0
+        );
+
+        assert.equal(
+          wrongRefRes.body
+            ?.rejected
+            ?.[0]
+            ?.code,
+          "EDGE_FINANCIAL_POS_ROW_STATE_REF_MISMATCH"
+        );
+
+        assert.equal(
+          await countRows(
+            `
+            SELECT
+              COUNT(*)::int
+                AS count
+            FROM
+              public.edge_inbox
+            WHERE
+              event_id =
+                $1::uuid
+            `,
+            [
+              wrongRefEventId,
+            ]
+          ),
+          0,
+          "Wrong-ref POS state reached durable Cloud inbox"
+        );
+
+        assert.equal(
+          await countRows(
+            `
+            SELECT
+              COUNT(*)::int
+                AS count
+            FROM
+              public.payment_settlements
+            WHERE
+              id =
+                $1::uuid
+            `,
+            [
+              wrongRefSettlementId,
+            ]
+          ),
+          0,
+          "Wrong-ref POS state created a settlement"
+        );
+
+        console.log(
+          "✅ 04B Settlement POS financial state coverage fails closed"
         );
       }
     );

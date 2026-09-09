@@ -2217,6 +2217,7 @@ async function insertPosItems({
   tableName,
   items,
   batchId,
+  orderType = null,
   stockDeductionEnabled = true,
   holdKdsUntilPaid = false,
 }) {
@@ -2285,7 +2286,12 @@ async function insertPosItems({
       : Number((unit * quantity).toFixed(2));
 
     const category = normalizeCategory(item.category || item.item_type || "meals");
-    const order_type = normalizeOrderType(item.order_type || item.orderType || "dine-in");
+    const order_type = normalizeOrderType(
+      orderType ||
+      item.order_type ||
+      item.orderType ||
+      "dine-in"
+    );
 
     const note = item.note ?? item.notes ?? null;
     const special_requests = item.special_requests ?? item.specialRequests ?? null;
@@ -4151,6 +4157,7 @@ tableCovers = Math.max(1, Number(sess?.covers || 1));
     tableName,
     items: trustedItems,
     batchId,
+    orderType: order_type,
     stockDeductionEnabled,
     holdKdsUntilPaid: holdQrKioskUntilPaid,
   });
@@ -4878,6 +4885,7 @@ if (!shouldAppendToExistingBatch) {
     tableName,
 items: trustedItems,
     batchId,
+    orderType: safeOrderType,
     stockDeductionEnabled,
     holdKdsUntilPaid: holdQrKioskUntilPaid,
   });
