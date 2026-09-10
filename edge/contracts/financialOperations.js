@@ -4187,6 +4187,38 @@ async function applyFinancialRefundRecordedCloud({
         );
       }
 
+      // The original amount remains immutable. Its status follows the
+      // cumulative refund ledger, inside the same locked transaction.
+      const originalRefundStatus =
+        Math.round(resultingRefundTotal * 100) === Math.round(originalAmount * 100)
+          ? "refunded"
+          : "partially_refunded";
+
+      const updatedOriginal = await tx.qGet(
+        `
+        UPDATE public.payments
+        SET status = $1
+        WHERE restaurant_id = $2
+          AND id = $3
+          AND payment_uuid = $4::uuid
+          AND status IN ('completed', 'partially_refunded', 'refunded')
+        RETURNING id, status
+        `,
+        [
+          originalRefundStatus,
+          normalized.restaurant_id,
+          originalLocalId,
+          refund.ref_payment_uuid,
+        ]
+      );
+
+      if (!updatedOriginal || updatedOriginal.status !== originalRefundStatus) {
+        fail(
+          "EDGE_FINANCIAL_REFUND_ORIGINAL_STATUS_CONFLICT",
+          "Original payment status cannot accept this refund"
+        );
+      }
+
       /*
        * POS financial balances above are copied from the
        * exact post-refund Edge snapshot when that snapshot

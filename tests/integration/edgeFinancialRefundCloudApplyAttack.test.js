@@ -1029,6 +1029,112 @@ test(
 
 
     await t.test(
+      "refund status follows cumulative pence and survives rejection and replay",
+      async () => {
+        const batchId = crypto.randomUUID();
+        const submissionId = crypto.randomUUID();
+        const originalUuid = crypto.randomUUID();
+        const tableNumber = "Table REF STATUS PENCE";
+        const pos = await createPortablePosRow({
+          restaurantId: ridA, batchId, submissionId, tableNumber, total: 7.5,
+        });
+        await insertOriginalTender({
+          restaurantId: ridA, paymentUuid: originalUuid, tableNumber,
+          amount: 7.5, batchId, posOrderIds: [Number(pos.id)],
+        });
+        const makeEvent = (amount) => {
+          const refundUuid = crypto.randomUUID();
+          return makeRefundEvent({
+            eventId: crypto.randomUUID(), restaurantId: ridA, refundUuid,
+            payload: makeRefundPayload({
+              restaurantId: ridA, refundUuid, originalUuid, batchId,
+              submissionId, tableNumber, amount,
+            }),
+          });
+        };
+        const readLedger = () => qAll(
+          `SELECT payment_uuid, status, amount::text AS amount
+           FROM public.payments
+           WHERE restaurant_id = $1
+             AND (payment_uuid = $2::uuid OR ref_payment_uuid = $2::uuid)
+           ORDER BY payment_uuid`,
+          [ridA, originalUuid]
+        );
+        const assertOriginal = async (status) => {
+          const row = (await readLedger()).find((p) => p.payment_uuid === originalUuid);
+          assert.equal(row.status, status);
+          assert.equal(Number(row.amount), 7.5, "Original tender amount must stay intact");
+        };
+
+        const partial = makeEvent(-7.49);
+        const first = await pushEvent({ api, edge: edgeA, event: partial });
+        assert.equal(first.body?.acked?.length, 1, JSON.stringify(first.body));
+        await assertOriginal("partially_refunded");
+
+        const beforeRejected = await readLedger();
+        const excessive = await pushEvent({ api, edge: edgeA, event: makeEvent(-0.02) });
+        assert.equal(excessive.body?.acked?.length, 0, JSON.stringify(excessive.body));
+        assert.equal(excessive.body?.rejected?.[0]?.code, "EDGE_FINANCIAL_REFUND_AMOUNT_EXCEEDED");
+        assert.deepEqual(await readLedger(), beforeRejected);
+
+        const finalPenny = makeEvent(-0.01);
+        const final = await pushEvent({ api, edge: edgeA, event: finalPenny });
+        assert.equal(final.body?.acked?.length, 1, JSON.stringify(final.body));
+        await assertOriginal("refunded");
+
+        const beforeReplay = await readLedger();
+        for (const event of [partial, finalPenny]) {
+          const replay = await pushEvent({ api, edge: edgeA, event });
+          assert.equal(replay.body?.acked?.[0]?.duplicate, true, JSON.stringify(replay.body));
+          assert.deepEqual(await readLedger(), beforeReplay);
+        }
+        assert.equal(beforeReplay.length, 3);
+        assert.equal(beforeReplay.reduce((sum, p) => sum + Math.round(Number(p.amount) * 100), 0), 0);
+      }
+    );
+
+    await t.test(
+      "refund against a voided original rolls back refund and preserves status",
+      async () => {
+        const batchId = crypto.randomUUID();
+        const submissionId = crypto.randomUUID();
+        const originalUuid = crypto.randomUUID();
+        const refundUuid = crypto.randomUUID();
+        const tableNumber = "Table REF STATUS VOID";
+        const pos = await createPortablePosRow({
+          restaurantId: ridA, batchId, submissionId, tableNumber, total: 5,
+        });
+        await insertOriginalTender({
+          restaurantId: ridA, paymentUuid: originalUuid, tableNumber,
+          amount: 5, batchId, posOrderIds: [Number(pos.id)],
+        });
+        await qRun(
+          "UPDATE public.payments SET status = 'voided' WHERE restaurant_id = $1 AND payment_uuid = $2::uuid",
+          [ridA, originalUuid]
+        );
+        const event = makeRefundEvent({
+          eventId: crypto.randomUUID(), restaurantId: ridA, refundUuid,
+          payload: makeRefundPayload({
+            restaurantId: ridA, refundUuid, originalUuid, batchId,
+            submissionId, tableNumber, amount: -1,
+          }),
+        });
+        const response = await pushEvent({ api, edge: edgeA, event });
+        assert.equal(response.body?.acked?.length, 0, JSON.stringify(response.body));
+        assert.equal(response.body?.rejected?.[0]?.code, "EDGE_FINANCIAL_REFUND_ORIGINAL_STATUS_CONFLICT");
+        const original = await qGet(
+          "SELECT status FROM public.payments WHERE restaurant_id = $1 AND payment_uuid = $2::uuid",
+          [ridA, originalUuid]
+        );
+        assert.equal(original.status, "voided");
+        assert.equal(await countRows(
+          "SELECT COUNT(*)::int AS count FROM public.payments WHERE restaurant_id = $1 AND payment_uuid = $2::uuid",
+          [ridA, refundUuid]
+        ), 0);
+      }
+    );
+
+    await t.test(
       "lost ACK replay is exactly once",
       async () => {
         const batchId =
