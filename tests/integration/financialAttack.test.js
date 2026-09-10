@@ -353,17 +353,150 @@ async function payShare({
 }
 
 /*
+ * Reporting fixtures use API-created orders, payments and refunds.
+ * Only their timestamps are repositioned, on the verified maks_test DB,
+ * into isolated UTC windows. No synthetic amounts or statuses are inserted.
+ */
+function reportingWindow(day) {
+  return { from: `${day}T00:00:00.000Z`, to: `${day}T23:59:59.999Z` };
+}
+
+async function reportingTotals(day, token = ownerTokenA, extra = {}) {
+  const res = await request(app)
+    .get("/orders/payments/totals")
+    .set("Authorization", bearer(token))
+    .query({ ...reportingWindow(day), ...extra });
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  return res.body;
+}
+
+function assertReportingAmounts(actual, expected) {
+  for (const [field, amount] of Object.entries(expected)) {
+    assert.equal(typeof actual[field], "number", `${field} must be a JSON number`);
+    assert.ok(Number.isFinite(actual[field]), `${field} must be finite`);
+    assert.equal(actual[field], amount, `Incorrect ${field}`);
+  }
+}
+
+function assertReportingTotals(actual, expected = {}) {
+  assertReportingAmounts(actual, {
+    cash_total: 0, card_total: 0, voucher_total: 0,
+    grand_total: 0, voided_total: 0, refunded_total: 0,
+    ...expected,
+  });
+}
+
+async function stampReportingPayment(restaurantId, paymentId, timestamp) {
+  const row = await one(`
+    UPDATE public.payments SET created_at = $3::timestamptz
+    WHERE restaurant_id = $1 AND id = $2
+    RETURNING *
+  `, [restaurantId, paymentId, timestamp]);
+  assert.ok(row, "Timestamp fixture must target an existing tenant payment");
+  if (Number(row.amount) > 0 && row.settlement_id) {
+    const result = await query(`
+      UPDATE public.payment_settlements SET created_at = $3::timestamptz
+      WHERE restaurant_id = $1 AND id = $2::uuid
+    `, [restaurantId, row.settlement_id, timestamp]);
+    assert.equal(result.rowCount, 1);
+  }
+  return row;
+}
+
+async function createReportingSale({ table, day, method = "card", tenders, tenantB = false }) {
+  const token = tenantB ? ownerTokenB : ownerTokenA;
+  const restaurantId = tenantB ? fixtures.restaurantB : fixtures.restaurantA;
+  const price = tenantB ? 99.99 : 12.5;
+  const order = await createOrder({
+    token, restaurantId, tableNumber: table,
+    mealId: tenantB ? fixtures.mealB : fixtures.mealA,
+    ...(tenantB ? { options: {}, expectedPrice: price } : {}),
+  });
+  const paid = await markPaid({
+    token, tableNumber: table, itemIds: [Number(order.id)],
+    paymentMethod: method,
+    payments: tenders || [{ method, amount: price }],
+  });
+  assert.ok(is2xx(paid.status), JSON.stringify(paid.body));
+  const ledger = await paymentsForTable(restaurantId, table);
+  const originals = ledger.filter(row => Number(row.amount) > 0);
+  assert.equal(originals.length, (tenders || [method]).length);
+  const payments = [];
+  for (const payment of originals) {
+    payments.push(await stampReportingPayment(
+      restaurantId, payment.id, `${day}T12:00:00.000Z`
+    ));
+  }
+  assert.ok(payments[0].settlement_id, "API payment must have settlement identity");
+  assert.ok(payments.every(p => p.settlement_id === payments[0].settlement_id));
+  return { token, restaurantId, table, order, payments, settlementId: payments[0].settlement_id };
+}
+
+async function recordReportingRefund(sale, payment, amount, day, reason, time = "13:00:00.000") {
+  const res = await request(app)
+    .post(`/orders/payments/${payment.id}/refund`)
+    .set("Authorization", bearer(sale.token))
+    .send({ amount, reason });
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  assert.equal(res.body.refund_amount, amount);
+  assert.ok(res.body.payment_batch_id, "Refund response needs a batch identity");
+  const rows = await all(`
+    SELECT * FROM public.payments
+    WHERE restaurant_id = $1 AND ref_payment_id = $2
+      AND batch_id = $3::uuid AND amount < 0
+  `, [sale.restaurantId, payment.id, res.body.payment_batch_id]);
+  assert.equal(rows.length, 1, "One request must create one linked refund row");
+  assert.equal(Number(rows[0].amount), -amount);
+  assert.ok(rows[0].payment_uuid);
+  assert.equal(rows[0].ref_payment_uuid, payment.payment_uuid);
+  return stampReportingPayment(sale.restaurantId, rows[0].id, `${day}T${time}Z`);
+}
+
+async function reportingDetail(sale) {
+  const res = await request(app)
+    .get(`/orders/payment-settlements/${sale.settlementId}`)
+    .set("Authorization", bearer(sale.token));
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  assert.ok(Array.isArray(res.body.payments));
+  assert.ok(Array.isArray(res.body.refunds));
+  return res.body;
+}
+
+async function reportingList(day, token, status) {
+  const res = await request(app)
+    .get("/orders/payment-settlements")
+    .set("Authorization", bearer(token))
+    .query({ ...reportingWindow(day), ...(status ? { status } : {}) });
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  assert.ok(Array.isArray(res.body));
+  return res.body;
+}
+
+async function reportingLedgerSnapshot(sale) {
+  return all(`
+    SELECT to_jsonb(p) AS payment FROM public.payments p
+    WHERE p.restaurant_id = $1
+      AND (p.settlement_id = $2::uuid OR EXISTS (
+        SELECT 1 FROM public.payments original
+        WHERE original.restaurant_id = $1
+          AND original.settlement_id = $2::uuid
+          AND original.id = p.ref_payment_id
+      ))
+    ORDER BY p.id
+  `, [sale.restaurantId, sale.settlementId]);
+}
+
+/*
  * =====================================================
  * SETUP
  * =====================================================
  */
 
 test.before(async () => {
-  await resetTestData();
+  assert.equal(process.env.NODE_ENV, "test", "Financial tests require NODE_ENV=test");
+  assert.equal(process.env.MAKS_TEST_MODE, "1", "Financial tests require MAKS_TEST_MODE=1");
 
-  fixtures =
-    await seedTestData();
-
+  // Verify the destructive-test target BEFORE calling reset or seed.
   const safe =
     await assertTestDatabase();
 
@@ -374,6 +507,9 @@ test.before(async () => {
   );
 
   pool = safe.pool;
+
+  await resetTestData();
+  fixtures = await seedTestData();
 
   /*
    * Keep the financial tests focused on money rather
@@ -1670,9 +1806,36 @@ test(
             "financial attack over-refund",
         });
 
+    assert.equal(
+      refund.status,
+      409,
+      "Over-refund must return a business-rule conflict"
+    );
+
+    assert.equal(
+      refund.body?.code,
+      "REFUND_EXCEEDS_REMAINING"
+    );
+
+    assert.equal(
+      refund.body?.error,
+      "Refund exceeds remaining refundable amount"
+    );
+
     assert.ok(
-      refund.status >= 400,
-      "Over-refund succeeded"
+      Number.isFinite(
+        Number(
+          refund.body?.max_refundable
+        )
+      ),
+      "Over-refund response must expose max_refundable"
+    );
+
+    assert.ok(
+      Number(
+        refund.body?.max_refundable
+      ) > 0,
+      "max_refundable must be positive"
     );
 
     const after =
@@ -2215,6 +2378,195 @@ test(
     );
   }
 );
+
+/* REPORTING A — signed ledger, partial/full status and per-refund audit history */
+test("REPORTING: card refunds preserve the sale and expose exact linked history", async () => {
+  const day = "2001-01-22";
+  assertReportingTotals(await reportingTotals(day));
+  const sale = await createReportingSale({ table: "Table 230", day });
+  const original = sale.payments[0];
+  const snapshot = await one(`
+    SELECT to_jsonb(s) AS settlement FROM public.payment_settlements s
+    WHERE s.restaurant_id = $1 AND s.id = $2::uuid
+  `, [sale.restaurantId, sale.settlementId]);
+  assertReportingTotals(await reportingTotals(day), { card_total: 12.5, grand_total: 12.5 });
+
+  const first = await recordReportingRefund(sale, original, 5, day, "reporting partial reason");
+  assertReportingTotals(await reportingTotals(day), {
+    card_total: 7.5, grand_total: 7.5, refunded_total: 5,
+  });
+  let detail = await reportingDetail(sale);
+  assert.equal(detail.settlement.status, "partially_refunded");
+  assertReportingAmounts(detail.settlement, {
+    original_payment_total: 12.5, refunded_total: 5, net_payment_total: 7.5, payment_total: 7.5,
+  });
+  assert.deepEqual(detail.payments.map(p => p.id), [Number(original.id)]);
+  assert.equal(detail.refunds.length, 1);
+  assert.equal(detail.refunds[0].payment_uuid, first.payment_uuid);
+  assert.equal(detail.refunds[0].ref_payment_uuid, original.payment_uuid);
+  assert.equal(detail.refunds[0].ref_payment_id, Number(original.id));
+  assert.equal(detail.refunds[0].amount, -5);
+  assert.equal(detail.refunds[0].method, "card");
+  assert.equal(detail.refunds[0].created_at, `${day}T13:00:00.000Z`);
+  assert.equal(detail.refunds[0].staff_user_id, Number(first.staff_user_id));
+  assert.ok(detail.refunds[0].staff_name, "Recorded staff must be available");
+  assert.equal(detail.refunds[0].reason, "reporting partial reason");
+  const partialRows = await reportingList(day, sale.token, "refunded");
+  assert.equal(partialRows.find(r => r.settlement_id === sale.settlementId)?.status, "partially_refunded");
+  assert.ok(!(await reportingList(day, sale.token, "completed"))
+    .some(r => r.settlement_id === sale.settlementId));
+
+  const second = await recordReportingRefund(sale, original, 7.5, day, "reporting final reason", "14:00:00.000");
+  assertReportingTotals(await reportingTotals(day), { refunded_total: 12.5 });
+  detail = await reportingDetail(sale);
+  assert.equal(detail.settlement.status, "refunded");
+  assertReportingAmounts(detail.settlement, {
+    original_payment_total: 12.5, refunded_total: 12.5, net_payment_total: 0, payment_total: 0,
+  });
+  assert.deepEqual(detail.payments.map(p => p.id), [Number(original.id)]);
+  assert.equal(detail.payments[0].amount, 12.5, "The positive sale must survive a full refund");
+  assert.deepEqual(detail.refunds.map(r => r.payment_uuid), [first.payment_uuid, second.payment_uuid]);
+  assert.deepEqual(detail.refunds.map(r => r.reason), ["reporting partial reason", "reporting final reason"]);
+  assert.equal((await reportingList(day, sale.token, "refunded"))
+    .find(r => r.settlement_id === sale.settlementId)?.status, "refunded");
+
+  const beforeReads = await reportingLedgerSnapshot(sale);
+  await reportingDetail(sale);
+  await reportingDetail(sale);
+  await reportingTotals(day);
+  assert.deepEqual(await reportingLedgerSnapshot(sale), beforeReads, "Reporting GETs must not mutate the ledger");
+  assert.deepEqual(await one(`
+    SELECT to_jsonb(s) AS settlement FROM public.payment_settlements s
+    WHERE s.restaurant_id = $1 AND s.id = $2::uuid
+  `, [sale.restaurantId, sale.settlementId]), snapshot, "Refunds must preserve the immutable sale snapshot");
+});
+
+/* REPORTING B — the physical 50p case, using the existing £12.50 fixture */
+test("REPORTING: today's 50p refund against yesterday's sale reduces only today's takings", async () => {
+  const yesterday = "2001-02-01", today = "2001-02-02";
+  assertReportingTotals(await reportingTotals(yesterday));
+  assertReportingTotals(await reportingTotals(today));
+  const oldSale = await createReportingSale({ table: "Table 231", day: yesterday });
+  await recordReportingRefund(oldSale, oldSale.payments[0], 12, yesterday, "prior-day refund");
+  const currentSale = await createReportingSale({ table: "Table 232", day: today });
+  const carryover = await recordReportingRefund(oldSale, oldSale.payments[0], 0.5, today, "last 50p from yesterday", "00:00:00.000");
+  await recordReportingRefund(currentSale, currentSale.payments[0], 5, today, "current refund one");
+  await recordReportingRefund(currentSale, currentSale.payments[0], 1, today, "current refund two", "14:00:00.000");
+  await recordReportingRefund(currentSale, currentSale.payments[0], 5, today, "current refund three", "23:59:59.999");
+
+  assertReportingTotals(await reportingTotals(yesterday), {
+    card_total: 0.5, grand_total: 0.5, refunded_total: 12,
+  });
+  assertReportingTotals(await reportingTotals(today), {
+    card_total: 1, grand_total: 1, refunded_total: 11.5,
+  });
+  const currentDetail = await reportingDetail(currentSale);
+  assertReportingAmounts(currentDetail.settlement, {
+    original_payment_total: 12.5, refunded_total: 11, net_payment_total: 1.5,
+  });
+  assert.equal(currentDetail.refunds.length, 3);
+  assert.ok(!currentDetail.refunds.some(r => r.payment_uuid === carryover.payment_uuid), "Older sale's 50p must not appear under the new invoice");
+  const oldDetail = await reportingDetail(oldSale);
+  assert.equal(oldDetail.settlement.status, "refunded");
+  assertReportingAmounts(oldDetail.settlement, { refunded_total: 12.5, net_payment_total: 0 });
+  assert.ok(oldDetail.refunds.some(r => r.payment_uuid === carryover.payment_uuid));
+  assertReportingTotals(await reportingTotals("2001-02-03"));
+});
+
+/* REPORTING C — each refund reduces its actual tender */
+test("REPORTING: mixed cash/card refunds keep original tender IDs separate", async () => {
+  const day = "2001-03-01";
+  assertReportingTotals(await reportingTotals(day));
+  const sale = await createReportingSale({ table: "Table 233", day,
+    tenders: [{ method: "cash", amount: 5 }, { method: "card", amount: 7.5 }],
+  });
+  const cash = sale.payments.find(p => p.method === "cash");
+  const card = sale.payments.find(p => p.method === "card");
+  assert.ok(cash && card);
+  await recordReportingRefund(sale, cash, 2, day, "cash return");
+  await recordReportingRefund(sale, card, 3, day, "card return", "14:00:00.000");
+  assertReportingTotals(await reportingTotals(day), {
+    cash_total: 3, card_total: 4.5, grand_total: 7.5, refunded_total: 5,
+  });
+  const detail = await reportingDetail(sale);
+  assert.equal(detail.settlement.status, "partially_refunded");
+  assert.equal(detail.settlement.method, "mixed");
+  assertReportingAmounts(detail.settlement, { original_payment_total: 12.5, refunded_total: 5, net_payment_total: 7.5 });
+  assert.deepEqual(detail.payments.map(p => p.id).sort((a,b) => a-b),
+    sale.payments.map(p => Number(p.id)).sort((a,b) => a-b));
+  assert.equal(detail.refunds.length, 2);
+  assert.equal(detail.refunds.find(r => r.method === "cash").ref_payment_id, Number(cash.id));
+  assert.equal(detail.refunds.find(r => r.method === "card").ref_payment_id, Number(card.id));
+});
+
+/* REPORTING D — no tenant override or financial/audit disclosure */
+test("ATTACK: reporting totals and refund detail remain tenant-scoped", async () => {
+  const day = "2001-04-01";
+  const a = await createReportingSale({ table: "Table 234", day });
+  const b = await createReportingSale({ table: "Table 235", day, tenantB: true });
+  await recordReportingRefund(a, a.payments[0], 2.5, day, "tenant A private reason");
+  await recordReportingRefund(b, b.payments[0], 9.99, day, "tenant B private reason");
+  assertReportingTotals(await reportingTotals(day, ownerTokenA, { restaurant_id: fixtures.restaurantB }), {
+    card_total: 10, grand_total: 10, refunded_total: 2.5,
+  });
+  assertReportingTotals(await reportingTotals(day, ownerTokenB, { restaurant_id: fixtures.restaurantA }), {
+    card_total: 90, grand_total: 90, refunded_total: 9.99,
+  });
+  for (const [token, foreignSale] of [[ownerTokenA, b], [ownerTokenB, a]]) {
+    const res = await request(app)
+      .get(`/orders/payment-settlements/${foreignSale.settlementId}`)
+      .set("Authorization", bearer(token))
+      .query({ restaurant_id: foreignSale.restaurantId });
+    assert.equal(res.status, 404, JSON.stringify(res.body));
+    assert.equal(res.body.settlement, undefined);
+    assert.equal(res.body.refunds, undefined);
+  }
+  assert.deepEqual((await reportingList(day, ownerTokenA, "refunded")).map(r => r.settlement_id), [a.settlementId]);
+  assert.deepEqual((await reportingList(day, ownerTokenB, "refunded")).map(r => r.settlement_id), [b.settlementId]);
+  assert.equal((await reportingDetail(a)).refunds[0].reason, "tenant A private reason");
+  assert.equal((await reportingDetail(b)).refunds[0].reason, "tenant B private reason");
+});
+
+/* REPORTING E — preserve void history without treating it as takings/refund */
+test("REPORTING: a voided positive payment is excluded from net and reported as voided", async () => {
+  const day = "2001-05-01";
+  const sale = await createReportingSale({ table: "Table 236", day, method: "cash" });
+  assertReportingTotals(await reportingTotals(day), { cash_total: 12.5, grand_total: 12.5 });
+  const res = await request(app)
+    .post(`/orders/payments/${sale.payments[0].id}/void`)
+    .set("Authorization", bearer(sale.token))
+    .send({ reason: "reporting void fixture" });
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  assertReportingTotals(await reportingTotals(day), { voided_total: 12.5 });
+  const detail = await reportingDetail(sale);
+  assert.equal(detail.settlement.status, "voided");
+  assertReportingAmounts(detail.settlement, { original_payment_total: 12.5, refunded_total: 0, net_payment_total: 0 });
+  assert.equal(detail.payments[0].amount, 12.5);
+  assert.equal(detail.refunds.length, 0);
+});
+
+/* REPORTING F — rejected refund attempts must leave every ledger value intact */
+test("ATTACK: invalid and excessive partial refunds leave totals and history unchanged", async () => {
+  const day = "2001-06-01";
+  const sale = await createReportingSale({ table: "Table 237", day });
+  const payment = sale.payments[0];
+  await recordReportingRefund(sale, payment, 5, day, "valid partial refund");
+  const before = await reportingLedgerSnapshot(sale);
+  for (const amount of [0, -0.01, "not-money", 7.51]) {
+    const res = await request(app)
+      .post(`/orders/payments/${payment.id}/refund`)
+      .set("Authorization", bearer(sale.token))
+      .send({ amount, reason: "must be rejected" });
+    assert.equal(res.status, amount === 7.51 ? 409 : 400, JSON.stringify(res.body));
+    assert.equal(res.body.code, amount === 7.51 ? "REFUND_EXCEEDS_REMAINING" : "INVALID_REFUND_AMOUNT");
+    if (amount === 7.51) assert.equal(res.body.max_refundable, 7.5);
+    assert.deepEqual(await reportingLedgerSnapshot(sale), before);
+  }
+  assertReportingTotals(await reportingTotals(day), { card_total: 7.5, grand_total: 7.5, refunded_total: 5 });
+  const detail = await reportingDetail(sale);
+  assert.equal(detail.refunds.length, 1);
+  assertReportingAmounts(detail.settlement, { refunded_total: 5, net_payment_total: 7.5 });
+});
 
 /*
  * =====================================================

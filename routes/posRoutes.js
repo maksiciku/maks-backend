@@ -9527,31 +9527,118 @@ router.get(
     if (to) { params.push(to); extra += isPg ? ` AND created_at <= $${params.length}` : ` AND created_at <= ?`; }
 
     const sql = isPg
-           ? `
+      ? `
         SELECT
-          COALESCE(SUM(CASE WHEN LOWER(method)='cash' AND status='completed' THEN amount ELSE 0 END),0)::numeric AS cash_total,
-          COALESCE(SUM(CASE WHEN LOWER(method)='card' AND status='completed' THEN amount ELSE 0 END),0)::numeric AS card_total,
-          COALESCE(SUM(CASE WHEN LOWER(method)='voucher' AND status='completed' THEN amount ELSE 0 END),0)::numeric AS voucher_total,
-          COALESCE(SUM(CASE WHEN status='completed' THEN amount ELSE 0 END),0)::numeric AS grand_total
+          COALESCE(SUM(CASE
+            WHEN LOWER(COALESCE(method,''))='cash'
+             AND LOWER(COALESCE(status,'completed')) <> 'voided'
+            THEN COALESCE(amount,0)
+            ELSE 0
+          END),0)::numeric AS cash_total,
+
+          COALESCE(SUM(CASE
+            WHEN LOWER(COALESCE(method,'')) IN
+              ('card','visa','mastercard','amex','contactless')
+             AND LOWER(COALESCE(status,'completed')) <> 'voided'
+            THEN COALESCE(amount,0)
+            ELSE 0
+          END),0)::numeric AS card_total,
+
+          COALESCE(SUM(CASE
+            WHEN LOWER(COALESCE(method,''))='voucher'
+             AND LOWER(COALESCE(status,'completed')) <> 'voided'
+            THEN COALESCE(amount,0)
+            ELSE 0
+          END),0)::numeric AS voucher_total,
+
+          COALESCE(SUM(CASE
+            WHEN LOWER(COALESCE(status,'completed')) <> 'voided'
+            THEN COALESCE(amount,0)
+            ELSE 0
+          END),0)::numeric AS grand_total,
+
+          COALESCE(SUM(CASE
+            WHEN LOWER(COALESCE(status,'completed'))='voided'
+             AND COALESCE(amount,0) > 0
+            THEN ABS(COALESCE(amount,0))
+            ELSE 0
+          END),0)::numeric AS voided_total,
+
+          COALESCE(SUM(CASE
+            WHEN COALESCE(amount,0) < 0
+             AND (
+               ref_payment_id IS NOT NULL
+               OR LOWER(COALESCE(source,''))='refund'
+             )
+             AND LOWER(COALESCE(status,'completed')) <> 'voided'
+            THEN ABS(COALESCE(amount,0))
+            ELSE 0
+          END),0)::numeric AS refunded_total
+
         FROM public.payments
         WHERE restaurant_id = $1 ${extra}
       `
-            : `
+      : `
         SELECT
-          COALESCE(SUM(CASE WHEN LOWER(method)='cash' AND status='completed' THEN amount ELSE 0 END),0) AS cash_total,
-          COALESCE(SUM(CASE WHEN LOWER(method)='card' AND status='completed' THEN amount ELSE 0 END),0) AS card_total,
-          COALESCE(SUM(CASE WHEN LOWER(method)='voucher' AND status='completed' THEN amount ELSE 0 END),0) AS voucher_total,
-          COALESCE(SUM(CASE WHEN status='completed' THEN amount ELSE 0 END),0) AS grand_total
+          COALESCE(SUM(CASE
+            WHEN LOWER(COALESCE(method,''))='cash'
+             AND LOWER(COALESCE(status,'completed')) <> 'voided'
+            THEN COALESCE(amount,0)
+            ELSE 0
+          END),0) AS cash_total,
+
+          COALESCE(SUM(CASE
+            WHEN LOWER(COALESCE(method,'')) IN
+              ('card','visa','mastercard','amex','contactless')
+             AND LOWER(COALESCE(status,'completed')) <> 'voided'
+            THEN COALESCE(amount,0)
+            ELSE 0
+          END),0) AS card_total,
+
+          COALESCE(SUM(CASE
+            WHEN LOWER(COALESCE(method,''))='voucher'
+             AND LOWER(COALESCE(status,'completed')) <> 'voided'
+            THEN COALESCE(amount,0)
+            ELSE 0
+          END),0) AS voucher_total,
+
+          COALESCE(SUM(CASE
+            WHEN LOWER(COALESCE(status,'completed')) <> 'voided'
+            THEN COALESCE(amount,0)
+            ELSE 0
+          END),0) AS grand_total,
+
+          COALESCE(SUM(CASE
+            WHEN LOWER(COALESCE(status,'completed'))='voided'
+             AND COALESCE(amount,0) > 0
+            THEN ABS(COALESCE(amount,0))
+            ELSE 0
+          END),0) AS voided_total,
+
+          COALESCE(SUM(CASE
+            WHEN COALESCE(amount,0) < 0
+             AND (
+               ref_payment_id IS NOT NULL
+               OR LOWER(COALESCE(source,''))='refund'
+             )
+             AND LOWER(COALESCE(status,'completed')) <> 'voided'
+            THEN ABS(COALESCE(amount,0))
+            ELSE 0
+          END),0) AS refunded_total
+
         FROM payments
         WHERE restaurant_id = ? ${extra}
       `;
 
     const row = await qGet(sql, params);
-        res.json({
+
+    return res.json({
       cash_total: Number(row?.cash_total || 0),
       card_total: Number(row?.card_total || 0),
       voucher_total: Number(row?.voucher_total || 0),
       grand_total: Number(row?.grand_total || 0),
+      voided_total: Number(row?.voided_total || 0),
+      refunded_total: Number(row?.refunded_total || 0),
     });
   } catch (e) {
     console.error("payments totals error:", e);
@@ -9869,6 +9956,11 @@ router.get(
                   THEN 'refunded'
 
                 WHEN BOOL_OR(
+                  p.status = 'partially_refunded'
+                )
+                  THEN 'partially_refunded'
+
+                WHEN BOOL_OR(
                   p.status = 'refunded'
                 )
                 AND BOOL_OR(
@@ -9975,7 +10067,17 @@ AS cashup_session_id
 
         WHERE (
           $6::text IS NULL
-          OR status = $6
+          OR (
+            $6::text = 'refunded'
+            AND status IN (
+              'refunded',
+              'partially_refunded'
+            )
+          )
+          OR (
+            $6::text <> 'refunded'
+            AND status = $6
+          )
         )
 
         ORDER BY created_at DESC
@@ -10293,12 +10395,11 @@ router.get(
       }
 
       /*
-       * Load every tender row belonging to the settlement.
-       *
-       * A mixed payment therefore returns two or more rows,
-       * while a normal card/cash payment returns one.
+       * Read original tenders and their linked refund ledger rows together.
+       * Refunds may have no settlement_id; follow tenant-scoped ref_payment_id.
+       * Keep returned original tender IDs separate for safe reversible actions.
        */
-      const paymentRows = await qAll(
+      const ledgerRows = await qAll(
         `
         SELECT
           p.id,
@@ -10314,17 +10415,71 @@ router.get(
           p.cashup_session_id,
           p.ref_payment_id,
           p.source,
-          p.created_at
+          p.created_at,
+          p.payment_uuid,
+          p.ref_payment_uuid,
+          ${staffExpr} AS staff_name,
+          refund_audit.reason AS refund_reason
 
         FROM public.payments p
+        LEFT JOIN public.users u ON u.id = p.staff_user_id
+        LEFT JOIN LATERAL (
+          -- Match the specific refund batch, never just the original sale.
+          -- Ambiguous/missing audit records must not invent a reason.
+          SELECT CASE WHEN COUNT(*) = 1
+            THEN MAX(NULLIF(BTRIM(a.meta->>'reason'), ''))
+            ELSE NULL END AS reason
+          FROM public.audit_log a
+          WHERE p.amount < 0
+            AND a.restaurant_id = $1
+            AND a.action = 'POS_REFUND'
+            AND a.entity = 'payment'
+            AND a.entity_id = p.ref_payment_id::text
+            AND a.meta->>'payment_batch_id' = p.batch_id::text
+        ) refund_audit ON TRUE
 
         WHERE p.restaurant_id = $1
-          AND p.settlement_id = $2::uuid
+          AND (
+            p.settlement_id = $2::uuid
+            OR (
+              p.amount < 0
+              AND EXISTS (
+                SELECT 1 FROM public.payments original
+                WHERE original.restaurant_id = $1
+                  AND original.settlement_id = $2::uuid
+                  AND original.amount > 0
+                  AND original.id = p.ref_payment_id
+              )
+            )
+          )
 
         ORDER BY p.created_at ASC, p.id ASC
         `,
         [rid, settlementId]
       );
+
+      // Keep original tender identities separate from refund identities.
+      // Both sets come from one tenant-scoped statement/snapshot.
+      const paymentRows = ledgerRows.filter((row) => Number(row.amount) >= 0);
+      const refunds = ledgerRows
+        .filter((row) => Number(row.amount) < 0)
+        .map((row) => ({
+          id: Number(row.id),
+          payment_uuid: row.payment_uuid || null,
+          ref_payment_id: row.ref_payment_id == null ? null : Number(row.ref_payment_id),
+          ref_payment_uuid: row.ref_payment_uuid || null,
+          amount: Number(row.amount),
+          method: row.method || "unknown",
+          status: row.status || "completed",
+          created_at: row.created_at,
+          staff_user_id: row.staff_user_id == null ? null : Number(row.staff_user_id),
+          staff_name: row.staff_name || null,
+          reason: row.refund_reason || null,
+          table_number: row.table_number || null,
+          source: row.source || null,
+          // The producer copies this from the original payment.
+          original_terminal_ref: row.terminal_ref || null,
+        }));
 
       const posOrderIds = Array.isArray(
         settlement.pos_order_ids
@@ -10597,6 +10752,12 @@ router.get(
         status = "refunded";
       } else if (
         paymentStatuses.includes(
+          "partially_refunded"
+        )
+      ) {
+        status = "partially_refunded";
+      } else if (
+        paymentStatuses.includes(
           "refunded"
         ) &&
         paymentStatuses.includes(
@@ -10627,23 +10788,18 @@ router.get(
         )
       );
 
-      const paymentTotal = Number(
-        payments
-          .filter(
-            (payment) =>
-              payment.status ===
-              "completed"
-          )
-          .reduce(
-            (sum, payment) =>
-              sum +
-              Number(
-                payment.amount || 0
-              ),
-            0
-          )
-          .toFixed(2)
-      );
+      const toPence = (amount) => Math.round(Number(amount || 0) * 100);
+      const originalPence = paymentRows.reduce((sum, row) => sum + toPence(row.amount), 0);
+      const activeOriginalPence = paymentRows
+        .filter((row) => String(row.status || "completed").toLowerCase() !== "voided")
+        .reduce((sum, row) => sum + toPence(row.amount), 0);
+      const refundPence = refunds
+        .filter((row) => String(row.status).toLowerCase() !== "voided")
+        .reduce((sum, row) => sum - toPence(row.amount), 0);
+      const paymentTotal = (activeOriginalPence - refundPence) / 100;
+      if (refundPence > 0 && activeOriginalPence > 0) {
+        status = refundPence >= activeOriginalPence ? "refunded" : "partially_refunded";
+      }
 
       return res.json({
         settlement: {
@@ -10727,6 +10883,9 @@ router.get(
           ),
 
           payment_total: paymentTotal,
+          original_payment_total: originalPence / 100,
+          refunded_total: refundPence / 100,
+          net_payment_total: paymentTotal,
 
           applied_rule_ids:
             Array.isArray(
@@ -10760,6 +10919,7 @@ router.get(
         },
 
         payments,
+        refunds,
         items,
       });
     } catch (error) {
@@ -10793,6 +10953,7 @@ router.post(
     const result = await withTx(async (tx) => {
       const isPg = tx.kind === "pg";
       const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+      const toPence = (n) => Math.round(round2(n) * 100);
       const refundBatchId = makeBatchId();
 
       const pay = await tx.qGet(
@@ -10851,9 +11012,15 @@ if (
   paymentStatus !== "completed" &&
   paymentStatus !== "partially_refunded"
 ) {
-  throw new Error(
+  const err = new Error(
     "Only completed or partially refunded payments can be refunded"
   );
+
+  err.status = 409;
+  err.code =
+    "PAYMENT_NOT_REFUNDABLE";
+
+  throw err;
 }
 
 const original =
@@ -10933,9 +11100,16 @@ const refundableRemaining =
   );
 
 if (!(refundableRemaining > 0)) {
-  throw new Error(
+  const err = new Error(
     "Payment has already been fully refunded"
   );
+
+  err.status = 409;
+  err.code =
+    "PAYMENT_ALREADY_FULLY_REFUNDED";
+  err.max_refundable = 0;
+
+  throw err;
 }
 
 let refundAmount =
@@ -10951,19 +11125,32 @@ if (
     );
 
   if (!(refundAmount > 0)) {
-    throw new Error(
+    const err = new Error(
       "Refund amount must be > 0"
     );
+
+    err.status = 400;
+    err.code =
+      "INVALID_REFUND_AMOUNT";
+
+    throw err;
   }
 
   if (
-    refundAmount -
-      refundableRemaining >
-    0.01
+    toPence(refundAmount) >
+    toPence(refundableRemaining)
   ) {
-    throw new Error(
+    const err = new Error(
       "Refund exceeds remaining refundable amount"
     );
+
+    err.status = 409;
+    err.code =
+      "REFUND_EXCEEDS_REMAINING";
+    err.max_refundable =
+      refundableRemaining;
+
+    throw err;
   }
 }
 
@@ -11048,7 +11235,7 @@ if (
         remainingRefund = round2(remainingRefund - giveBack);
       }
 
-      if (remainingRefund > 0.01) {
+      if (toPence(remainingRefund) > 0) {
         throw new Error("Unable to restore full refund amount to POS orders safely");
       }
 
@@ -11085,9 +11272,8 @@ if (
   );
 
 const nextPaymentStatus =
-  original -
-      refundedAfter <=
-    0.01
+  toPence(refundedAfter) >=
+    toPence(original)
     ? "refunded"
     : "partially_refunded";
 
@@ -11190,6 +11376,19 @@ await tx.qRun(
         ? {
             code:
               e.code,
+          }
+        : {}),
+
+      ...(Number.isFinite(
+        Number(
+          e?.max_refundable
+        )
+      )
+        ? {
+            max_refundable:
+              Number(
+                e.max_refundable
+              ),
           }
         : {}),
     });
