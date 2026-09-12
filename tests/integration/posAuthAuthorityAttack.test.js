@@ -483,6 +483,43 @@ test(
         ?.role,
       "owner"
     );
+
+    const staffToken =
+      response.body?.staff?.access_token;
+
+    assert.ok(
+      staffToken,
+      "PIN login did not issue a staff access token"
+    );
+
+    const claims = jwt.decode(staffToken);
+    assert.equal(Number(claims?.id), USERS.staleLegacyOwner.id);
+    assert.equal(Number(claims?.restaurant_id), fixtures.restaurantA);
+    assert.equal(claims?.authority, "staff");
+    assert.equal(claims?.scope, "pos_staff");
+    assert.equal(claims?.purpose, "pos_pin");
+  }
+);
+
+test(
+  "AUTHORITY: staff PIN token cannot use an ungranted management permission",
+  async () => {
+    const login = await pinLogin(USERS.realManager.pin);
+    assert.equal(login.status, 200, JSON.stringify(login.body));
+
+    const token = login.body?.staff?.access_token;
+    assert.ok(token);
+
+    const response = await request(app)
+      .get("/org/users")
+      .set("Authorization", `Bearer ${token}`)
+      .set("x-tenant-rid", String(fixtures.restaurantA));
+
+    assert.equal(
+      response.status,
+      403,
+      `Staff PIN token bypassed permissions: ${JSON.stringify(response.body)}`
+    );
   }
 );
 

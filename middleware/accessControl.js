@@ -45,6 +45,13 @@ const AUTHORITY_SET = new Set(
 
 const PERMISSIONS = Object.freeze({
   // -------------------------------------------------------
+  // SHARED NAVIGATION
+  // -------------------------------------------------------
+
+  PROFILE_VIEW: "profile.view",
+  ORDERS_VIEW: "orders.view",
+
+  // -------------------------------------------------------
   // POS — general
   // -------------------------------------------------------
 
@@ -185,6 +192,12 @@ const PERMISSIONS = Object.freeze({
 
   TABLES_STATUS:
     "tables.status",
+
+  PREPLIST_VIEW:
+    "preplist.view",
+
+  PREPLIST_UPDATE:
+    "preplist.update",
 
   // -------------------------------------------------------
   // STOCK
@@ -430,9 +443,21 @@ function normalizeAuthority(
 }
 
 function normalizePermission(value) {
-  return String(value || "")
+  const permission = String(value || "")
     .trim()
     .toLowerCase();
+
+  /*
+   * Compatibility for permissions saved by older MAKS
+   * frontend builds. New writes use the canonical values,
+   * but existing restaurant staff start working immediately.
+   */
+  const aliases = {
+    "menus.*": "menu.*",
+    "stock.update": "stock.edit",
+  };
+
+  return aliases[permission] || permission;
 }
 
 function normalizePermissions(value) {
@@ -723,7 +748,15 @@ function validatePermissions(
     normalized.filter(
       (permission) =>
         permission !== "*" &&
-        !permission.endsWith(".*") &&
+        !(
+          permission.endsWith(".*") &&
+          [...KNOWN_PERMISSION_SET].some(
+            (known) =>
+              known.startsWith(
+                permission.slice(0, -1)
+              )
+          )
+        ) &&
         !KNOWN_PERMISSION_SET.has(
           permission
         )

@@ -11,6 +11,7 @@ const {
   hasPermission,
   PERMISSIONS,
   normalizeAuthority: normalizeAccessAuthority,
+  normalizePermissions: normalizeAccessPermissions,
 } = require("../middleware/accessControl");
 
 // ------------------ helpers ------------------
@@ -38,11 +39,11 @@ function boolParam(kind, v) {
 function safePermissions(value) {
   try {
     if (Array.isArray(value)) {
-      return [...new Set(
+      return normalizeAccessPermissions([...new Set(
         value
           .map((item) => String(item || "").trim())
           .filter(Boolean)
-      )];
+      )]);
     }
 
     if (value && typeof value === "object") {
@@ -52,11 +53,11 @@ function safePermissions(value) {
     const parsed = JSON.parse(value || "[]");
 
     return Array.isArray(parsed)
-      ? [...new Set(
+      ? normalizeAccessPermissions([...new Set(
           parsed
             .map((item) => String(item || "").trim())
             .filter(Boolean)
-        )]
+        )])
       : [];
   } catch {
     return [];
@@ -323,6 +324,30 @@ router.post(
             legacyRole
           );
 
+        /*
+         * The PIN is a real staff authentication event.
+         * Issue a short-lived JWT for that exact membership so
+         * protected backend routes enforce the permissions of the
+         * person who entered the PIN instead of the browser owner's
+         * long-lived business token.
+         */
+        const accessToken =
+          jwt.sign(
+            {
+              id: Number(u.id),
+              restaurant_id:
+                Number(req.tenantRid),
+              role: legacyRole,
+              authority,
+              scope: "pos_staff",
+              purpose: "pos_pin",
+            },
+            SECRET_KEY,
+            {
+              expiresIn: "12h",
+            }
+          );
+
         return res.json({
           success: true,
 
@@ -368,6 +393,9 @@ router.post(
             can_pos_login:
               u.can_pos_login ===
               true,
+
+            access_token:
+              accessToken,
           },
         });
       }
